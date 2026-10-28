@@ -1,0 +1,10 @@
+; ISSUE-010: a non-capturing `fn` that reads a global aggregate `defconst` is
+; refused as capturing a "runtime local". Expected: compiles; the table is a
+; global. Actual: "`fn` cannot capture runtime local 'TABLE'; use vfn (clone),
+; mfn (move), or cfn (reference)".
+; fixed-when: runs
+(defconst TABLE (array i32 1 2 3))
+
+(defn main ():int
+  (let (f:(fn i32)(i32) (fn (i:i32):i32 (aref TABLE i)))
+    (return (if (= (f 2) 3) 0 1))))

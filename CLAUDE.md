@@ -40,6 +40,11 @@ scripts:
     (baseline 2026-10-28: 1611 passed, 5 failed, bootstrap PASS). Their failure
     makes `make test` exit non-zero, which is why the bootstrap needs `-k` to
     run after it.
+  - Since the port gained its `build.edn`, 13 more `suite-build` tests fail
+    in `.toolchain/nucleus`. Their scratch projects find the port's
+    `build.edn` above the checkout (ISSUE-005). Baseline from then on:
+    18 failed (5 + 13). To check those 13, move `build.edn` aside and run them
+    with `build/nuctests --run NAME` from `.toolchain/nucleus`.
   - On the host, compiler fixes take effect only after `make` in
     `/home/zak/code/nucleus`. Say so in every playtest request.
 
@@ -59,6 +64,12 @@ Other environment facts:
   `-timedemo` run ends in `I_Error` (exit 255) on the demo's end marker.
 - **Probes** state their own pass condition on a `; fixed-when:` header line
   (see `scripts/check-probes.sh`).
+- **Commits** need an identity the container lacks: pass
+  `-c user.name="Zak Wilson" -c user.email="zak.wilson@gmail.com"` (the
+  repos' existing author) on each `git commit`, in both repos.
+- **Tables are generated once:** `scripts/gen-tables.py` writes
+  `src/doom/tables.nuc`. `scripts/convert-info.py` wrote `info.nuc` and
+  `sounds.nuc`, and rerunning it overwrites any hand edits.
 - **Keep Bash calls small.** A big compound command (edits plus `rm` of a
   wildcard plus runs) gets denied by the permission policy. Use Edit for
   source changes and run steps separately.
@@ -70,7 +81,9 @@ Other environment facts:
 nucleus build               # → build/nuc-doom
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy build/nuc-doom -iwad /home/zak/code/chocolate-doom/src/DOOM1.WAD
 scripts/check-demos.sh      # demo-sync gate against reference/data/
+scripts/run-tests.sh        # unit tests (test/build.edn → test/build/tests)
 scripts/check-probes.sh     # which ISSUES.md probes still reproduce
+scripts/check-frames.sh     # framedump gate against reference/data/frames/
 scripts/build-compiler.sh && scripts/build-compiler.sh -k test bootstrap   # after a Nucleus fix
 ```
 

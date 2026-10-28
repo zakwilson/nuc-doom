@@ -1,0 +1,13 @@
+; ISSUE-011: SDL_Event, the type every SDL event loop needs, imports as an
+; opaque type because its padding member's extent is
+; `sizeof(void *) <= 8 ? 56 : …`, and the importer doesn't fold `?:`.
+; Expected: compiles. Actual: "alloca: 'SDL_Event' is an opaque type declared
+; at /usr/include/SDL2/SDL_events.h:655; only pointers to it are valid".
+; flags: --cflag=-I/usr/include/SDL2 --link-lib=SDL2
+; fixed-when: compiles
+(import-use "SDL2/SDL.h")
+
+(defn main ():int
+  (let (ev:&SDL_Event (alloca SDL_Event))
+    (SDL_PollEvent ev)
+    (return 0)))

@@ -1,0 +1,31 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The two random streams (m_random.c). The playsim draws only from p-random;
+; m-random is for everything a demo doesn't record, but it still has to match
+; the reference draw for draw, because the tic hash includes its index.
+
+(ns doom.random)
+
+(import-use doom.tables)
+
+(defvar rnd-index:i32 0)
+(defvar prnd-index:i32 0)
+
+(defn p-random ():i32
+  (set! prnd-index (bit-and (+ prnd-index 1) 255))
+  (as i32 (aref rnd-table prnd-index)))
+
+(defn m-random ():i32
+  (set! rnd-index (bit-and (+ rnd-index 1) 255))
+  (as i32 (aref rnd-table rnd-index)))
+
+(defn clear-random ():void
+  (set! rnd-index 0)
+  (set! prnd-index 0))
+
+; The two draws are sequenced; C leaves `P_Random() - P_Random()` unspecified,
+; which is why Chocolate Doom spells it with a temporary.
+(defn p-sub-random ():i32
+  (let (r (p-random))
+    (- r (p-random))))

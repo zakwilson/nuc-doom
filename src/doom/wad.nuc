@@ -1,0 +1,110 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The WAD directory (w_wad.c, w_file.c). Every file is read whole into memory,
+; so a lump is a view into its file's buffer and there is no lump cache.
+
+(ns doom.wad)
+
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.file)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(import-use doom.bytes)
+
+(deferror wad-bad-header "WAD file doesn't have an IWAD or PWAD id")
+(deferror lump-not-found "lump not found")
+
+(defstruct Lump key:i64 file:i32 pos:i32 size:i32)
+
+(defvar wad-files:(Vector String) (make (Vector String)))
+(defvar lumps:(Vector Lump) (make (Vector Lump)))
+; Keyed by the packed upper-case name; a later file's lump replaces an earlier
+; one, which is how a PWAD overrides the IWAD.
+(defvar lump-index:(HashMap i64 i32) (make (HashMap i64 i32)))
+
+(defn- upper (c:i64):i64 (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+; A lump name is up to 8 bytes, NUL-padded and compared case-insensitively, so
+; it packs into one integer key.
+(defn lump-key (name:StrView):i64
+  (let (k:i64 0 i:usize 0)
+    (while (and (< i 8) (< i (name 'len)) (!= (aref (name 'data) i) 0))
+      (set! k (bit-or k (bit-shl (upper (as i64 (aref (name 'data) i))) (* 8 (as i64 i)))))
+      (inc! i))
+    k))
+
+(defn- key-at (b:Bytes off:i32):i64
+  (lump-key (StrView (unsafe/cast &ui8 (unsafe/ptr+ (b 'data) off)) 8)))
+
+(defn add-lump (l:Lump):void ; ISSUE-008: public, not defn-
+  (assoc &lump-index (l 'key) (unsafe/cast i32 (count &lumps)))
+  (conj &lumps l))
+
+; The file name minus directory and extension, as M_ExtractFileBase.
+(defn- file-base (path:StrView):StrView
+  (let (start (match (strview-rfind-byte path 47) ((some i) (+ i 1)) (none 0))
+        base (strview-drop-bytes path start))
+    (match (strview-find-byte base 46)
+      ((some i) (strview-take-bytes base i))
+      (none base))))
+
+; Any file not ending in .wad (case-insensitively, as strcasecmp) is one lump.
+(defn- has-wad-suffix (path:StrView):bool
+  (and (>= (path 'len) 4)
+       (= (lump-key (strview-drop-bytes path (- (path 'len) 4))) (lump-key ".WAD"))))
+
+(defn add-file (path:StrView):!void
+  (let (data:String (try (with (f (try (file-open-read &path)))
+                           (file-read-to-string f)))
+        fi:i32 (unsafe/cast i32 (count &wad-files)))
+    (conj &wad-files data)
+    (let (b (wad-bytes fi))
+      (if (not (has-wad-suffix path))
+        (add-lump (Lump (lump-key (file-base path)) fi 0 (b 'len)))
+        (let (id (le-i32 b 0))
+          ; "IWAD" and "PWAD" as little-endian words.
+          (when (and (!= id 0x44415749) (!= id 0x44415750))
+            (return (err wad-bad-header)))
+          (let (n (le-i32 b 4) dir (le-i32 b 8) i:i32 0)
+            (while (< i n)
+              (let (e (+ dir (* i 16)))
+                (add-lump (Lump (key-at b (+ e 8)) fi (le-i32 b e) (le-i32 b (+ e 4)))))
+              (inc! i))))))
+    (return (ok))))
+
+(defn wad-bytes (f:i32):Bytes
+  ; A copy of the String header shares its buffer, which is all a view needs.
+  (let (s:String (&wad-files (as usize f)) v (string-as-view &s))
+    (Bytes (unsafe/cast ptr:ui8 (v 'data)) (unsafe/cast i32 (v 'len)))))
+
+(defn num-lumps ():i32 (unsafe/cast i32 (count &lumps)))
+
+(defn check-num-for-name (name:StrView):i32
+  (match (get &lump-index (lump-key name))
+    ((some i) i)
+    (none -1)))
+
+(defn lump-num (name:StrView):!i32
+  (let (i (check-num-for-name name))
+    (if (< i 0) (err lump-not-found) (ok i))))
+
+(defn lump (i:i32):Bytes
+  (let (l:Lump (&lumps (as usize i)))
+    (sub (wad-bytes (l 'file)) (l 'pos) (l 'size))))
+
+(defn lump-named (name:StrView):!Bytes
+  (ok (lump (try (lump-num name)))))
+
+(defn lump-length (i:i32):i32 ((&lumps (as usize i)) 'size))
+
+; The name back from its key, for messages and tests.
+(defn lump-name (i:i32):String
+  (let (k ((&lumps (as usize i)) 'key) s (make String) j:i64 0)
+    (while (and (< j 8) (!= (bit-and (bit-shr k (* 8 j)) 255) 0))
+      (string-push-char &s (unsafe/cast Char (bit-and (bit-shr k (* 8 j)) 255)))
+      (inc! j))
+    s))

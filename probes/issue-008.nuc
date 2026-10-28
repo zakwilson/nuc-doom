@@ -1,0 +1,14 @@
+; ISSUE-008: a private defn and a public defn calling `count` on one Vector type,
+; beside a HashMap, make a second namespace's `(Vector i64)` count a duplicate
+; public definition, reported at line 99 of each file (line 99
+; of lib/nucleus/vector.nuc). Expected: compiles and exits 0. Actual:
+; "issue-008/b.nuc:99: error: duplicate definition of 'count' — the same
+; parameter types are already defined at issue-008/a.nuc:99".
+; flags: -I probes
+; fixed-when: runs
+(import-use issue-008.a)
+(import-use issue-008.b)
+
+(defn main ():int
+  (add (Lump 5 1))
+  (return (if (= (small) 1) 0 1)))

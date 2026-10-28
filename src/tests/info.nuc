@@ -1,0 +1,40 @@
+(ns tests.info)
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.test)
+(import-use doom.math)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.tablegen)
+
+; The counts are info.h's NUMSPRITES, NUMSTATES, NUMMOBJTYPES; sounds.h's NUMSFX
+; and NUMMUSIC.
+(deftest info-table-sizes
+  (try (check-eq-int NUM-SPRITES 138 "sprites"))
+  (try (check-eq-int NUM-STATES 967 "states"))
+  (try (check-eq-int NUM-MOBJ-TYPES 137 "mobj types"))
+  (try (check-eq-int NUM-SFX 109 "sfx"))
+  (try (check-eq-int NUM-MUSIC 68 "music")))
+
+(deftest info-rows-line-up
+  (try (check-eq (aref sprite-names SPR-PLAY) "PLAY"))
+  (let (s:State (aref states S-PLAY-RUN1))
+    (try (check-eq-int (s 'sprite) SPR-PLAY "run1 sprite"))
+    (try (check-eq-int (s 'tics) 4 "run1 tics"))
+    (try (check-eq-int (s 'next-state) S-PLAY-RUN2 "run1 next")))
+  (let (m:MobjInfo (aref mobj-info MT-POSSESSED))
+    (try (check-eq-int (m 'doomed-num) 3004 "possessed ednum"))
+    (try (check-eq-int ((m 'radius) 'v) (* 20 FRAC-UNIT) "possessed radius"))
+    (try (check-eq-int (m 'flags) (bit-or* MF-SOLID MF-SHOOTABLE MF-COUNTKILL) "possessed flags"))
+    (try (check-eq-int (m 'active-sound) SFX-POSACT "possessed active")))
+  (try (check-eq ((aref sfx-info SFX-CHGUN) 'name) "chgun"))
+  (try (check-eq-int ((aref sfx-info SFX-CHGUN) 'link) SFX-PISTOL "chgun link"))
+  (try (check-eq (aref music-names MUS-E1M1) "e1m1")))
+
+(deftest random-streams
+  (clear-random)
+  (try (check-eq-int (p-random) 8 "first p-random"))
+  (try (check-eq-int (m-random) 8 "first m-random"))
+  (try (check-eq-int (p-random) 109 "second p-random"))
+  (clear-random))

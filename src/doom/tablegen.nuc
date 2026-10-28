@@ -1,0 +1,40 @@
+; Macros that expand one row set into an enum, a count and a table, so a
+; table's names and its data are written once and can't drift apart.
+; A row set lives in a macro `(over-X m args…)` that calls `(m args… row…)`.
+
+(ns doom.tablegen)
+
+(import-use nucleus.node)
+
+; (def-enum-rows Name row…): the members are each row's first element, in order.
+(defmacro def-enum-rows (name :rest rows)
+  (let (out:&Node (node-list-new 0) i:i32 0)
+    (node-push out 'defenum)
+    (node-push out name)
+    (while (< i (node-len rows))
+      (node-push out (node-at (node-at rows i) 0))
+      (inc! i))
+    out))
+
+; (def-count-row NAME row…): NAME is the number of rows.
+(defmacro def-count-row (name :rest rows)
+  `(defconst ~name ~(node-int (node-len rows))))
+
+; (def-table-rows name T row…): a constant array of T, one element per row,
+; built from the row's remaining elements.
+(defmacro def-table-rows (name type :rest rows)
+  (let (arr:&Node (node-list-new 0) i:i32 0)
+    (node-push arr 'array)
+    (node-push arr type)
+    (while (< i (node-len rows))
+      (let (rest:ptr:Node (node-rest (node-at rows i)))
+        ; A one-column row is the element itself, not a constructor call.
+        (node-push arr (if (= (node-len rest) 1)
+                         (node-at rest 0)
+                         (node-cons type rest 0))))
+      (inc! i))
+    `(defconst ~name ~arr)))
+
+; A variadic bit-or: the builtin takes exactly two operands (ISSUE-009), and
+; thing flags are written five at a time.
+(defmacro bit-or* (:rest xs) `(macfoldr bit-or 0 ~@xs))

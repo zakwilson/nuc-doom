@@ -1,3 +1,4 @@
 /.toolchain/
 /build/
 /reference/build/
+/test/build/

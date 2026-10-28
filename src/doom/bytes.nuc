@@ -1,0 +1,45 @@
+; Copyright(C) 2005-2014 Simon Howard; GPLv2 or later; see COPYING.
+;
+; A bounds-checked view of raw bytes with little-endian readers. WAD lumps sit
+; at arbitrary offsets, so fields are read byte by byte instead of cast to
+; structs as the C does (which also drops the SHORT()/LONG() swaps).
+
+(ns doom.bytes)
+
+(import-use "stdio.h")
+(import-use "stdlib.h")
+
+(extern stderr:ptr) ; ISSUE-006
+
+(defstruct Bytes data:ptr:ui8 len:i32)
+
+(defn bytes-oob (off:i32 n:i32 len:i32):void
+  (fprintf stderr "bytes: read of %d at %d past length %d\n" n off len)
+  (abort))
+
+(defn- check (b:Bytes off:i32 n:i32):void
+  (when (or (< off 0) (> (+ off n) (b 'len))) (bytes-oob off n (b 'len))))
+
+(defn sub (b:Bytes off:i32 n:i32):Bytes
+  (check b off n)
+  (Bytes (unsafe/ptr+ (b 'data) off) n))
+
+(defn u8 (b:Bytes off:i32):i32
+  (check b off 1)
+  (as i32 (aref (b 'data) off)))
+
+(defn le-u16 (b:Bytes off:i32):i32
+  (check b off 2)
+  (bit-or (as i32 (aref (b 'data) off))
+          (bit-shl (as i32 (aref (b 'data) (+ off 1))) 8)))
+
+(defn le-i16 (b:Bytes off:i32):i32
+  (let (u (le-u16 b off))
+    (if (>= u 32768) (- u 65536) u)))
+
+(defn le-i32 (b:Bytes off:i32):i32
+  (check b off 4)
+  (bit-or (bit-or (as i32 (aref (b 'data) off))
+                  (bit-shl (as i32 (aref (b 'data) (+ off 1))) 8))
+          (bit-or (bit-shl (as i32 (aref (b 'data) (+ off 2))) 16)
+                  (bit-shl (as i32 (aref (b 'data) (+ off 3))) 24))))

@@ -2,19 +2,14 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 
-(import-use "SDL2/SDL.h")
 (import-use nucleus.io)
+(import-use nucleus.error)
+(import-use doom.args)
+(import-use doom.main)
 
-(defn main (argc:i32 argv:ptr):int
-  (when (!= (SDL_Init SDL_INIT_VIDEO) 0)
-    (println "SDL_Init failed")
-    (return 1))
-  (let (win (SDL_CreateWindow "nuc-doom" SDL_WINDOWPOS_UNDEFINED_MASK SDL_WINDOWPOS_UNDEFINED_MASK ; ISSUE-002
-                              640 400 0))
-    (when (null? win)
-      (println "SDL_CreateWindow failed")
-      (return 1))
-    (println "hello SDL")
-    (SDL_DestroyWindow win))
-  (SDL_Quit)
-  (return 0))
+; Fatal errors propagate here as Results; this is the only place that exits on one.
+(defn main (argc:i32 argv:ptr:CStr):int
+  (args-init argc argv)
+  (match (doom-main)
+    ((ok) 0)
+    ((err e) (eprintln "nuc-doom: " (err-message e)) 1)))

@@ -1,0 +1,42 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Command-line parameters (m_argv.c). Response files are not supported.
+
+(ns doom.args)
+
+(import-use nucleus.strview)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.char)
+
+(defvar args:(Vector StrView) (make (Vector StrView)))
+
+(defn args-init (argc:i32 argv:ptr:CStr):void
+  (dotimes (i argc)
+    (conj &args (strview-from-cstr (aref argv i)))))
+
+(defn arg-count ():i32 (unsafe/cast i32 (count &args)))
+
+(defn arg (i:i32):StrView (&args (as usize i)))
+
+(defn- ascii-ieq (a:StrView b:StrView):bool
+  (when (!= (a 'len) (b 'len)) (return false))
+  (dotimes (i (a 'len))
+    (when (!= (char-ascii-lower (as Char (aref (a 'data) i)))
+              (char-ascii-lower (as Char (aref (b 'data) i))))
+      (return false)))
+  true)
+
+; The index of `name` (case-insensitive) with at least `nargs` arguments after
+; it, or 0 when absent, so the result reads as a truth value like the C's.
+(defn check-parm-with-args (name:StrView nargs:i32):i32
+  (let (i:i32 1)
+    (while (< i (- (arg-count) nargs))
+      (when (ascii-ieq (arg i) name) (return i))
+      (inc! i)))
+  0)
+
+(defn check-parm (name:StrView):i32 (check-parm-with-args name 0))
+
+(defn parm-exists? (name:StrView):bool (!= (check-parm name) 0))

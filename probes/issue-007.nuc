@@ -1,0 +1,10 @@
+; ISSUE-007: `unwrap-or` refuses a value Maybe such as the `?usize` that
+; strview-find returns. Expected: 2 (the index of "c"). Actual: "unwrap-or:
+; value must be (Maybe (ref ...)) — launder an unchecked pointer with (as-ref ...)".
+; fixed-when: runs
+(import-use nucleus.strview)
+
+(defn main ():int
+  (let (hay:StrView "abc" needle:StrView "c"
+        at:usize (unwrap-or (strview-find &hay &needle) 99))
+    (return (if (= at 2) 0 1))))

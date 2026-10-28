@@ -1,0 +1,112 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The SDL presentation layer (i_video.c): the indexed screen goes through the
+; palette into an ARGB texture, which SDL scales to the window at 4:3.
+; Also -framedump, the reference harness's frame capture.
+
+(ns doom.sys.video)
+
+(import-use "SDL2/SDL.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.video)
+(import-use doom.args)
+
+(deferror sdl-init-failed "SDL video initialization failed")
+(deferror framedump-write-failed "framedump: cannot write a frame")
+
+(defvar window:ptr null)
+(defvar renderer:ptr null)
+(defvar texture:ptr null)
+(defvar argb:(array ui32 64000))
+
+(defn init-graphics ():!void
+  (when (!= (SDL_InitSubSystem SDL_INIT_VIDEO) 0) (return (err sdl-init-failed)))
+  (set! window (SDL_CreateWindow "nuc-doom" SDL_WINDOWPOS_UNDEFINED_MASK SDL_WINDOWPOS_UNDEFINED_MASK ; ISSUE-002
+                                 640 480 SDL_WINDOW_RESIZABLE))
+  (when (null? window) (return (err sdl-init-failed)))
+  (set! renderer (SDL_CreateRenderer window -1 0))
+  (when (null? renderer) (return (err sdl-init-failed)))
+  ; 320x200 pixels shown 4:3, as the original's non-square VGA pixels were.
+  (SDL_RenderSetLogicalSize renderer SCREEN-WIDTH 240)
+  (set! texture (SDL_CreateTexture renderer SDL_PIXELFORMAT_ARGB8888 SDL_TEXTUREACCESS_STREAMING
+                                   SCREEN-WIDTH SCREEN-HEIGHT))
+  (when (null? texture) (return (err sdl-init-failed)))
+  (ok))
+
+(defn shutdown-graphics ():void
+  (when (not (null? texture)) (SDL_DestroyTexture texture))
+  (when (not (null? renderer)) (SDL_DestroyRenderer renderer))
+  (when (not (null? window)) (SDL_DestroyWindow window))
+  (SDL_QuitSubSystem SDL_INIT_VIDEO))
+
+(defn finish-update ():void
+  (dotimes (i SCREEN-SIZE)
+    (let (c (* 3 (as i32 (aref screen i))))
+      (set! (aref argb i)
+            (bit-or (bit-or 0xff000000 (bit-shl (as ui32 (aref palette-rgb c)) 16))
+                    (bit-or (bit-shl (as ui32 (aref palette-rgb (+ c 1))) 8)
+                            (as ui32 (aref palette-rgb (+ c 2))))))))
+  (SDL_UpdateTexture texture null (unsafe/cast ptr &argb) (* SCREEN-WIDTH 4))
+  (SDL_RenderClear renderer)
+  (SDL_RenderCopy renderer texture null null)
+  (SDL_RenderPresent renderer))
+
+;; -framedump <tic,tic,...> <dir>: after a normal (non-wipe) update at a listed
+;; gametic, write the frame as <dir>/ticNNNNN.ppm; exit after the last one.
+
+(defvar dump-tics:(array i32 64))
+(defvar dump-count:i32 0)
+(defvar dump-done:i32 0)
+(defvar dump-dir:StrView "")
+
+(defn framedump-init ():void
+  (let (p (check-parm-with-args "-framedump" 2))
+    (when (!= p 0)
+      (let (list (arg (+ p 1)) n:i32 0 any false)
+        (dotimes (i (list 'len))
+          (let (c (aref (list 'data) i))
+            (if (and (>= c 48) (<= c 57))
+              (do (set! n (+ (* n 10) (as i32 (- c 48)))) (set! any true))
+              (do (when (and any (< dump-count 64))
+                    (set! (aref dump-tics dump-count) n)
+                    (inc! dump-count))
+                  (set! n 0) (set! any false)))))
+        (when (and any (< dump-count 64))
+          (set! (aref dump-tics dump-count) n)
+          (inc! dump-count)))
+      (set! dump-dir (arg (+ p 2))))))
+
+(defn- write-frame (tic:i32):!void
+  (let (num:String (pad-tic tic)
+        path:String (str dump-dir "/tic" (string-as-view &num) ".ppm")
+        f (fopen (string-as-cstr &path) "wb"))
+    (when (null? f) (return (err framedump-write-failed)))
+    (fprintf f "P6\n%d %d\n255\n" SCREEN-WIDTH SCREEN-HEIGHT)
+    (dotimes (i SCREEN-SIZE)
+      (let (c (* 3 (as i32 (aref screen i))))
+        (fputc (as i32 (aref palette-rgb c)) f)
+        (fputc (as i32 (aref palette-rgb (+ c 1))) f)
+        (fputc (as i32 (aref palette-rgb (+ c 2))) f)))
+    (fclose f))
+  (ok))
+
+(defn- pad-tic (tic:i32):String
+  (let (s (str tic))
+    (while (< ((string-as-view &s) 'len) 5)
+      (set! s (str "0" (string-as-view &s))))
+    s))
+
+(defn framedump-check (tic:i32):!void
+  (dotimes (i dump-count)
+    (when (= (aref dump-tics i) tic)
+      (try (write-frame tic))
+      (set! (aref dump-tics i) -1)
+      (inc! dump-done)
+      (when (= dump-done dump-count) (exit 0))))
+  (ok))

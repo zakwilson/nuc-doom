@@ -1,0 +1,12 @@
+; ISSUE-003: an `if` in implicit-return position whose branches are a struct
+; value and a struct compound literal returns zeroinitializer.
+; Expected: prints 7 (or a compile error, as the same `if` in a `let` gets).
+; Actual: prints 0; the IR stores `zeroinitializer` with no phi.
+; fixed-when: output-contains pick=7
+(import-use "stdio.h")
+(defstruct Fx v:i32)
+(defconst BIG (Fx 7))
+(defn pick (c:bool):Fx (if c BIG (Fx 3)))
+(defn main ():int
+  (printf "pick=%d\n" ((pick true) 'v))
+  (return 0))

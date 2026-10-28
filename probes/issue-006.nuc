@@ -1,0 +1,11 @@
+; ISSUE-006: a C header's global variables (stdio.h's `stderr`, unistd.h's
+; `optind`) are not imported. Expected: `stderr` resolves to glibc's
+; `extern FILE *stderr`. Actual: "undefined: stderr — not defined anywhere in
+; this compilation unit". With nucleus.vector also imported, the message
+; instead blames "namespace 'nucleus.vector', which this file does not import".
+; fixed-when: runs
+(import-use "stdio.h")
+
+(defn main ():int
+  (fprintf stderr "to stderr\n")
+  (return 0))

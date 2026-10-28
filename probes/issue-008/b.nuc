@@ -1,0 +1,7 @@
+(ns issue-008.b)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(defn small ():usize
+  (let (v (make (Vector i64)))
+    (conj &v 1)
+    (count &v)))

@@ -1,0 +1,26 @@
+(ns tests.wad)
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.test)
+(import-use doom.wad)
+(import-use doom.bytes)
+(import-use tests.env)
+
+(deftest wad-directory
+  (try (ensure-iwad))
+  (try (check-eq-int (num-lumps) 1270 "lump count"))
+  (try (check-eq-int (check-num-for-name "PLAYPAL") 0 "PLAYPAL"))
+  (try (check-eq-int (check-num-for-name "playpal") 0 "playpal"))
+  (try (check-eq-int (lump-length (try (lump-num "TITLEPIC"))) 68168 "TITLEPIC size"))
+  ; The last of the nine THINGS lumps wins, as a PWAD's would.
+  (try (check-eq-int (check-num-for-name "THINGS") 95 "THINGS"))
+  (try (check-eq-int (check-num-for-name "NOSUCH") -1 "absent"))
+  (let (n:String (lump-name 1))
+    (try (check-eq (string-as-view &n) "COLORMAP"))))
+
+(deftest wad-lump-bytes
+  (try (ensure-iwad))
+  (let (pal (try (lump-named "PLAYPAL")))
+    (try (check-eq-int (pal 'len) 10752 "PLAYPAL len"))
+    (try (check-eq-int (u8 pal 0) 0 "first byte"))))

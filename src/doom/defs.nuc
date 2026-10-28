@@ -1,0 +1,66 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Game-wide enums and constants (doomdef.h, d_mode.h, doomdata.h, i_timer.h).
+
+(ns doom.defs)
+
+(defconst DOOM-VERSION 109)
+(defconst MAX-PLAYERS 4)
+(defconst TIC-RATE 35)
+
+(defenum GameMission DOOM DOOM2 PACK-TNT PACK-PLUT PACK-CHEX PACK-HACX)
+(defenum GameMode SHAREWARE REGISTERED COMMERCIAL RETAIL INDETERMINED)
+
+; sk_noitems (-1) is the "-skill 0" hack; the rest count up from sk_baby.
+(defconst SK-NO-ITEMS -1)
+(defenum Skill SK-BABY SK-EASY SK-MEDIUM SK-HARD SK-NIGHTMARE)
+
+(defenum GameState GS-LEVEL GS-INTERMISSION GS-FINALE GS-DEMOSCREEN)
+
+(defenum GameAction
+  GA-NOTHING GA-LOAD-LEVEL GA-NEW-GAME GA-LOAD-GAME GA-SAVE-GAME GA-PLAY-DEMO
+  GA-COMPLETED GA-VICTORY GA-WORLD-DONE GA-SCREENSHOT)
+
+; Map thing options.
+(defconst MTF-EASY 1)
+(defconst MTF-NORMAL 2)
+(defconst MTF-HARD 4)
+(defconst MTF-AMBUSH 8)
+
+(defenum Card IT-BLUE-CARD IT-YELLOW-CARD IT-RED-CARD IT-BLUE-SKULL IT-YELLOW-SKULL IT-RED-SKULL
+  NUM-CARDS)
+
+(defenum WeaponType
+  WP-FIST WP-PISTOL WP-SHOTGUN WP-CHAINGUN WP-MISSILE WP-PLASMA WP-BFG WP-CHAINSAW
+  WP-SUPERSHOTGUN NUM-WEAPONS WP-NOCHANGE)
+
+(defenum AmmoType AM-CLIP AM-SHELL AM-CELL AM-MISL NUM-AMMO AM-NOAMMO)
+
+(defenum PowerType
+  PW-INVULNERABILITY PW-STRENGTH PW-INVISIBILITY PW-IRONFEET PW-ALLMAP PW-INFRARED NUM-POWERS)
+
+(defconst INVULN-TICS (* 30 TIC-RATE))
+(defconst INVIS-TICS (* 60 TIC-RATE))
+(defconst INFRA-TICS (* 120 TIC-RATE))
+(defconst IRON-TICS (* 60 TIC-RATE))
+
+;; Map lumps (doomdata.h): the offsets after a map's marker lump.
+
+(defenum MapLump
+  ML-LABEL ML-THINGS ML-LINEDEFS ML-SIDEDEFS ML-VERTEXES ML-SEGS ML-SSECTORS ML-NODES
+  ML-SECTORS ML-REJECT ML-BLOCKMAP)
+
+; Linedef flags.
+(defconst ML-BLOCKING 1)
+(defconst ML-BLOCKMONSTERS 2)
+(defconst ML-TWOSIDED 4)
+(defconst ML-DONTPEGTOP 8)
+(defconst ML-DONTPEGBOTTOM 16)
+(defconst ML-SECRET 32)
+(defconst ML-SOUNDBLOCK 64)
+(defconst ML-DONTDRAW 128)
+(defconst ML-MAPPED 256)
+
+; A BSP child index with this bit set is a subsector.
+(defconst NF-SUBSECTOR 0x8000)

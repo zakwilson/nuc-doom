@@ -1,0 +1,78 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Startup and the main loop (d_main.c, the single-player half of d_loop.c).
+
+(ns doom.main)
+
+(import-use "SDL2/SDL.h")
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.io)
+(import-use doom.args)
+(import-use doom.wad)
+(import-use doom.video)
+(import-use doom.sys.video)
+(import-use doom.defs)
+
+(defvar gametic:i32 0)
+; One tic per frame, as fast as possible: for -framedump and -timedemo.
+(defvar single-tics:bool false)
+(defvar quit-requested:bool false)
+
+(defvar page-name:StrView "TITLEPIC")
+
+(defn get-time ():i32
+  (unsafe/cast i32 (/ (* (as ui64 (SDL_GetTicks)) TIC-RATE) 1000)))
+
+(defn- add-wad-files ():!void
+  (let (p (check-parm-with-args "-iwad" 1)
+        iwad:StrView (if (!= p 0) (arg (+ p 1)) "DOOM1.WAD"))
+    (try (add-file iwad)))
+  (let (p (check-parm "-file"))
+    (when (!= p 0)
+      (let (i (+ p 1))
+        (while (and (< i (arg-count)) (!= (aref ((arg i) 'data) 0) 45))
+          (try (add-file (arg i)))
+          (inc! i)))))
+  (ok))
+
+; SDL_Event imports opaque (ISSUE-011), so events land in a buffer of its size
+; and are read through the member structs, which do import.
+(defstruct EventBuf words:(array ui64 8))
+
+(defn- pump-events ():void
+  (let (buf:&EventBuf (alloca EventBuf)
+        ev (unsafe/cast ptr:SDL_Event buf)) ; ISSUE-011
+    (while (!= (SDL_PollEvent ev) 0)
+      (when (= ((unsafe/cast ptr:SDL_CommonEvent buf) 'type) SDL_QUIT)
+        (set! quit-requested true)))))
+
+(defn- ticker ():void
+  (inc! gametic))
+
+(defn- display ():!void
+  (try (draw-patch 0 0 (try (patch-named page-name))))
+  (finish-update)
+  (try (framedump-check gametic))
+  (ok))
+
+(defn doom-main ():!void
+  (try (add-wad-files))
+  (set-palette (try (lump-named "PLAYPAL")))
+  (framedump-init)
+  (set! single-tics (parm-exists? "-framedump"))
+  (try (init-graphics))
+  (let (last (get-time))
+    (while (not quit-requested)
+      (pump-events)
+      (if single-tics
+        (ticker)
+        (let (now (get-time))
+          (while (< last now)
+            (ticker)
+            (inc! last))))
+      (try (display))
+      (when (not single-tics) (SDL_Delay 1))))
+  (shutdown-graphics)
+  (ok))

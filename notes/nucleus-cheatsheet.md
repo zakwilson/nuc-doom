@@ -23,3 +23,22 @@ Distilled from `nucleus/docs` while porting. Not authoritative; the docs are.
 - `import-use lib` flattens; `(import lib p)` -> `p/name`; prefixes are file-scoped. A file must import libs it uses.
 - One definition per name per unit; overloads are per (name, param types).
 - Bare `"x"` literal → `StrView`.
+
+## Learned while porting
+- Equality is `=`/`!=`, not `==`. `(null? x)`.
+- `bit-shr` is arithmetic on signed, logical on unsigned. Two typed i32 wrap on overflow.
+- Imports: `doom.math` -> `src/doom/math.nuc`; `(ns doom.math)` at top.
+- Constants style: UPPER-KEBAB (`FRAC-UNIT`), as in the stdlib.
+- C function-like macros aren't imported (ISSUE-002); spell their expansion.
+- Struct literal `(S ...)` is `&S` (alloca); it loads in typed by-value slots.
+- No ui64 Hash; i32/i64/usize/StrView/CStr are Hash.
+- No generic panic in stdlib: fprintf stderr + abort.
+- StrView fns take `&StrView` mostly (`strview-find &sv &needle` -> ?usize);
+  `strview-drop-bytes` takes by value.
+- Test binary: `scripts/run-tests.sh` (test/build.edn, ISSUE-004).
+- Macro row tables: `(defmacro- over-X (m :rest args) `(~m ~@args row...))`, then
+  `(over-X def-enum-rows Name)` etc. from doom.tablegen.
+- `--emit-llvm` prints IR to stdout (unoptimized). Default opt is -O0.
+- `str` takes `&String`, not a String value.
+- A local named like a function shadows it: `(lump lump)` gives "no matching
+  method for overloaded 'invoke' with argument types (i32, i32)". (candidate papercut)

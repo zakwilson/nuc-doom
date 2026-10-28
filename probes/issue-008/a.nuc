@@ -1,0 +1,12 @@
+(ns issue-008.a)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(defstruct Lump key:i64 size:i32)
+(defvar lumps:(Vector Lump) (make (Vector Lump)))
+(defvar index:(HashMap i64 i32) (make (HashMap i64 i32)))
+(defn- add-lump (l:Lump):void
+  (assoc &index (l 'key) (unsafe/cast i32 (count &lumps)))
+  (conj &lumps l))
+(defn num-lumps ():i32 (unsafe/cast i32 (count &lumps)))
+(defn add (l:Lump):void (add-lump l))

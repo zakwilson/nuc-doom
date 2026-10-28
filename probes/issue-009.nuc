@@ -1,0 +1,13 @@
+; ISSUE-009: `bit-or` with three constants in a global initializer reports
+; "defvar: init must be a compile-time constant (a literal, a named constant,
+; or an expression over them)" -- naming `defvar` for a `defconst`, and hiding
+; the real cause, which a function body reports as "bit-or expects 2 args".
+; Expected: the arity error (or, better, a variadic bit-or like `+`).
+; fixed-when: output-contains expects 2 args
+(defconst A 1)
+(defconst B 2)
+(defconst C 4)
+(defconst FLAGS (array i32 (bit-or A B C)))
+
+(defn main ():int
+  (return (if (= (aref FLAGS 0) 7) 0 1)))

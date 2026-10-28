@@ -1,0 +1,86 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; 16.16 fixed point and binary angles (m_fixed.c, tables.h). Fixed is a
+; one-field struct rather than an alias so it can't be mixed with a plain int.
+
+(ns doom.math)
+
+(import-use doom.tables)
+
+(defconst FRAC-BITS 16)
+(defconst FRAC-UNIT 65536)
+
+(defstruct Fixed v:i32)
+
+(defconst FIXED-ZERO (Fixed 0))
+(defconst FIXED-ONE (Fixed FRAC-UNIT))
+(defconst FIXED-MAX (Fixed 2147483647))
+(defconst FIXED-MIN (Fixed -2147483648))
+
+(defn fx (n:i32):Fixed (Fixed (bit-shl n FRAC-BITS)))
+(defn fx-raw (v:i32):Fixed (Fixed v))
+(defn fx-int (a:Fixed):i32 (bit-shr (a 'v) FRAC-BITS))
+
+(defn _+ (a:Fixed b:Fixed):Fixed (Fixed (+ (a 'v) (b 'v))))
+(defn _- (a:Fixed b:Fixed):Fixed (Fixed (- (a 'v) (b 'v))))
+(defn fx-neg (a:Fixed):Fixed (Fixed (- 0 (a 'v))))
+
+(defn _* (a:Fixed b:Fixed):Fixed
+  (Fixed (unsafe/cast i32 (bit-shr (* (as i64 (a 'v)) (as i64 (b 'v))) FRAC-BITS))))
+(defn _* (a:Fixed n:i32):Fixed (Fixed (* (a 'v) n)))
+(defn _* (n:i32 a:Fixed):Fixed (Fixed (* (a 'v) n)))
+
+; Wraps on INT_MIN exactly as C's abs() does in practice; FixedDiv relies on it.
+(defn- iabs (x:i32):i32 (if (< x 0) (- 0 x) x))
+
+(defn _/ (a:Fixed b:Fixed):Fixed
+  (if (>= (bit-shr (iabs (a 'v)) 14) (iabs (b 'v)))
+    (if (< (bit-xor (a 'v) (b 'v)) 0) FIXED-MIN FIXED-MAX)
+    (Fixed (unsafe/cast i32 (/ (bit-shl (as i64 (a 'v)) FRAC-BITS) (as i64 (b 'v)))))))
+(defn _/ (a:Fixed n:i32):Fixed (Fixed (/ (a 'v) n)))
+
+(defn fx-shr (a:Fixed n:i32):Fixed (Fixed (bit-shr (a 'v) n)))
+(defn fx-shl (a:Fixed n:i32):Fixed (Fixed (bit-shl (a 'v) n)))
+(defn fx-abs (a:Fixed):Fixed (Fixed (iabs (a 'v))))
+
+(defn = (a:Fixed b:Fixed):bool (= (a 'v) (b 'v)))
+(defn != (a:Fixed b:Fixed):bool (!= (a 'v) (b 'v)))
+(defn < (a:Fixed b:Fixed):bool (< (a 'v) (b 'v)))
+(defn <= (a:Fixed b:Fixed):bool (<= (a 'v) (b 'v)))
+(defn > (a:Fixed b:Fixed):bool (> (a 'v) (b 'v)))
+(defn >= (a:Fixed b:Fixed):bool (>= (a 'v) (b 'v)))
+
+;; Binary angles: the full circle is 2^32 and wraps.
+
+(deftype Angle ui32)
+
+(defconst ANG45 0x20000000)
+(defconst ANG90 0x40000000)
+(defconst ANG180 0x80000000)
+(defconst ANG270 0xc0000000)
+(defconst ANG-MAX 0xffffffff)
+(defconst ANG1 (/ ANG45 45))
+(defconst ANG60 (/ ANG180 3))
+
+(defconst FINE-ANGLES 8192)
+(defconst FINE-MASK 8191)
+(defconst ANGLE-TO-FINE-SHIFT 19)
+
+(defconst SLOPE-RANGE 2048)
+(defconst SLOPE-BITS 11)
+(defconst DBITS 5)
+
+(defn fine-index (a:Angle):i32 (as i32 (bit-shr a ANGLE-TO-FINE-SHIFT)))
+
+; The cosine table is the sine table a quarter turn on.
+(defn fine-sine (i:i32):Fixed (Fixed (aref fine-sine-table i)))
+(defn fine-cosine (i:i32):Fixed (Fixed (aref fine-sine-table (+ i (/ FINE-ANGLES 4)))))
+(defn fine-tangent (i:i32):Fixed (Fixed (aref fine-tangent-table i)))
+(defn tan-to-angle (i:i32):Angle (aref tan-to-angle-table i))
+
+(defn slope-div (num:ui32 den:ui32):i32
+  (if (< den 512)
+    SLOPE-RANGE
+    (let (ans (/ (bit-shl num 3) (bit-shr den 8)))
+      (if (<= ans SLOPE-RANGE) (as i32 ans) SLOPE-RANGE))))

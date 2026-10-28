@@ -1,0 +1,18 @@
+(ns tests.math)
+(import-use nucleus.error)
+(import-use nucleus.test)
+(import-use doom.math)
+
+(deftest fixed-mul-matches-c
+  (try (check-eq-int ((* (fx 3) (fx 2)) 'v) (* 6 FRAC-UNIT) "3*2"))
+  (try (check-eq-int ((* (fx-raw -98304) (fx-raw 32768)) 'v) -49152 "-1.5*0.5")))
+
+(deftest fixed-div-clamps
+  (try (check-eq-int ((/ (fx 1) (fx-raw 1)) 'v) 2147483647 "1/eps"))
+  (try (check-eq-int ((/ (fx -1) (fx-raw 1)) 'v) -2147483648 "-1/eps"))
+  (try (check-eq-int ((/ (fx 3) (fx 2)) 'v) 98304 "3/2")))
+
+(deftest fine-tables-line-up
+  (try (check-eq-int ((fine-sine 0) 'v) 25 "sin 0"))
+  (try (check-eq-int ((fine-cosine 0) 'v) 65535 "cos 0"))
+  (try (check-eq-int (as i64 (tan-to-angle 2048)) 536870912 "atan 1")))

@@ -1,0 +1,97 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The 320x200 indexed screen and the drawing primitives over it (v_video.c),
+; plus the WAD's patch format (v_patch.h).
+
+(ns doom.video)
+
+(import-use "string.h")
+(import-use nucleus.error)
+(import-use doom.bytes)
+(import-use doom.tables)
+(import-use doom.wad)
+
+(defconst SCREEN-WIDTH 320)
+(defconst SCREEN-HEIGHT 200)
+(defconst SCREEN-SIZE 64000)
+
+(deferror bad-patch-draw "patch drawn outside the screen")
+
+(defvar screen:(array ui8 64000))
+; Where drawing goes: the screen, or a wipe's scratch buffer (V_UseBuffer).
+(defvar dest-screen:ptr:ui8 (unsafe/cast ptr:ui8 &screen))
+
+(defn use-buffer (buf:ptr:ui8):void (set! dest-screen buf))
+(defn restore-buffer ():void (set! dest-screen (unsafe/cast ptr:ui8 &screen)))
+
+(defn- pixel-at (x:i32 y:i32):ptr:ui8
+  (unsafe/ptr+ dest-screen (+ (* y SCREEN-WIDTH) x)))
+
+;; Patches: a header, a column offset table, and per column a run of posts
+;; (topdelta, length, pad, pixels…, pad) ended by topdelta 255.
+
+(defstruct Patch data:Bytes)
+
+(defn patch-width (p:Patch):i32 (le-i16 (p 'data) 0))
+(defn patch-height (p:Patch):i32 (le-i16 (p 'data) 2))
+(defn patch-left (p:Patch):i32 (le-i16 (p 'data) 4))
+(defn patch-top (p:Patch):i32 (le-i16 (p 'data) 6))
+(defn patch-column (p:Patch col:i32):i32 (le-i32 (p 'data) (+ 8 (* col 4))))
+
+(defn patch-named (name:StrView):!Patch (ok (Patch (try (lump-named name)))))
+(defn patch-num (i:i32):Patch (Patch (lump i)))
+
+; Copies one patch column's posts down from `top`, a step of SCREEN-WIDTH.
+(defn- draw-column (p:Patch col:i32 top:ptr:ui8):void
+  (let (b (p 'data) at (patch-column p col))
+    (while (!= (u8 b at) 255)
+      (let (delta (u8 b at) len (u8 b (+ at 1))
+            src (sub b (+ at 3) len)
+            dst (unsafe/ptr+ top (* delta SCREEN-WIDTH)))
+        (dotimes (i len)
+          (set! (aref dst (* i SCREEN-WIDTH)) (aref (src 'data) i)))
+        (set! at (+ at len 4))))))
+
+(defn- check-bounds (x:i32 y:i32 p:Patch):!void
+  (when (or (< x 0) (> (+ x (patch-width p)) SCREEN-WIDTH)
+            (< y 0) (> (+ y (patch-height p)) SCREEN-HEIGHT))
+    (return (err bad-patch-draw)))
+  (ok))
+
+(defn draw-patch (x:i32 y:i32 p:Patch):!void
+  (let (x (- x (patch-left p)) y (- y (patch-top p)))
+    (try (check-bounds x y p))
+    (dotimes (col (patch-width p))
+      (draw-column p col (pixel-at (+ x col) y))))
+  (ok))
+
+; Mirrored left to right, for the status bar face.
+(defn draw-patch-flipped (x:i32 y:i32 p:Patch):!void
+  (let (x (- x (patch-left p)) y (- y (patch-top p)) w (patch-width p))
+    (try (check-bounds x y p))
+    (dotimes (col w)
+      (draw-column p (- w 1 col) (pixel-at (+ x col) y))))
+  (ok))
+
+(defn draw-block (x:i32 y:i32 w:i32 h:i32 src:ptr:ui8):void
+  (dotimes (row h)
+    (memcpy (pixel-at x (+ y row)) (unsafe/ptr+ src (* row w)) (as usize w))))
+
+(defn fill-box (x:i32 y:i32 w:i32 h:i32 c:ui8):void
+  (dotimes (row h)
+    (memset (pixel-at x (+ y row)) (as i32 c) (as usize w))))
+
+(defn draw-raw-screen (raw:ptr:ui8):void
+  (memcpy dest-screen raw SCREEN-SIZE))
+
+;; The palette, as the SDL layer will show it: gamma-corrected and with the
+;; low two bits cleared, which is what Chocolate Doom's I_SetPalette does.
+
+(defvar palette-rgb:(array ui8 768))
+(defvar use-gamma:i32 0)
+
+(defn set-palette (pal:Bytes):void
+  (dotimes (i 768)
+    (set! (aref palette-rgb i)
+          (bit-and (aref gamma-table (+ (* use-gamma 256) (u8 pal i))) 252))))
