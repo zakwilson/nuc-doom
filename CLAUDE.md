@@ -52,6 +52,16 @@ Other environment facts:
   carry `:pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}`.
 - **Installed:** SDL2 2.32, SDL2_mixer 2.8, SDL2_net 2.2, clang 19 (the link
   driver) and rsync.
+- **The reference engine** is built by `scripts/build-reference.sh` (it skips
+  the build if the binary exists, so delete `reference/build/src/chocolate-doom`
+  after editing the patch). Always pass `-nosound`, which is much faster and
+  hashes the same. A `-framedump` run exits by itself after its last dump. A
+  `-timedemo` run ends in `I_Error` (exit 255) on the demo's end marker.
+- **Probes** state their own pass condition on a `; fixed-when:` header line
+  (see `scripts/check-probes.sh`).
+- **Keep Bash calls small.** A big compound command (edits plus `rm` of a
+  wildcard plus runs) gets denied by the permission policy. Use Edit for
+  source changes and run steps separately.
 
 ## Commands
 

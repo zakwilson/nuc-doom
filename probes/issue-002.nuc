@@ -1,0 +1,9 @@
+; ISSUE-002: a function-like C macro is reported as "not defined anywhere".
+; Expected: the diagnostic says stdint.h defines INT64_C as a function-like
+; macro, which isn't imported. Actual: "undefined: INT64_C — not defined anywhere".
+; fixed-when: output-contains stdint.h
+(import-use "stdint.h")
+
+(defn main ():int
+  (let (x:i64 (INT64_C 5))
+    (return (unsafe/cast i32 x))))

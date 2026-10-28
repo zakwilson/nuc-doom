@@ -1,0 +1,184 @@
+--- a/src/doom/d_net.c
++++ b/src/doom/d_net.c
+@@ -36,6 +36,66 @@
+ 
+ #include "d_loop.h"
+ 
++// nuc-doom reference harness: per-tic state hash (-tichash <file>).
++#include <stdio.h>
++#include <stdint.h>
++#include "p_local.h"
++
++extern int rndindex, prndindex;
++static FILE *tichash_file = NULL;
++
++static uint32_t TicHashInt(uint32_t h, int32_t v)
++{
++    uint32_t u = (uint32_t) v;
++    int b;
++    for (b = 0; b < 4; ++b)
++    {
++        h ^= (u >> (8 * b)) & 0xff;
++        h *= 16777619u;
++    }
++    return h;
++}
++
++static void TicHashWrite(void)
++{
++    thinker_t *th;
++    uint32_t h = 2166136261u;
++    int i;
++
++    for (th = thinkercap.next; th != &thinkercap; th = th->next)
++    {
++        mobj_t *mo;
++        if (th->function.acp1 != (actionf_p1) P_MobjThinker)
++            continue;
++        mo = (mobj_t *) th;
++        h = TicHashInt(h, mo->x);
++        h = TicHashInt(h, mo->y);
++        h = TicHashInt(h, mo->z);
++        h = TicHashInt(h, (int32_t) mo->angle);
++        h = TicHashInt(h, mo->momx);
++        h = TicHashInt(h, mo->momy);
++        h = TicHashInt(h, mo->momz);
++        h = TicHashInt(h, mo->health);
++        h = TicHashInt(h, mo->type);
++        h = TicHashInt(h, (int32_t) (mo->state - states));
++        h = TicHashInt(h, mo->flags);
++    }
++    fprintf(tichash_file, "tic=%d rnd=%d prnd=%d mobj=%08x",
++            gametic, rndindex, prndindex, h);
++    for (i = 0; i < MAXPLAYERS; ++i)
++    {
++        player_t *p = &players[i];
++        if (!playeringame[i])
++            continue;
++        fprintf(tichash_file, " p%d=%d,%d,%d,%d,%d,%d", i, p->health,
++                p->armorpoints, p->readyweapon, p->killcount, p->itemcount,
++                p->secretcount);
++    }
++    fputc('\n', tichash_file);
++    fflush(tichash_file);
++}
++
++
+ ticcmd_t *netcmds;
+ 
+ // Called when a player leaves the game
+@@ -89,6 +149,19 @@
+         D_DoAdvanceDemo ();
+ 
+     G_Ticker ();
++
++    if (tichash_file == NULL)
++    {
++        int p = M_CheckParmWithArgs("-tichash", 1);
++        if (p > 0)
++        {
++            tichash_file = fopen(myargv[p + 1], "w");
++        }
++    }
++    if (tichash_file != NULL)
++    {
++        TicHashWrite();
++    }
+ }
+ 
+ static loop_interface_t doom_loop_interface = {
+--- a/src/doom/d_main.c
++++ b/src/doom/d_main.c
+@@ -446,6 +446,7 @@
+         } else {
+             // normal update
+             I_FinishUpdate ();              // page flip or blit buffer
++            I_FrameDumpCheck(gametic);
+         }
+     }
+ }
+--- a/src/i_video.c
++++ b/src/i_video.c
+@@ -698,6 +698,59 @@
+     }
+ }
+ 
++// nuc-doom reference harness: -framedump <tic,tic,...> <dir> writes the
++// indexed framebuffer through the current palette as <dir>/tic%05d.ppm.
++void I_FrameDumpCheck(int tic)
++{
++    static int parsed = 0;
++    static int tics[64];
++    static int ntics = 0, done = 0;
++    static const char *dir = NULL;
++    int i;
++
++    if (!parsed)
++    {
++        int p = M_CheckParmWithArgs("-framedump", 2);
++        parsed = 1;
++        if (p > 0)
++        {
++            char *list = M_StringDuplicate(myargv[p + 1]);
++            char *tok = strtok(list, ",");
++            while (tok != NULL && ntics < 64)
++            {
++                tics[ntics++] = atoi(tok);
++                tok = strtok(NULL, ",");
++            }
++            dir = myargv[p + 2];
++        }
++    }
++    for (i = 0; i < ntics; ++i)
++    {
++        if (tics[i] == tic)
++        {
++            char path[512];
++            FILE *f;
++            int x;
++            M_snprintf(path, sizeof(path), "%s/tic%05d.ppm", dir, tic);
++            f = fopen(path, "wb");
++            if (f == NULL)
++                I_Error("framedump: cannot write %s", path);
++            fprintf(f, "P6\n%d %d\n255\n", SCREENWIDTH, SCREENHEIGHT);
++            for (x = 0; x < SCREENWIDTH * SCREENHEIGHT; ++x)
++            {
++                SDL_Color *c = &palette[I_VideoBuffer[x]];
++                fputc(c->r, f);
++                fputc(c->g, f);
++                fputc(c->b, f);
++            }
++            fclose(f);
++            tics[i] = -1;
++            if (++done == ntics)
++                exit(0);
++        }
++    }
++}
++
+ //
+ // I_FinishUpdate
+ //
+--- a/src/i_video.h
++++ b/src/i_video.h
+@@ -48,6 +48,7 @@
+ 
+ void I_UpdateNoBlit (void);
+ void I_FinishUpdate (void);
++void I_FrameDumpCheck(int tic);
+ 
+ void I_ReadScreen (pixel_t* scr);
+ 
+--- a/src/d_loop.c
++++ b/src/d_loop.c
+@@ -688,6 +688,10 @@
+     realtics = entertic - oldentertics;
+     oldentertics = entertic;
+ 
++    // nuc-doom: framedumps want exactly one tic per displayed frame.
++    if (M_CheckParm("-framedump") > 0)
++        singletics = true;
++
+     // in singletics mode, run a single tic every time this function
+     // is called.
+ 
