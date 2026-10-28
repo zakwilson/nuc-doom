@@ -1,0 +1,7 @@
+; ISSUE-019: a parameter that shadows a function makes calls to the function
+; fail with "value is not callable: no `invoke` method is defined for this
+; type", which names neither the shadowing nor the function.
+; fixed-when: output-contains shadow
+(defn fx (n:i32):i32 (* n 2))
+(defn g (fx:i32):i32 (fx 3))
+(defn main ():i32 (g 1))

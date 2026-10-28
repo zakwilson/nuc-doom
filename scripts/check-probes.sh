@@ -5,7 +5,8 @@
 #   ; fixed-when: runs                   it compiles, runs and exits 0
 #   ; fixed-when: compile-fails          the compiler rejects it
 #   ; fixed-when: output-contains TEXT   compiler or program output contains TEXT
-# and optionally `; flags: ...` with extra nucleusc arguments.
+# and optionally `; flags: ...` with extra nucleusc arguments ($ROOT expands to
+# the repo root).
 # Usage: scripts/check-probes.sh [issue-NNN ...]
 set -uo pipefail
 
@@ -27,6 +28,7 @@ for p in "${probes[@]}"; do
     id=$(basename "$p" .nuc)
     rule=$(sed -n 's/^; fixed-when: *//p' "$p" | head -1)
     flags=$(sed -n 's/^; flags: *//p' "$p" | head -1)
+    flags=${flags//\$ROOT/$ROOT}
     out="$TMP/$id.out"
     # shellcheck disable=SC2086
     (cd "$ROOT" && "$NUCLEUSC" $flags "$p" -o "$TMP/$id") > "$out" 2>&1

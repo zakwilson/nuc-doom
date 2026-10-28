@@ -1,0 +1,8 @@
+; ISSUE-016: a defvar initialized with an aggregate defconst is refused, though
+; docs/toplevel.md says naming one "runs at startup". Actual: "defvar: a Fx slot
+; must be initialized with a (Fx ...) compound literal".
+; fixed-when: runs
+(defstruct Fx v:i32)
+(defconst ZERO (Fx 0))
+(defvar g:Fx ZERO)
+(defn main ():i32 (g 'v))

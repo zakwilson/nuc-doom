@@ -1,0 +1,9 @@
+; ISSUE-013: a struct template stamped over a nullable pointer (?&M) gets a
+; non-null field, so it refuses null. Known: design/deferred/overview.md,
+; "A template stamp loses the pointer kind".
+; fixed-when: runs
+(defstruct M v:i32)
+(defstruct (Box T) x:T)
+(defn main ():i32
+  (let (b:(Box ?&M) ((Box ?&M) null))
+    (if (null? (b 'x)) 0 1)))

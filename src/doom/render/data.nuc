@@ -1,0 +1,298 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Wall textures, flats, sprite lumps and colormaps (r_data.c), and the sprite
+; frame tables (R_InitSprites in r_things.c).
+
+(ns doom.render.data)
+
+(import-use "stdio.h")
+(import-use "string.h")
+(import-use nucleus.arena)
+(import-use nucleus.create)
+(import-use nucleus.hashmap)
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+(import-use doom.math)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.table)
+(import-use doom.system)
+(import-use doom.info)
+
+;; Textures: each is built from patches. A column covered by exactly one patch
+;; is drawn straight from that patch's lump; any other column comes from a
+;; composite assembled on first use.
+
+(defstruct TexPatch origin-x:i32 origin-y:i32 patch:i32)
+
+(defstruct Texture
+  name:i64 width:i32 height:i32 width-mask:i32
+  patch-count:i32 patches:ptr:TexPatch
+  ; Per column: the patch lump, or -1 for the composite, and the byte offset
+  ; of the column's pixels in that lump or composite.
+  column-lump:ptr:i16 column-ofs:ptr:ui16
+  composite:ptr:ui8 composite-size:i32)
+
+(defvar textures:&(Table Texture) (new (Table Texture) g-arena))
+; Animated walls swap entries here (p_spec.c).
+(defvar texture-translation:&(Table i32) (new (Table i32) g-arena))
+; Name to texture number; the first texture with a name wins, as in the C's
+; chained hash.
+(defvar texture-by-name:(HashMap i64 i32) (make (HashMap i64 i32)))
+
+(defn texture-height (tex:i32):Fixed (fx ((textures tex) 'height)))
+
+; Posts of a patch column into a composite column `height` tall, clipped.
+(defn- draw-column-in-cache (b:Bytes at:i32 cache:ptr:ui8 origin-y:i32 height:i32):void
+  (while (!= (u8 b at) 255)
+    (let (len (u8 b (+ at 1))
+          pos (+ origin-y (u8 b at))
+          count len)
+      (when (< pos 0) (set! count (+ count pos)) (set! pos 0))
+      (when (> (+ pos count) height) (set! count (- height pos)))
+      (when (> count 0)
+        (memcpy (unsafe/ptr+ cache pos) (unsafe/ptr+ (b 'data) (+ at 3)) (as usize count)))
+      (set! at (+ at len 4)))))
+
+; The patch's horizontal span clipped to the texture, as [x, x2).
+(defn- patch-span (t:&Texture p:&TexPatch):i32
+  (let (x2 (+ (p 'origin-x) (le-i16 (lump (p 'patch)) 0)))
+    (if (> x2 (t 'width)) (t 'width) x2)))
+
+(defn- generate-composite (tex:i32):void
+  (let (t (textures tex)
+        block (unsafe/cast ptr:ui8 (arena-alloc (as i64 (t 'composite-size)))))
+    (dotimes (i (t 'patch-count))
+      (let (p (unsafe/cast &TexPatch (unsafe/ptr+ (t 'patches) i))
+            b (lump (p 'patch))
+            x1 (p 'origin-x)
+            x (if (< x1 0) 0 x1)
+            x2 (patch-span t p))
+        (while (< x x2)
+          (when (< (aref (t 'column-lump) x) 0)
+            (draw-column-in-cache b (le-i32 b (+ 8 (* 4 (- x x1))))
+                                  (unsafe/ptr+ block (as i32 (aref (t 'column-ofs) x)))
+                                  (p 'origin-y) (t 'height)))
+          (inc! x))))
+    (set! (t 'composite) block)))
+
+(defn- generate-lookup (tex:i32):void
+  (let (t (textures tex)
+        counts (unsafe/cast ptr:ui8 (arena-alloc (as i64 (t 'width)))))
+    (dotimes (i (t 'patch-count))
+      (let (p (unsafe/cast &TexPatch (unsafe/ptr+ (t 'patches) i))
+            b (lump (p 'patch))
+            x1 (p 'origin-x)
+            x (if (< x1 0) 0 x1)
+            x2 (patch-span t p))
+        (while (< x x2)
+          (set! (aref counts x) (+ (aref counts x) 1))
+          (set! (aref (t 'column-lump) x) (p 'patch))
+          (set! (aref (t 'column-ofs) x) (+ (le-i32 b (+ 8 (* 4 (- x x1)))) 3))
+          (inc! x))))
+    (let (x:i32 0 done false)
+      (while (and (< x (t 'width)) (not done))
+        (cond (= (aref counts x) 0) (do (printf "R_GenerateLookup: column without a patch\n") (set! done true))
+          (> (aref counts x) 1) (do (set! (aref (t 'column-lump) x) -1) (set! (aref (t 'column-ofs) x) (t 'composite-size)) (when (> (t 'composite-size) (- 0x10000 (t 'height)))
+             (fatal "R_GenerateLookup: texture is >64k")) (set! (t 'composite-size) (+ (t 'composite-size) (t 'height)))))
+        (inc! x)))))
+
+; The pixels of column `col` (wrapped to the texture's power-of-two width).
+; A single-patch column points into the patch lump, so a texture taller than
+; its patch reads on into the following posts, as vanilla does.
+(defn texture-column (tex:i32 col:i32):ptr:ui8
+  (let (t (textures tex)
+        c (bit-and col (t 'width-mask))
+        l (as i32 (aref (t 'column-lump) c))
+        ofs (as i32 (aref (t 'column-ofs) c)))
+    (if (> l 0)
+      (unsafe/ptr+ ((lump l) 'data) ofs)
+      (do (when (null? (t 'composite)) (generate-composite tex))
+          (unsafe/ptr+ (t 'composite) ofs)))))
+
+(defn- init-textures ():!void
+  (let (names (try (lump-named "PNAMES"))
+        npatches (le-i32 names 0)
+        patch-lookup (unsafe/cast ptr:i32 (arena-alloc (* 4 (as i64 npatches))))
+        tex1 (try (lump-named "TEXTURE1"))
+        has2 (!= (check-num-for-name "TEXTURE2") -1)
+        tex2 (if has2 (try (lump-named "TEXTURE2")) tex1)
+        n1 (le-i32 tex1 0)
+        n2 (if has2 (le-i32 tex2 0) 0)
+        n (+ n1 n2))
+    (dotimes (i npatches)
+      (set! (aref patch-lookup i) (check-num-for-key (key-at names (+ 4 (* i 8))))))
+    (static-table textures Texture n)
+    (dotimes (i n)
+      (let (b (if (< i n1) tex1 tex2)
+            dir (if (< i n1) i (- i n1))
+            off (le-i32 b (+ 4 (* 4 dir)))
+            t (textures i)
+            count (le-i16 b (+ off 20))
+            width (le-i16 b (+ off 12))
+            j:i32 1)
+        (when (> off (b 'len)) (fatal "R_InitTextures: bad texture directory"))
+        (set! (t 'name) (key-at b off))
+        (set! (t 'width) width)
+        (set! (t 'height) (le-i16 b (+ off 14)))
+        (set! (t 'patch-count) count)
+        (set! (t 'patches) (unsafe/cast ptr:TexPatch (arena-alloc (* (as i64 count) (unsafe/cast i64 (sizeof TexPatch))))))
+        (dotimes (k count)
+          (let (mp (+ off 22 (* k 10))
+                p (unsafe/cast &TexPatch (unsafe/ptr+ (t 'patches) k)))
+            (set! (p 'origin-x) (le-i16 b mp))
+            (set! (p 'origin-y) (le-i16 b (+ mp 2)))
+            (set! (p 'patch) (aref patch-lookup (le-i16 b (+ mp 4))))
+            (when (= (p 'patch) -1) (fatal "R_InitTextures: missing patch in texture"))))
+        (set! (t 'column-lump) (unsafe/cast ptr:i16 (arena-alloc (* 2 (as i64 width)))))
+        (set! (t 'column-ofs) (unsafe/cast ptr:ui16 (arena-alloc (* 2 (as i64 width)))))
+        (while (<= (* j 2) width) (set! j (bit-shl j 1)))
+        (set! (t 'width-mask) (- j 1))))
+    (dotimes (i n) (generate-lookup i))
+    (static-table texture-translation i32 (+ n 1))
+    (dotimes (i n) (set! (texture-translation i) i))
+    (dotimes (i n)
+      (let (k ((textures i) 'name))
+        (when (none? (get &texture-by-name k)) (assoc &texture-by-name k i)))))
+  (ok))
+
+(defn- none? (m:?i32):bool (match m ((some _) false) (none true)))
+
+; -1 when absent; "-" is texture 0, the empty texture.
+(defn check-texture-num-for-key (k:i64):i32
+  (if (= (bit-and k 255) 45)
+    0
+    (match (get &texture-by-name k) ((some i) i) (none -1))))
+
+(defn texture-num-for-key (k:i64):i32
+  (let (i (check-texture-num-for-key k))
+    (when (= i -1) (fatal "R_TextureNumForName: texture not found"))
+    i))
+
+(defn texture-num-for-name (name:StrView):i32 (texture-num-for-key (lump-key name)))
+
+;; Flats.
+
+(defvar first-flat:i32 0)
+(defvar num-flats:i32 0)
+(defvar flat-translation:&(Table i32) (new (Table i32) g-arena))
+
+(defn- init-flats ():!void
+  (set! first-flat (+ (try (lump-num "F_START")) 1))
+  (set! num-flats (- (try (lump-num "F_END")) first-flat))
+  (static-table flat-translation i32 (+ num-flats 1))
+  (dotimes (i num-flats) (set! (flat-translation i) i))
+  (ok))
+
+(defn flat-num-for-key (k:i64):i32
+  (let (i (check-num-for-key k))
+    (when (= i -1) (fatal "R_FlatNumForName: flat not found"))
+    (- i first-flat)))
+
+(defn flat-num-for-name (name:StrView):i32 (flat-num-for-key (lump-key name)))
+
+;; Sprite lumps.
+
+(defvar first-sprite-lump:i32 0)
+(defvar num-sprite-lumps:i32 0)
+(defvar sprite-width:&(Table Fixed) (new (Table Fixed) g-arena))
+(defvar sprite-offset:&(Table Fixed) (new (Table Fixed) g-arena))
+(defvar sprite-top-offset:&(Table Fixed) (new (Table Fixed) g-arena))
+
+(defn- init-sprite-lumps ():!void
+  (set! first-sprite-lump (+ (try (lump-num "S_START")) 1))
+  (set! num-sprite-lumps (- (try (lump-num "S_END")) first-sprite-lump))
+  (static-table sprite-width Fixed num-sprite-lumps)
+  (static-table sprite-offset Fixed num-sprite-lumps)
+  (static-table sprite-top-offset Fixed num-sprite-lumps)
+  (dotimes (i num-sprite-lumps)
+    (let (b (lump (+ first-sprite-lump i)))
+      (set! (sprite-width i) (fx (le-i16 b 0)))
+      (set! (sprite-offset i) (fx (le-i16 b 4)))
+      (set! (sprite-top-offset i) (fx (le-i16 b 6)))))
+  (ok))
+
+;; Colormaps: 34 maps of 256 bytes, from full bright down to black, then the
+;; invulnerability map. Light tables index them by map number.
+
+(defvar colormaps:Bytes (Bytes null 0))
+
+(defn colormap-byte (map:i32 c:i32):ui8 (aref (colormaps 'data) (+ (* map 256) c)))
+
+;; Sprite frames (R_InitSpriteDefs): which lump, mirrored or not, shows each
+;; frame from each of eight directions.
+
+; rotate is -1 until the frame is seen, then 0 (one view) or 1 (eight).
+(defstruct SpriteFrame rotate:i32 lump:(array i32 8) flip:(array ui8 8))
+(defstruct SpriteDef num-frames:i32 frames:ptr:SpriteFrame)
+
+(defvar sprites:&(Table SpriteDef) (new (Table SpriteDef) g-arena))
+(defvar- sprtemp:(array SpriteFrame 29))
+(defvar- max-frame:i32 -1)
+
+(defn sprite-frame (sprite:i32 frame:i32):&SpriteFrame
+  (let (d (sprites sprite))
+    (when (>= frame (d 'num-frames)) (fatal "R_ProjectSprite: invalid sprite frame"))
+    (unsafe/cast &SpriteFrame (unsafe/ptr+ (d 'frames) frame))))
+
+(defn- temp-frame (frame:i32):&SpriteFrame
+  (unsafe/cast &SpriteFrame (unsafe/ptr+ (unsafe/cast ptr:SpriteFrame &sprtemp) frame)))
+
+(defn- install-sprite-lump (l:i32 frame:i32 rotation:i32 flipped:bool):void
+  (when (or (< frame 0) (>= frame 29) (< rotation 0) (> rotation 8))
+    (fatal "R_InstallSpriteLump: bad frame characters in lump"))
+  (when (> frame max-frame) (set! max-frame frame))
+  (let (f (temp-frame frame) flip:ui8 (if flipped 1 0))
+    (if (= rotation 0)
+      (do
+        ; Only the first rotation-0 lump of a frame is legal.
+        (when (= (f 'rotate) 0) (fatal "R_InitSprites: sprite frame has multiple rot=0 lumps"))
+        (when (= (f 'rotate) 1) (fatal "R_InitSprites: sprite frame has rotations and a rot=0 lump"))
+        (set! (f 'rotate) 0)
+        (dotimes (r 8)
+          (set! (aref (f 'lump) r) (- l first-sprite-lump))
+          (set! (aref (f 'flip) r) flip)))
+      (do
+        (when (= (f 'rotate) 0) (fatal "R_InitSprites: sprite frame has rotations and a rot=0 lump"))
+        (set! (f 'rotate) 1)
+        (let (r (- rotation 1))
+          (when (!= (aref (f 'lump) r) -1) (fatal "R_InitSprites: sprite has two lumps mapped to one rotation"))
+          (set! (aref (f 'lump) r) (- l first-sprite-lump))
+          (set! (aref (f 'flip) r) flip))))))
+
+(defn- key-byte (k:i64 i:i32):i32 (unsafe/cast i32 (bit-and (bit-shr k (as i64 (* 8 i))) 255)))
+
+(defn- init-sprite-defs ():void
+  (static-table sprites SpriteDef NUM-SPRITES)
+  (dotimes (i NUM-SPRITES)
+    (let (prefix (lump-key (aref sprite-names i)))
+      (memset (unsafe/cast ptr &sprtemp) -1 (sizeof (array SpriteFrame 29)))
+      (set! max-frame -1)
+      (dotimes (j num-sprite-lumps)
+        (let (l (+ first-sprite-lump j) k (lump-key-of l))
+          (when (= (bit-and k 0xffffffff) prefix)
+            (install-sprite-lump l (- (key-byte k 4) 65) (- (key-byte k 5) 48) false)
+            (when (!= (key-byte k 6) 0)
+              (install-sprite-lump l (- (key-byte k 6) 65) (- (key-byte k 7) 48) true)))))
+      (if (= max-frame -1)
+        (set! ((sprites i) 'num-frames) 0)
+        (let (n (+ max-frame 1))
+          (dotimes (f n)
+            (let (fr (temp-frame f))
+              (when (= (fr 'rotate) -1) (fatal "R_InitSprites: no patches found for a sprite frame"))
+              (when (= (fr 'rotate) 1)
+                (dotimes (r 8)
+                  (when (= (aref (fr 'lump) r) -1) (fatal "R_InitSprites: sprite frame is missing rotations"))))))
+          (set! ((sprites i) 'num-frames) n)
+          (set! ((sprites i) 'frames) (unsafe/cast ptr:SpriteFrame (arena-alloc (* (as i64 n) (unsafe/cast i64 (sizeof SpriteFrame))))))
+          (memcpy (unsafe/cast ptr ((sprites i) 'frames)) (unsafe/cast ptr &sprtemp)
+                  (unsafe/cast usize (* n (unsafe/cast i32 (sizeof SpriteFrame))))))))))
+
+(defn init-data ():!void
+  (try (init-textures))
+  (try (init-flats))
+  (try (init-sprite-lumps))
+  (set! colormaps (try (lump-named "COLORMAP")))
+  (init-sprite-defs)
+  (ok))

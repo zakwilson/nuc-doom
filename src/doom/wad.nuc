@@ -37,10 +37,11 @@
       (inc! i))
     k))
 
-(defn- key-at (b:Bytes off:i32):i64
+; The key of an 8-byte name field inside a lump (map and texture records).
+(defn key-at (b:Bytes off:i32):i64
   (lump-key (StrView (unsafe/cast &ui8 (unsafe/ptr+ (b 'data) off)) 8)))
 
-(defn add-lump (l:Lump):void ; ISSUE-008: public, not defn-
+(defn- add-lump (l:Lump):void
   (assoc &lump-index (l 'key) (unsafe/cast i32 (count &lumps)))
   (conj &lumps l))
 
@@ -83,10 +84,12 @@
 
 (defn num-lumps ():i32 (unsafe/cast i32 (count &lumps)))
 
-(defn check-num-for-name (name:StrView):i32
-  (match (get &lump-index (lump-key name))
+(defn check-num-for-key (k:i64):i32
+  (match (get &lump-index k)
     ((some i) i)
     (none -1)))
+
+(defn check-num-for-name (name:StrView):i32 (check-num-for-key (lump-key name)))
 
 (defn lump-num (name:StrView):!i32
   (let (i (check-num-for-name name))
@@ -100,6 +103,7 @@
   (ok (lump (try (lump-num name)))))
 
 (defn lump-length (i:i32):i32 ((&lumps (as usize i)) 'size))
+(defn lump-key-of (i:i32):i64 ((&lumps (as usize i)) 'key))
 
 ; The name back from its key, for messages and tests.
 (defn lump-name (i:i32):String

@@ -41,7 +41,9 @@ import sys
 a, b = (open(p, "rb").read()[15:] for p in sys.argv[1:])
 diff = [i // 3 for i in range(0, min(len(a), len(b)), 3) if a[i:i+3] != b[i:i+3]]
 first = diff[0] if diff else 0
-print(f"FAIL: {len(diff)} of {len(a)//3} pixels differ, first at x={first%320} y={first//320}")
+# The status bar is the bottom 32 rows; it is drawn separately from the view.
+bar = sum(1 for p in diff if p // 320 >= 168)
+print(f"FAIL: {len(diff)} of {len(a)//3} pixels differ ({len(diff) - bar} above the status bar), first at x={first%320} y={first//320}")
 EOF
     fi
 done

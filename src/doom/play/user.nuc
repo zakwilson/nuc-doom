@@ -1,0 +1,43 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The player's own movement and view (p_user.c).
+
+(ns doom.play.user)
+
+(import-use doom.math)
+(import-use doom.world)
+(import-use doom.state)
+
+(defconst- MAXBOB 0x100000)
+
+; Set by the move each tic, and read by the view-height code after it.
+(defvar on-ground:bool false)
+
+; The view's height: the eye level plus the walking bob, kept under the ceiling.
+(defn calc-height (p:&Player):void
+  (when-some (mo (p 'mo))
+    (let (b (fx-shr (+ (* (mo 'momx) (mo 'momx)) (* (mo 'momy) (mo 'momy))) 2))
+      (set! (p 'bob) (if (> (b 'v) MAXBOB) (Fixed MAXBOB) b)))
+    (let (ceiling (- (mo 'ceilingz) (Fixed (* 4 FRAC-UNIT))))
+      (if (or (!= (bit-and (p 'cheats) CF-NOMOMENTUM) 0) (not on-ground))
+        ; The C clamps here and then overwrites the clamped value.
+        (set! (p 'viewz) (+ (mo 'z) (p 'view-height)))
+        (let (angle (bit-and (* (/ FINE-ANGLES 20) level-time) FINE-MASK)
+              bob (* (Fixed (/ ((p 'bob) 'v) 2)) (fine-sine angle)))
+          (when (= (p 'player-state) PST-LIVE)
+            (set! (p 'view-height) (+ (p 'view-height) (p 'delta-view-height)))
+            (when (> ((p 'view-height) 'v) VIEWHEIGHT)
+              (set! (p 'view-height) (Fixed VIEWHEIGHT))
+              (set! (p 'delta-view-height) (Fixed 0)))
+            (when (< ((p 'view-height) 'v) (/ VIEWHEIGHT 2))
+              (set! (p 'view-height) (Fixed (/ VIEWHEIGHT 2)))
+              (when (<= ((p 'delta-view-height) 'v) 0)
+                (set! (p 'delta-view-height) (Fixed 1))))
+            (when (!= ((p 'delta-view-height) 'v) 0)
+              (set! (p 'delta-view-height) (+ (p 'delta-view-height) (Fixed (/ FRAC-UNIT 4))))
+              (when (= ((p 'delta-view-height) 'v) 0)
+                (set! (p 'delta-view-height) (Fixed 1)))))
+          (set! (p 'viewz) (+ (+ (mo 'z) (p 'view-height)) bob))
+          (when (> (p 'viewz) ceiling)
+            (set! (p 'viewz) ceiling)))))))

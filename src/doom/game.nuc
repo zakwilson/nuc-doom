@@ -1,0 +1,78 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Game flow (g_game.c): starting a game and loading its levels.
+
+(ns doom.game)
+
+(import-use "string.h")
+(import-use nucleus.error)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.random)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.render.main)
+(import-use doom.render.data)
+(import-use doom.play.setup)
+
+(defconst- MAX-AMMO (array i32 200 50 300 50))
+
+; A fresh player for a new life; only the level tallies and frags survive.
+(defn player-reborn (pn:i32):void
+  (let (p (player pn) old:Player @p)
+    (memset (unsafe/cast ptr p) 0 (unsafe/cast usize (sizeof Player)))
+    (dotimes (i MAX-PLAYERS) (set! (aref (p 'frags) i) (aref (old 'frags) i)))
+    (set! (p 'kill-count) (old 'kill-count))
+    (set! (p 'item-count) (old 'item-count))
+    (set! (p 'secret-count) (old 'secret-count))
+    ; Don't fire or use on the first tic.
+    (set! (p 'use-down) 1)
+    (set! (p 'attack-down) 1)
+    (set! (p 'player-state) PST-LIVE)
+    (set! (p 'health) 100)
+    (set! (p 'ready-weapon) WP-PISTOL)
+    (set! (p 'pending-weapon) WP-PISTOL)
+    (set! (aref (p 'weapon-owned) WP-FIST) 1)
+    (set! (aref (p 'weapon-owned) WP-PISTOL) 1)
+    (set! (aref (p 'ammo) AM-CLIP) 50)
+    (dotimes (i NUM-AMMO) (set! (aref (p 'max-ammo) i) (aref MAX-AMMO i)))))
+
+(defn do-load-level ():!void
+  (set! sky-flat-num (flat-num-for-name "F_SKY1"))
+  (set! game-state GS-LEVEL)
+  (dotimes (i MAX-PLAYERS)
+    (let (p (player i))
+      (when (and (aref player-in-game i) (= (p 'player-state) PST-DEAD))
+        (set! (p 'player-state) PST-REBORN))
+      (dotimes (j MAX-PLAYERS) (set! (aref (p 'frags) j) 0))))
+  (try (setup-level game-episode game-map game-skill))
+  (set! display-player console-player)
+  (set! game-action GA-NOTHING)
+  (set! paused false)
+  (ok))
+
+(defn init-new (skill:i32 episode:i32 map:i32):!void
+  (set! paused false)
+  (when (> skill SK-NIGHTMARE) (set! skill SK-NIGHTMARE))
+  (when (< episode 1) (set! episode 1))
+  (when (> episode 3) (set! episode 3))
+  (when (and (> episode 1) (= game-mode SHAREWARE)) (set! episode 1))
+  (when (< map 1) (set! map 1))
+  (when (and (> map 9) (!= game-mode COMMERCIAL)) (set! map 9))
+  (clear-random)
+  (set! respawn-monsters (= skill SK-NIGHTMARE))
+  (dotimes (i MAX-PLAYERS) (set! ((player i) 'player-state) PST-REBORN))
+  (set! demo-playback false)
+  (set! automap-active false)
+  (set! view-active true)
+  (set! game-episode episode)
+  (set! game-map map)
+  (set! game-skill skill)
+  (set! sky-texture (texture-num-for-name
+                      (cond (= game-mode COMMERCIAL) (if (< map 12) "SKY1" (if (< map 21) "SKY2" "SKY3"))
+                        (= episode 2) "SKY2"
+                        (= episode 3) "SKY3"
+                        (= episode 4) "SKY4"
+                        true "SKY1")))
+  (do-load-level))

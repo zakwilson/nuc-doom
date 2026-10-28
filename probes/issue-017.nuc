@@ -1,0 +1,7 @@
+; ISSUE-017: a constant subexpression does not adapt to the other operand the
+; way its constant leaves do. (- BIG x) compiles at ui32; (- (- BIG 1) x) is
+; "mixed signed/unsigned operands".
+; fixed-when: runs
+(defconst BIG 0x40000000)
+(defn f (x:ui32):ui32 (- (- BIG 1) x))
+(defn main ():i32 (if (= (f 1) 0x3ffffffe) 0 1))

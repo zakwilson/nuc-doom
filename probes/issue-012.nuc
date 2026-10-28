@@ -1,0 +1,16 @@
+; ISSUE-012: a user defunion shaped like a Maybe (one payload-less arm, one
+; (ref T) arm) takes the niche layout and then answers only to some/none.
+; fixed-when: output-contains 0 7
+(import-use "stdio.h")
+(defstruct Box n:i32)
+(defunion Slot
+  empty
+  (full b:&Box))
+(defn show (s:Slot):i32
+  (match s
+    (empty 0)
+    ((full b) (b 'n))))
+(defn main ():i32
+  (let (bx:Box (Box 7))
+    (printf "%d %d\n" (show (Slot-empty)) (show (Slot-full &bx))))
+  0)

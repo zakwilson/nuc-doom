@@ -1,0 +1,233 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; BSP traversal (r_bsp.c): walk the tree front to back, clip each seg's
+; screen span against the columns solid walls already cover, and hand the
+; visible parts to the wall code.
+
+(ns doom.render.bsp)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.world)
+(import-use doom.geom)
+(import-use doom.system)
+(import-use doom.render.main)
+(import-use doom.render.draw)
+(import-use doom.render.segs)
+(import-use doom.render.plane)
+(import-use doom.render.things)
+
+(defconst SIL-NONE 0)
+(defconst SIL-BOTTOM 1)
+(defconst SIL-TOP 2)
+(defconst SIL-BOTH 3)
+(defconst MAXDRAWSEGS 256)
+
+; A drawn wall span, kept for clipping sprites and masked walls later. The
+; clip fields are bases into clip-store (NO-CLIP for none), biased so that
+; column x is at base + x.
+(defstruct DrawSeg
+  cur-line:i32
+  x1:i32 x2:i32
+  scale1:Fixed scale2:Fixed scale-step:Fixed
+  silhouette:i32
+  bsil-height:Fixed tsil-height:Fixed
+  spr-top-clip:i32 spr-bottom-clip:i32 masked-texture-col:i32)
+
+(defvar draw-segs:(array DrawSeg 256))
+(defvar ds-count:i32 0)
+
+(defn draw-seg (i:i32):&DrawSeg &(aref draw-segs i))
+
+; The seg being drawn and the sectors on either side of it.
+(defvar cur-line:i32 0)
+(defvar- no-sector:Sector)
+(defvar front-sector:&Sector &no-sector)
+(defvar back-sector:?&Sector null)
+
+(defn clear-draw-segs ():void (set! ds-count 0))
+
+;; The solid-wall clip list: sorted, non-overlapping column ranges already
+;; fully covered, with sentinels at both ends.
+
+(defstruct ClipRange first:i32 last:i32)
+(defconst- MAXSEGS 161)
+(defvar- solid-segs:(array ClipRange 161))
+(defvar- new-end:i32 0)
+
+(defn- seg-range (i:i32):&ClipRange &(aref solid-segs i))
+
+(defn clear-clip-segs ():void
+  (set! (aref solid-segs 0) (ClipRange -0x7fffffff -1))
+  (set! (aref solid-segs 1) (ClipRange view-width 0x7fffffff))
+  (set! new-end 2))
+
+; A wall that hides what is behind it: draw its uncovered parts and merge
+; its span into the list.
+(defn- clip-solid-wall-segment (first:i32 last:i32):void
+  (let (start:i32 0)
+    (while (< ((seg-range start) 'last) (- first 1)) (inc! start))
+    (let (s (seg-range start) done false)
+      (when (< first (s 'first))
+        (if (< last (- (s 'first) 1))
+          ; Entirely visible: insert a new range before start.
+          (do (store-wall-range first last)
+              (let (next new-end)
+                (inc! new-end)
+                (while (!= next start)
+                  (set! (aref solid-segs next) (aref solid-segs (- next 1)))
+                  (set! next (- next 1)))
+                (set! (aref solid-segs next) (ClipRange first last)))
+              (set! done true))
+          (do (store-wall-range first (- (s 'first) 1))
+              (set! (s 'first) first))))
+      (when (and (not done) (> last (s 'last)))
+        (let (next start crunched false)
+          (while (and (not crunched) (>= last (- ((seg-range (+ next 1)) 'first) 1)))
+            (store-wall-range (+ ((seg-range next) 'last) 1) (- ((seg-range (+ next 1)) 'first) 1))
+            (inc! next)
+            (when (<= last ((seg-range next) 'last))
+              (set! (s 'last) ((seg-range next) 'last))
+              (set! crunched true)))
+          (when (not crunched)
+            (store-wall-range (+ ((seg-range next) 'last) 1) last)
+            (set! (s 'last) last))
+          ; Drop the ranges the new one swallowed.
+          (when (!= next start)
+            (let (to start)
+              (while (!= next new-end)
+                (inc! next)
+                (inc! to)
+                (when (< next MAXSEGS)
+                  (set! (aref solid-segs to) (aref solid-segs next))))
+              (set! new-end (+ to 1)))))))))
+
+; A wall that can be seen past (a window, a step): draw its uncovered parts
+; but leave the list alone.
+(defn- clip-pass-wall-segment (first:i32 last:i32):void
+  (let (start:i32 0)
+    (while (< ((seg-range start) 'last) (- first 1)) (inc! start))
+    (let (s (seg-range start) done false)
+      (when (< first (s 'first))
+        (if (< last (- (s 'first) 1))
+          (do (store-wall-range first last) (set! done true))
+          (store-wall-range first (- (s 'first) 1))))
+      (when (and (not done) (> last (s 'last)))
+        (let (stop false)
+          (while (and (not stop) (>= last (- ((seg-range (+ start 1)) 'first) 1)))
+            (store-wall-range (+ ((seg-range start) 'last) 1) (- ((seg-range (+ start 1)) 'first) 1))
+            (inc! start)
+            (when (<= last ((seg-range start) 'last)) (set! stop true)))
+          (when (not stop)
+            (store-wall-range (+ ((seg-range start) 'last) 1) last)))))))
+
+; Projects an angle pair onto screen columns, or false if the span is
+; behind the view or outside the field of view.
+(defstruct- Span2 x1:i32 x2:i32)
+
+(defn- angle-span (a1:Angle a2:Angle out:&Span2):bool
+  (let (span (- a1 a2) ok true)
+    (if (>= span ANG180)
+      false
+      (let (angle1 (- a1 view-angle)
+            angle2 (- a2 view-angle)
+            tspan (+ angle1 clip-angle))
+        (when (> tspan (* 2 clip-angle))
+          (if (>= (- tspan (* 2 clip-angle)) span)
+            (set! ok false)
+            (set! angle1 clip-angle)))
+        (set! tspan (- clip-angle angle2))
+        (when (and ok (> tspan (* 2 clip-angle)))
+          (if (>= (- tspan (* 2 clip-angle)) span)
+            (set! ok false)
+            (set! angle2 (- 0 clip-angle))))
+        (when ok
+          (set! (out 'x1) (aref view-angle-to-x (fine-index (+ angle1 ANG90))))
+          (set! (out 'x2) (aref view-angle-to-x (fine-index (+ angle2 ANG90)))))
+        ok))))
+
+(defvar rw-angle1:Angle 0)
+
+(defn- add-line (seg-num:i32):void
+  (set! cur-line seg-num)
+  (let (line (segs seg-num)
+        angle1 (point-to-view-angle ((line 'v1) 'x) ((line 'v1) 'y))
+        angle2 (point-to-view-angle ((line 'v2) 'x) ((line 'v2) 'y))
+        span (Span2 0 0))
+    ; Backside: not seen.
+    (when (< (- angle1 angle2) ANG180)
+      (set! rw-angle1 angle1)
+      (when (angle-span angle1 angle2 span)
+        (let (x1 (span 'x1) x2 (span 'x2))
+          (when (!= x1 x2)
+            (set! back-sector (line 'back-sector))
+            (if-some (back back-sector)
+              (cond (or (<= (back 'ceiling-height) (front-sector 'floor-height))
+                     (>= (back 'floor-height) (front-sector 'ceiling-height))) (clip-solid-wall-segment x1 (- x2 1))
+                (or (!= (back 'ceiling-height) (front-sector 'ceiling-height))
+                     (!= (back 'floor-height) (front-sector 'floor-height))) (clip-pass-wall-segment x1 (- x2 1))
+                (and (= (back 'ceiling-pic) (front-sector 'ceiling-pic))
+                      (= (back 'floor-pic) (front-sector 'floor-pic))
+                      (= (back 'light-level) (front-sector 'light-level))
+                      (= ((line 'side-def) 'mid-texture) 0)) (do)
+                true (clip-pass-wall-segment x1 (- x2 1)))
+              (clip-solid-wall-segment x1 (- x2 1)))))))))
+
+; Box corners to test, by where the view is relative to the box.
+(defconst- CHECK-COORD (array i32
+  3 0 2 1  3 0 2 0  3 1 2 0  0 0 0 0
+  2 0 2 1  0 0 0 0  3 1 3 0  0 0 0 0
+  2 0 3 1  2 1 3 1  2 1 3 0  0 0 0 0))
+
+; Whether any part of a bounding box might be visible.
+(defn- check-bbox (box:ptr:Fixed):bool
+  (let (boxx (cond (<= view-x (aref box BOXLEFT)) 0
+               (< view-x (aref box BOXRIGHT)) 1
+               true 2)
+        boxy (cond (>= view-y (aref box BOXTOP)) 0
+               (> view-y (aref box BOXBOTTOM)) 1
+               true 2)
+        pos (+ (bit-shl boxy 2) boxx))
+    (if (= pos 5)
+      true
+      (let (c (* pos 4)
+            x1 (aref box (aref CHECK-COORD c))
+            y1 (aref box (aref CHECK-COORD (+ c 1)))
+            x2 (aref box (aref CHECK-COORD (+ c 2)))
+            y2 (aref box (aref CHECK-COORD (+ c 3)))
+            a1 (point-to-view-angle x1 y1)
+            a2 (point-to-view-angle x2 y2)
+            span (Span2 0 0))
+        (cond (>= (- (- a1 view-angle) (- a2 view-angle)) ANG180) true
+          (not (angle-span a1 a2 span)) false
+          (= (span 'x1) (span 'x2)) false
+          true (let (sx1 (span 'x1) sx2 (- (span 'x2) 1) start:i32 0)
+             (while (< ((seg-range start) 'last) sx2) (inc! start))
+             (not (and (>= sx1 ((seg-range start) 'first))
+                       (<= sx2 ((seg-range start) 'last))))))))))
+
+(defn- render-subsector (num:i32):void
+  (let (sub (subsectors num)
+        sec (sub 'sector))
+    (set! front-sector sec)
+    (set! floor-plane (if (< (sec 'floor-height) view-z)
+                        (find-plane (sec 'floor-height) (sec 'floor-pic) (sec 'light-level))
+                        -1))
+    (set! ceiling-plane (if (or (> (sec 'ceiling-height) view-z) (= (sec 'ceiling-pic) sky-flat-num))
+                          (find-plane (sec 'ceiling-height) (sec 'ceiling-pic) (sec 'light-level))
+                          -1))
+    (add-sprites sec)
+    (dotimes (i (sub 'num-lines))
+      (add-line (+ (sub 'first-line) i)))
+    (when (> new-end 32)
+      (fatal "R_Subsector: solidsegs overflow (vanilla may crash here)"))))
+
+(defn render-bsp-node (bspnum:i32):void
+  (if (!= (bit-and bspnum NF-SUBSECTOR) 0)
+    (render-subsector (if (= bspnum -1) 0 (bit-and bspnum (bit-not NF-SUBSECTOR))))
+    (let (bsp (nodes bspnum)
+          side (point-on-node-side view-x view-y bsp))
+      (render-bsp-node (aref (bsp 'children) side))
+      (when (check-bbox (node-bbox bsp (bit-xor side 1)))
+        (render-bsp-node (aref (bsp 'children) (bit-xor side 1)))))))

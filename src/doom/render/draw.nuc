@@ -1,0 +1,224 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The inner loops (r_draw.c): vertical texture columns and horizontal flat
+; spans into the view window, and the border around a reduced view. The C
+; passes their arguments in dc_*/ds_* globals; here each job is a struct.
+
+(ns doom.render.draw)
+
+(import-use "string.h")
+(import-use doom.math)
+(import-use doom.wad)
+(import-use doom.bytes)
+(import-use doom.video)
+(import-use doom.system)
+(import-use doom.render.data)
+
+(defconst SBARHEIGHT 32)
+
+; The view window within the screen, and its size in drawn columns (halved at
+; low detail).
+(defvar view-window-x:i32 0)
+(defvar view-window-y:i32 0)
+(defvar view-width:i32 0)
+(defvar scaled-view-width:i32 0)
+(defvar view-height:i32 0)
+(defvar detail-shift:i32 0)
+(defvar center-y:i32 0)
+
+; How a column is drawn: plainly, as the spectre's shimmer, or with a player's
+; colour remapped.
+(defenum ColumnKind COL-NORMAL COL-FUZZ COL-TRANSLATED)
+
+; colormap is a map number; translation picks one of the three player tables.
+(defstruct Column
+  x:i32 yl:i32 yh:i32
+  iscale:Fixed texture-mid:Fixed
+  source:ptr:ui8
+  colormap:i32 translation:i32)
+
+(defn- pixel (x:i32 y:i32):ptr:ui8
+  (unsafe/ptr+ (unsafe/cast ptr:ui8 &screen)
+               (+ (* (+ y view-window-y) SCREEN-WIDTH) view-window-x x)))
+
+(defn- check-column (c:&Column x:i32):void
+  (when (or (< x 0) (>= x SCREEN-WIDTH) (< (c 'yl) 0) (>= (c 'yh) SCREEN-HEIGHT))
+    (fatal "R_DrawColumn: column out of range")))
+
+; Remaps the green ramp (0x70-0x7f) to grey, brown and red for players 2-4.
+(defvar- translation-tables:(array ui8 768))
+
+(defn init-translation-tables ():void
+  (dotimes (i 256)
+    (if (and (>= i 0x70) (<= i 0x7f))
+      (do (set! (aref translation-tables i) (+ 0x60 (bit-and i 15)))
+          (set! (aref translation-tables (+ i 256)) (+ 0x40 (bit-and i 15)))
+          (set! (aref translation-tables (+ i 512)) (+ 0x20 (bit-and i 15))))
+      (do (set! (aref translation-tables i) i)
+          (set! (aref translation-tables (+ i 256)) i)
+          (set! (aref translation-tables (+ i 512)) i)))))
+
+(defn- draw-normal (c:&Column):void
+  (let (count (- (c 'yh) (c 'yl)))
+    (when (>= count 0)
+      (check-column c (bit-shl (c 'x) detail-shift))
+      (let (step ((c 'iscale) 'v)
+            frac (+ ((c 'texture-mid) 'v) (* (- (c 'yl) center-y) step))
+            y (c 'yl)
+            src (c 'source)
+            base (* (c 'colormap) 256)
+            cm (colormaps 'data))
+        (if (= detail-shift 0)
+          (let (dest (pixel (c 'x) y))
+            (dotimes (i (+ count 1))
+              (set! (aref dest (* i SCREEN-WIDTH))
+                    (aref cm (+ base (as i32 (aref src (bit-and (bit-shr frac FRAC-BITS) 127))))))
+              (set! frac (+ frac step))))
+          (let (dest (pixel (bit-shl (c 'x) 1) y))
+            (dotimes (i (+ count 1))
+              (let (v (aref cm (+ base (as i32 (aref src (bit-and (bit-shr frac FRAC-BITS) 127))))))
+                (set! (aref dest (* i SCREEN-WIDTH)) v)
+                (set! (aref dest (+ (* i SCREEN-WIDTH) 1)) v))
+              (set! frac (+ frac step)))))))))
+
+; The spectre: each pixel takes the darkened colour of a neighbour above or
+; below, by a fixed cycling pattern.
+(defconst- FUZZTABLE 50)
+(defconst- FUZZ-OFFSET (array i32
+  320 -320 320 -320 320 320 -320 320 320 -320 320 320 320 -320
+  320 320 320 -320 -320 -320 -320 320 -320 -320 320 320 320 320 -320
+  320 -320 320 320 -320 -320 320 320 -320 -320 -320 -320 320 320
+  320 320 -320 320 320 -320 320))
+(defvar fuzz-pos:i32 0)
+
+(defn- draw-fuzz (c:&Column):void
+  (when (= (c 'yl) 0) (set! (c 'yl) 1))
+  (when (= (c 'yh) (- view-height 1)) (set! (c 'yh) (- view-height 2)))
+  (let (count (- (c 'yh) (c 'yl)))
+    (when (>= count 0)
+      (check-column c (bit-shl (c 'x) detail-shift))
+      (let (cm (colormaps 'data)
+            w (+ 1 detail-shift)
+            x0 (bit-shl (c 'x) detail-shift))
+        (dotimes (i (+ count 1))
+          (let (off (aref FUZZ-OFFSET fuzz-pos))
+            (dotimes (k w)
+              (let (dest (pixel (+ x0 k) (+ (c 'yl) i)))
+                (set! (aref dest 0) (aref cm (+ (* 6 256) (as i32 (aref dest off))))))))
+          (inc! fuzz-pos)
+          (when (= fuzz-pos FUZZTABLE) (set! fuzz-pos 0)))))))
+
+(defn- draw-translated (c:&Column):void
+  (let (count (- (c 'yh) (c 'yl)))
+    (when (>= count 0)
+      (check-column c (bit-shl (c 'x) detail-shift))
+      (let (step ((c 'iscale) 'v)
+            frac (+ ((c 'texture-mid) 'v) (* (- (c 'yl) center-y) step))
+            src (c 'source)
+            base (* (c 'colormap) 256)
+            tr (* (c 'translation) 256)
+            cm (colormaps 'data)
+            w (+ 1 detail-shift)
+            x0 (bit-shl (c 'x) detail-shift))
+        (dotimes (i (+ count 1))
+          ; Unmasked: sprites never wrap, so this reads past 127 as the C does.
+          (let (v (aref cm (+ base (as i32 (aref translation-tables
+                                                 (+ tr (as i32 (aref src (bit-shr frac FRAC-BITS)))))))))
+            (dotimes (k w)
+              (set! (aref (pixel (+ x0 k) (+ (c 'yl) i)) 0) v)))
+          (set! frac (+ frac step)))))))
+
+(defn draw-column (kind:i32 c:&Column):void
+  (match kind
+    (COL-NORMAL (draw-normal c))
+    (COL-FUZZ (draw-fuzz c))
+    (COL-TRANSLATED (draw-translated c))
+    (_ (fatal "draw-column: bad kind"))))
+
+;; Spans: one row of a floor or ceiling. The position packs 6.10 x and y
+;; texture coordinates into one word so a single add steps both.
+
+(defstruct Span
+  y:i32 x1:i32 x2:i32
+  xfrac:Fixed yfrac:Fixed xstep:Fixed ystep:Fixed
+  source:ptr:ui8 colormap:i32)
+
+(defn draw-span (s:&Span):void
+  (when (or (< (s 'x2) (s 'x1)) (< (s 'x1) 0) (>= (s 'x2) SCREEN-WIDTH)
+            (> (unsafe/cast ui32 (s 'y)) (as ui32 SCREEN-HEIGHT)))
+    (fatal "R_DrawSpan: span out of range"))
+  (let (pos:ui32 (bit-or (bit-and (unsafe/cast ui32 (bit-shl ((s 'xfrac) 'v) 10)) 0xffff0000)
+                         (bit-and (unsafe/cast ui32 (bit-shr ((s 'yfrac) 'v) 6)) 0xffff))
+        step:ui32 (bit-or (bit-and (unsafe/cast ui32 (bit-shl ((s 'xstep) 'v) 10)) 0xffff0000)
+                          (bit-and (unsafe/cast ui32 (bit-shr ((s 'ystep) 'v) 6)) 0xffff))
+        count (- (s 'x2) (s 'x1))
+        w (+ 1 detail-shift)
+        dest (pixel (bit-shl (s 'x1) detail-shift) (s 'y))
+        src (s 'source)
+        base (* (s 'colormap) 256)
+        cm (colormaps 'data))
+    (dotimes (i (+ count 1))
+      (let (spot (unsafe/cast i32 (bit-or (bit-and (bit-shr pos 4) 0x0fc0) (bit-shr pos 26)))
+            v (aref cm (+ base (as i32 (aref src spot)))))
+        (dotimes (k w)
+          (set! (aref dest (+ (* i w) k)) v)))
+      (set! pos (+ pos step)))))
+
+;; The view window and its border.
+
+(defn init-buffer (width:i32 height:i32):void
+  (set! view-window-x (bit-shr (- SCREEN-WIDTH width) 1))
+  (set! view-window-y (if (= width SCREEN-WIDTH)
+                        0
+                        (bit-shr (- SCREEN-HEIGHT SBARHEIGHT height) 1))))
+
+; The tiled flat and bevelled frame shown around a reduced view.
+(defvar- background:(array ui8 54400))
+(defvar- have-background:bool false)
+
+(defn- tile-row (src:Bytes y:i32 dest:ptr:ui8):void
+  (dotimes (x (/ SCREEN-WIDTH 64))
+    (memcpy (unsafe/ptr+ dest (* x 64)) (unsafe/ptr+ (src 'data) (bit-shl (bit-and y 63) 6)) 64)))
+
+(defn fill-back-screen (name:StrView):!void
+  (if (= scaled-view-width SCREEN-WIDTH)
+    (set! have-background false)
+    (let (src (try (lump-named name))
+          bg (unsafe/cast ptr:ui8 &background))
+      (set! have-background true)
+      (dotimes (y (- SCREEN-HEIGHT SBARHEIGHT))
+        (tile-row src y (unsafe/ptr+ bg (* y SCREEN-WIDTH))))
+      (use-buffer bg)
+      (let (x0 view-window-x y0 view-window-y w scaled-view-width h view-height)
+        (let (p (try (patch-named "brdr_t")) x:i32 0)
+          (while (< x w) (try (draw-patch (+ x0 x) (- y0 8) p)) (set! x (+ x 8))))
+        (let (p (try (patch-named "brdr_b")) x:i32 0)
+          (while (< x w) (try (draw-patch (+ x0 x) (+ y0 h) p)) (set! x (+ x 8))))
+        (let (p (try (patch-named "brdr_l")) y:i32 0)
+          (while (< y h) (try (draw-patch (- x0 8) (+ y0 y) p)) (set! y (+ y 8))))
+        (let (p (try (patch-named "brdr_r")) y:i32 0)
+          (while (< y h) (try (draw-patch (+ x0 w) (+ y0 y) p)) (set! y (+ y 8))))
+        (try (draw-patch (- x0 8) (- y0 8) (try (patch-named "brdr_tl"))))
+        (try (draw-patch (+ x0 w) (- y0 8) (try (patch-named "brdr_tr"))))
+        (try (draw-patch (- x0 8) (+ y0 h) (try (patch-named "brdr_bl"))))
+        (try (draw-patch (+ x0 w) (+ y0 h) (try (patch-named "brdr_br")))))
+      (restore-buffer)))
+  (ok))
+
+(defn- video-erase (ofs:i32 count:i32):void
+  (when have-background
+    (memcpy (unsafe/ptr+ (unsafe/cast ptr:ui8 &screen) ofs)
+            (unsafe/ptr+ (unsafe/cast ptr:ui8 &background) ofs)
+            (as usize count))))
+
+(defn draw-view-border ():void
+  (when (!= scaled-view-width SCREEN-WIDTH)
+    (let (top (/ (- (- SCREEN-HEIGHT SBARHEIGHT) view-height) 2)
+          side (/ (- SCREEN-WIDTH scaled-view-width) 2))
+      (video-erase 0 (+ (* top SCREEN-WIDTH) side))
+      (video-erase (- (* (+ view-height top) SCREEN-WIDTH) side) (+ (* top SCREEN-WIDTH) side))
+      (let (ofs (- (+ (* top SCREEN-WIDTH) SCREEN-WIDTH) side))
+        (dotimes (i (- view-height 1))
+          (video-erase ofs (* side 2))
+          (set! ofs (+ ofs SCREEN-WIDTH)))))))

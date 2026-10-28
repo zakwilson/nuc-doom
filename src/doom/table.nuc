@@ -1,0 +1,57 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Per-level storage (the zone's PU_LEVEL tag) and a bounds-checked view of an
+; array in it. Map structures point at each other, so their elements must not
+; move once loaded: a Table never grows, unlike a Vector.
+
+(ns doom.table)
+
+(import-use nucleus.allocator)
+(import-use nucleus.arena)
+(import-use nucleus.node)
+(import-use doom.bytes)
+(import-use doom.system)
+
+(defvar level-arena:Arena (arena-in (handle heap) 0))
+
+(defstruct (Table T) data:ptr:T len:i32)
+
+; Elements are handed out by reference, as C's &sectors[i] is: the map's
+; structures are mutated in place and linked by address.
+(defn invoke (self:&(Table T) i:i32):&T
+  (when (or (< i 0) (>= i (self 'len))) (bytes-oob i 1 (self 'len)))
+  (unsafe/cast &T (unsafe/ptr+ (self 'data) i)))
+
+; (set! (t i) v)
+(defn set (self:&(Table T) i:i32 v:T):void
+  (set! @(invoke self i) v))
+
+(defn table-len (self:&(Table T)):i32 (self 'len))
+
+; The element's index, for the places C subtracts the array base.
+(defn index-of (self:&(Table T) p:&T):i32
+  (unsafe/cast i32 (/ (- (unsafe/cast i64 p) (unsafe/cast i64 (self 'data)))
+                      (as i64 (sizeof T)))))
+
+; Zeroed bytes that live until the next level loads.
+(defn level-alloc (size:i32):ptr
+  (let (p (allocate-zeroed &level-arena (as usize (if (> size 0) size 1)) 8))
+    (when (null? p) (fatal "level-alloc: out of memory"))
+    (unsafe/cast ptr p)))
+
+; Points `t` at `n` zeroed elements of level storage.
+(defmacro level-table (t type n)
+  (let (k (gensym))
+    `(let (~k ~n)
+       (set! (~t 'data) (unsafe/cast (ptr ~type) (level-alloc (* ~k (unsafe/cast i32 (sizeof ~type))))))
+       (set! (~t 'len) ~k))))
+
+; Points `t` at `n` zeroed elements that live for the whole run (PU_STATIC).
+(defmacro static-table (t type n)
+  (let (k (gensym))
+    `(let (~k ~n)
+       (set! (~t 'data) (unsafe/cast (ptr ~type) (arena-alloc (* (as i64 ~k) (unsafe/cast i64 (sizeof ~type))))))
+       (set! (~t 'len) ~k))))
+
+(defn free-level ():void (arena-reset &level-arena))

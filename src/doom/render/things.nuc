@@ -1,0 +1,275 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Sprites (r_things.c): project the things in each visited sector, then draw
+; them far to near, clipped by the walls in front, and finally the player's
+; weapon over everything.
+
+(ns doom.render.things)
+
+(import-use doom.math)
+(import-use doom.world)
+(import-use doom.defs)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.system)
+(import-use doom.info)
+(import-use doom.geom)
+(import-use doom.render.main)
+(import-use doom.render.data)
+(import-use doom.render.draw)
+(import-use doom.render.bsp)
+(import-use doom.render.plane)
+(import-use doom.render.segs)
+
+(defconst- MINZ (* FRAC-UNIT 4))
+(defconst- BASEYCENTER 100)
+(defconst- MAXVISSPRITES 128)
+; Half a rotation step, so each of the eight views is centred on its angle.
+; Named, because the expression written inline would not adapt to ui32. ISSUE-017
+(defconst- ROT-BIAS (* (/ ANG45 2) 9))
+
+; Shared with masked walls: the current column scale, the screen row of the
+; texture top, and the clip-store bases bounding the column.
+; Globals start at (Fixed 0): FIXED-ZERO is refused here. ISSUE-016
+(defvar spry-scale:Fixed (Fixed 0))
+(defvar spr-top-screen:Fixed (Fixed 0))
+(defvar mfloor-clip:i32 CLIP-SCREEN-HEIGHT)
+(defvar mceiling-clip:i32 CLIP-NEG-ONE)
+
+; colormap -1 draws the spectre shimmer.
+(defstruct Vissprite
+  x1:i32 x2:i32
+  gx:Fixed gy:Fixed gz:Fixed gzt:Fixed
+  start-frac:Fixed scale:Fixed xiscale:Fixed texture-mid:Fixed
+  patch:i32 colormap:i32 mobj-flags:i32)
+
+(defvar- vissprites:(array Vissprite 128))
+(defvar- vissprite-count:i32 0)
+; The sector's scale-light row for the things being projected.
+(defvar- sprite-lights:i32 0)
+
+(defn clear-sprites ():void (set! vissprite-count 0))
+
+(defn- vissprite (i:i32):&Vissprite &(aref vissprites i))
+
+; Draws the posts of one patch column, clipped to mceiling-clip/mfloor-clip.
+; `post` points at the column's first post header.
+(defn draw-masked-column (c:&Column post:ptr:ui8 kind:i32):void
+  (let (base-mid (c 'texture-mid) p post x (c 'x))
+    (while (!= (aref p 0) 255)
+      (let (delta (as i32 (aref p 0))
+            len (as i32 (aref p 1))
+            top ((+ spr-top-screen (* spry-scale delta)) 'v)
+            bottom (+ top ((* spry-scale len) 'v))
+            yl (bit-shr (- (+ top FRAC-UNIT) 1) FRAC-BITS)
+            yh (bit-shr (- bottom 1) FRAC-BITS))
+        (when (>= yh (clip-at mfloor-clip x)) (set! yh (- (clip-at mfloor-clip x) 1)))
+        (when (<= yl (clip-at mceiling-clip x)) (set! yl (+ (clip-at mceiling-clip x) 1)))
+        (when (<= yl yh)
+          (set! (c 'yl) yl)
+          (set! (c 'yh) yh)
+          (set! (c 'source) (unsafe/ptr+ p 3))
+          (set! (c 'texture-mid) (- base-mid (fx delta)))
+          (draw-column kind c))
+        (set! p (unsafe/ptr+ p (+ len 4)))))
+    (set! (c 'texture-mid) base-mid)))
+
+(defn- draw-vis-sprite (vis:&Vissprite):void
+  (let (patch (lump (+ (vis 'patch) first-sprite-lump))
+        flags (vis 'mobj-flags)
+        kind (cond (= (vis 'colormap) -1) COL-FUZZ
+               (!= (bit-and flags MF-TRANSLATION) 0) COL-TRANSLATED
+               true COL-NORMAL)
+        c (Column 0 0 0 (fx-shr (fx-abs (vis 'xiscale)) detail-shift) (vis 'texture-mid) null
+                  (if (= (vis 'colormap) -1) 0 (vis 'colormap))
+                  (- (bit-shr (bit-and flags MF-TRANSLATION) MF-TRANSSHIFT) 1))
+        frac (vis 'start-frac)
+        x (vis 'x1))
+    (set! spry-scale (vis 'scale))
+    (set! spr-top-screen (- center-y-frac (* (vis 'texture-mid) spry-scale)))
+    (while (<= x (vis 'x2))
+      (let (col (fx-int frac))
+        (when (or (< col 0) (>= col (le-i16 patch 0)))
+          (fatal "R_DrawSpriteRange: bad texturecolumn"))
+        (set! (c 'x) x)
+        (draw-masked-column c (unsafe/ptr+ (patch 'data) (le-i32 patch (+ 8 (* 4 col)))) kind))
+      (set! frac (+ frac (vis 'xiscale)))
+      (inc! x))))
+
+; The C hands out a scratch sprite once the array is full; this just skips.
+(defn- new-vissprite ():?&Vissprite
+  (if (= vissprite-count MAXVISSPRITES)
+    null
+    (do (inc! vissprite-count)
+        (vissprite (- vissprite-count 1)))))
+
+(defn- project-sprite (thing:&Mobj):void
+  (let (tr-x (- (thing 'x) view-x)
+        tr-y (- (thing 'y) view-y)
+        tz (- (* tr-x view-cos) (fx-neg (* tr-y view-sin))))
+    ; Behind or too close.
+    (when (>= (tz 'v) MINZ)
+      (let (xscale (/ projection tz)
+            tx (fx-neg (+ (* tr-y view-cos) (fx-neg (* tr-x view-sin)))))
+        ; Too far to the side.
+        (when (<= (fx-abs tx) (fx-shl tz 2))
+          (when (>= (thing 'sprite) NUM-SPRITES) (fatal "R_ProjectSprite: invalid sprite number"))
+          (let (fr (sprite-frame (thing 'sprite) (bit-and (thing 'frame) FF-FRAMEMASK))
+                rot (if (!= (fr 'rotate) 0)
+                      (unsafe/cast i32 (bit-shr (+ (- (point-to-view-angle (thing 'x) (thing 'y)) (thing 'angle))
+                                                   ROT-BIAS)
+                                                29))
+                      0)
+                l (aref (fr 'lump) rot)
+                flip (!= (aref (fr 'flip) rot) 0)
+                tx1 (- tx @(sprite-offset l))
+                x1 (fx-int (+ center-x-frac (* tx1 xscale)))
+                tx2 (+ tx1 @(sprite-width l))
+                x2 (- (fx-int (+ center-x-frac (* tx2 xscale))) 1))
+            (when (and (<= x1 view-width) (>= x2 0))
+              (when-some (vis (new-vissprite))
+                (let (iscale (/ FIXED-ONE xscale))
+                  (set! (vis 'mobj-flags) (thing 'flags))
+                  (set! (vis 'scale) (fx-shl xscale detail-shift))
+                  (set! (vis 'gx) (thing 'x))
+                  (set! (vis 'gy) (thing 'y))
+                  (set! (vis 'gz) (thing 'z))
+                  (set! (vis 'gzt) (+ (thing 'z) @(sprite-top-offset l)))
+                  (set! (vis 'texture-mid) (- (vis 'gzt) view-z))
+                  (set! (vis 'x1) (if (< x1 0) 0 x1))
+                  (set! (vis 'x2) (if (>= x2 view-width) (- view-width 1) x2))
+                  (if flip
+                    (do (set! (vis 'start-frac) (- @(sprite-width l) (Fixed 1)))
+                        (set! (vis 'xiscale) (fx-neg iscale)))
+                    (do (set! (vis 'start-frac) (Fixed 0))
+                        (set! (vis 'xiscale) iscale)))
+                  (when (> (vis 'x1) x1)
+                    (set! (vis 'start-frac) (+ (vis 'start-frac) (* (vis 'xiscale) (- (vis 'x1) x1)))))
+                  (set! (vis 'patch) l)
+                  (set! (vis 'colormap)
+                        (cond (!= (bit-and (thing 'flags) MF-SHADOW) 0) -1
+                          (!= fixed-colormap 0) fixed-colormap
+                          (!= (bit-and (thing 'frame) FF-FULLBRIGHT) 0) 0
+                          true (scale-light-map sprite-lights
+                                                     (bit-shr (xscale 'v) (- LIGHTSCALESHIFT detail-shift))))))))))))))
+
+(defn add-sprites (sec:&Sector):void
+  ; A sector can be reached through several subsectors; project it once.
+  (when (!= (sec 'validcount) validcount)
+    (set! (sec 'validcount) validcount)
+    (set! sprite-lights (light-row (+ (bit-shr (sec 'light-level) LIGHTSEGSHIFT) extra-light)))
+    (let (t (sec 'thing-list))
+      (while (not (null? t))
+        (when-some (m t)
+          (project-sprite m)
+          (set! t (m 'snext)))))))
+
+(defn- draw-psprite (p:&Player psp:&PspDef):void
+  (let (st (aref states (psp 'state))
+        fr (sprite-frame (st 'sprite) (bit-and (st 'frame) FF-FRAMEMASK))
+        l (aref (fr 'lump) 0)
+        flip (!= (aref (fr 'flip) 0) 0)
+        tx (- (- (psp 'sx) (fx 160)) @(sprite-offset l))
+        x1 (fx-int (+ center-x-frac (* tx psprite-scale)))
+        x2 (- (fx-int (+ center-x-frac (* (+ tx @(sprite-width l)) psprite-scale))) 1))
+    (when (and (<= x1 view-width) (>= x2 0))
+      (let (vis:Vissprite (Vissprite 0 0 (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0) 0 0 0)
+            invis (aref (p 'powers) PW-INVISIBILITY))
+        (set! (vis 'texture-mid) (- (+ (fx BASEYCENTER) (Fixed (/ FRAC-UNIT 2)))
+                                    (- (psp 'sy) @(sprite-top-offset l))))
+        (set! (vis 'x1) (if (< x1 0) 0 x1))
+        (set! (vis 'x2) (if (>= x2 view-width) (- view-width 1) x2))
+        (set! (vis 'scale) (fx-shl psprite-scale detail-shift))
+        (if flip
+          (do (set! (vis 'xiscale) (fx-neg psprite-iscale))
+              (set! (vis 'start-frac) (- @(sprite-width l) (Fixed 1))))
+          (do (set! (vis 'xiscale) psprite-iscale)
+              (set! (vis 'start-frac) (Fixed 0))))
+        (when (> (vis 'x1) x1)
+          (set! (vis 'start-frac) (+ (vis 'start-frac) (* (vis 'xiscale) (- (vis 'x1) x1)))))
+        (set! (vis 'patch) l)
+        (set! (vis 'colormap)
+              (cond (or (> invis (* 4 32)) (!= (bit-and invis 8) 0)) -1
+                (!= fixed-colormap 0) fixed-colormap
+                (!= (bit-and (st 'frame) FF-FULLBRIGHT) 0) 0
+                true (scale-light-map sprite-lights (- MAXLIGHTSCALE 1))))
+        (draw-vis-sprite &vis)))))
+
+(defn- draw-player-sprites (p:&Player):void
+  (when-some (mo (p 'mo))
+    (when-some (ss (mo 'subsector))
+      (set! sprite-lights (light-row (+ (bit-shr ((ss 'sector) 'light-level) LIGHTSEGSHIFT) extra-light)))))
+  (set! mfloor-clip CLIP-SCREEN-HEIGHT)
+  (set! mceiling-clip CLIP-NEG-ONE)
+  (dotimes (i NUM-PSPRITES)
+    (let (psp &(aref (p 'psprites) i))
+      (when (!= (psp 'state) S-NULL)
+        (draw-psprite p psp)))))
+
+; Far to near: ascending scale, ties in projection order (the C's selection
+; sort picks the first smallest each time, which is a stable sort).
+(defvar- sorted:(array i32 128))
+
+(defn- sort-vissprites ():void
+  (dotimes (i vissprite-count)
+    (let (j i s ((vissprite i) 'scale))
+      (while (and (> j 0) (> ((vissprite (aref sorted (- j 1))) 'scale) s))
+        (set! (aref sorted j) (aref sorted (- j 1)))
+        (set! j (- j 1)))
+      (set! (aref sorted j) i))))
+
+(defn- draw-sprite (spr:&Vissprite):void
+  (let (x1 (spr 'x1) x2 (spr 'x2))
+    (let (x x1)
+      (while (<= x x2)
+        (set-clip CLIP-SPR-BOTTOM x -2)
+        (set-clip CLIP-SPR-TOP x -2)
+        (inc! x)))
+    ; Walls nearer than the sprite clip it; masked walls behind it are drawn now.
+    (let (i (- ds-count 1))
+      (while (>= i 0)
+        (let (ds (draw-seg i))
+          (when (not (or (> (ds 'x1) x2) (< (ds 'x2) x1)
+                         (and (= (ds 'silhouette) 0) (= (ds 'masked-texture-col) NO-CLIP))))
+            (let (r1 (if (< (ds 'x1) x1) x1 (ds 'x1))
+                  r2 (if (> (ds 'x2) x2) x2 (ds 'x2))
+                  lowscale (if (> (ds 'scale1) (ds 'scale2)) (ds 'scale2) (ds 'scale1))
+                  scale (if (> (ds 'scale1) (ds 'scale2)) (ds 'scale1) (ds 'scale2)))
+              (if (or (< scale (spr 'scale))
+                      (and (< lowscale (spr 'scale))
+                           (= (point-on-seg-side (spr 'gx) (spr 'gy) (segs (ds 'cur-line))) 0)))
+                (when (!= (ds 'masked-texture-col) NO-CLIP)
+                  (render-masked-seg-range ds r1 r2))
+                (let (sil (ds 'silhouette))
+                  (when (>= (spr 'gz) (ds 'bsil-height)) (set! sil (bit-and sil (bit-not SIL-BOTTOM))))
+                  (when (<= (spr 'gzt) (ds 'tsil-height)) (set! sil (bit-and sil (bit-not SIL-TOP))))
+                  (let (x r1)
+                    (while (<= x r2)
+                      (when (and (!= (bit-and sil SIL-BOTTOM) 0) (= (clip-at CLIP-SPR-BOTTOM x) -2))
+                        (set-clip CLIP-SPR-BOTTOM x (clip-at (ds 'spr-bottom-clip) x)))
+                      (when (and (!= (bit-and sil SIL-TOP) 0) (= (clip-at CLIP-SPR-TOP x) -2))
+                        (set-clip CLIP-SPR-TOP x (clip-at (ds 'spr-top-clip) x)))
+                      (inc! x)))))))
+          (set! i (- i 1)))))
+    (let (x x1)
+      (while (<= x x2)
+        (when (= (clip-at CLIP-SPR-BOTTOM x) -2) (set-clip CLIP-SPR-BOTTOM x view-height))
+        (when (= (clip-at CLIP-SPR-TOP x) -2) (set-clip CLIP-SPR-TOP x -1))
+        (inc! x)))
+    (set! mfloor-clip CLIP-SPR-BOTTOM)
+    (set! mceiling-clip CLIP-SPR-TOP)
+    (draw-vis-sprite spr)))
+
+(defn draw-masked ():void
+  (sort-vissprites)
+  (dotimes (i vissprite-count)
+    (draw-sprite (vissprite (aref sorted i))))
+  (let (i (- ds-count 1))
+    (while (>= i 0)
+      (let (ds (draw-seg i))
+        (when (!= (ds 'masked-texture-col) NO-CLIP)
+          (render-masked-seg-range ds (ds 'x1) (ds 'x2))))
+      (set! i (- i 1))))
+  (when-some (p view-player)
+    (draw-player-sprites p)))

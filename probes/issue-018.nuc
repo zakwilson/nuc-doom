@@ -1,0 +1,8 @@
+; ISSUE-018: inc! takes only a variable, not a place such as a field.
+; Actual: "inc!: target must be symbol".
+; fixed-when: runs
+(defstruct S n:i32)
+(defn main ():i32
+  (let (s:S (S 1) p &s)
+    (inc! (p 'n))
+    (- (p 'n) 2)))

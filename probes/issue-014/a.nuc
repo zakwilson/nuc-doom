@@ -1,0 +1,3 @@
+(ns issue-014.a)
+(import-use issue-014.b)
+(defn a-one ():i32 (b-zero))

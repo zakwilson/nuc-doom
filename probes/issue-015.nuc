@@ -1,0 +1,8 @@
+; ISSUE-015: compiled by absolute path with a relative -I, a unit whose import
+; cycle closes back on a file loads that file twice, once per path spelling,
+; and fails with "duplicate definition of 'a-one' ... already defined at
+; <the same file, absolute>". check-probes.sh passes this file's absolute path.
+; flags: -I probes
+; fixed-when: runs
+(import-use issue-015.a)
+(defn main ():i32 (- (a-one) 1))

@@ -1,0 +1,69 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Angles and BSP sides of points (from r_main.c), which the playsim uses as
+; much as the renderer. The C measures angles from a moving origin (viewx,
+; viewy, which R_PointToAngle2 even overwrites); here the origin is explicit.
+
+(ns doom.geom)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.world)
+(import-use doom.table)
+
+(defn- tan-angle (num:i32 den:i32):Angle
+  (tan-to-angle (slope-div (unsafe/cast ui32 num) (unsafe/cast ui32 den))))
+
+; The angle of the vector (x, y), by octant and the arctangent table.
+(defn point-to-angle (px:Fixed py:Fixed):Angle
+  (let (x (px 'v) y (py 'v))
+    (cond (and (= x 0) (= y 0)) 0
+      (>= x 0) (if (>= y 0)
+         (if (> x y)
+           (tan-angle y x)
+           (- (- ANG90 (tan-angle x y)) 1))
+         (let (y (- 0 y))
+           (if (> x y)
+             (- 0 (tan-angle y x))
+             (+ ANG270 (tan-angle x y)))))
+      true (let (x (- 0 x))
+         (if (>= y 0)
+           (if (> x y)
+             (- (- ANG180 (tan-angle y x)) 1)
+             (+ ANG90 (tan-angle x y)))
+           (let (y (- 0 y))
+             (if (> x y)
+               (+ ANG180 (tan-angle y x))
+               (- (- ANG270 (tan-angle x y)) 1))))))))
+
+(defn point-to-angle2 (x1:Fixed y1:Fixed x2:Fixed y2:Fixed):Angle
+  (point-to-angle (- x2 x1) (- y2 y1)))
+
+; 0 for the front (right) side of the partition line, 1 for the back.
+(defn- point-on-side (x:Fixed y:Fixed lx:Fixed ly:Fixed ldx:Fixed ldy:Fixed):i32
+  (cond (= (ldx 'v) 0) (if (<= x lx) (if (> (ldy 'v) 0) 1 0) (if (< (ldy 'v) 0) 1 0))
+    (= (ldy 'v) 0) (if (<= y ly) (if (< (ldx 'v) 0) 1 0) (if (> (ldx 'v) 0) 1 0))
+    true (let (dx (- x lx) dy (- y ly))
+       ; Opposite signs settle it without a multiply.
+       (if (< (bit-xor (bit-xor (ldy 'v) (ldx 'v)) (bit-xor (dx 'v) (dy 'v))) 0)
+         (if (< (bit-xor (ldy 'v) (dx 'v)) 0) 1 0)
+         (let (left (* (fx-raw (bit-shr (ldy 'v) FRAC-BITS)) dx)
+               right (* dy (fx-raw (bit-shr (ldx 'v) FRAC-BITS))))
+           (if (< right left) 0 1))))))
+
+(defn point-on-node-side (x:Fixed y:Fixed n:&Node):i32
+  (point-on-side x y (n 'x) (n 'y) (n 'dx) (n 'dy)))
+
+(defn point-on-seg-side (x:Fixed y:Fixed s:&Seg):i32
+  (let (v1 (s 'v1) v2 (s 'v2))
+    (point-on-side x y (v1 'x) (v1 'y) (- (v2 'x) (v1 'x)) (- (v2 'y) (v1 'y)))))
+
+(defn point-in-subsector (x:Fixed y:Fixed):&Subsector
+  (if (= (table-len nodes) 0)
+    (subsectors 0)
+    (let (n (- (table-len nodes) 1))
+      (while (= (bit-and n NF-SUBSECTOR) 0)
+        (let (node (nodes n))
+          (set! n (aref (node 'children) (point-on-node-side x y node)))))
+      (subsectors (bit-and n (bit-not NF-SUBSECTOR))))))

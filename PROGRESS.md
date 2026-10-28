@@ -7,8 +7,8 @@
 | 0 | Setup: scaffold, hello SDL, reference harness, demo data | done |
 | 1 | Foundations: fixed, tables, random, WAD, info, types, argv | done |
 | 2 | Static graphics, `-framedump` | done |
-| 3 | Level load and renderer | next |
-| 4 | Playsim, demos, `-tichash` | — |
+| 3 | Level load and renderer | done |
+| 4 | Playsim, demos, `-tichash` | next |
 | 5 | Playable | — |
 | 6 | Sound and music (optional) | — |
 | 7 | Savegames and config (optional) | — |
@@ -48,7 +48,25 @@
 | `doom.args` | `src/doom/args.nuc` | m_argv.c (no response files) |
 | `doom.video` | `src/doom/video.nuc` | v_video.c, v_patch.h (screen, patches, palette) |
 | `doom.sys.video` | `src/doom/sys/video.nuc` | i_video.c (SDL presentation), `-framedump` |
-| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop; title page only so far) |
+| `doom.system` | `src/doom/system.nuc` | i_system.c (`fatal`, the I_Error stand-in) |
+| `doom.table` | `src/doom/table.nuc` | z_zone.c's PU_LEVEL (one arena), bounds-checked `(Table T)` handing out `&T` |
+| `doom.world` | `src/doom/world.nuc` | r_defs.h, d_player.h, p_mobj.h, d_think.h (map, mobj, player and thinker types; the level tables) |
+| `doom.state` | `src/doom/state.nuc` | doomstat.c (game globals, `players`) |
+| `doom.geom` | `src/doom/geom.nuc` | r_main.c point/angle helpers shared by the renderer and the playsim |
+| `doom.game` | `src/doom/game.nuc` | g_game.c (new game, level load; more in M4) |
+| `doom.render.data` | `src/doom/render/data.nuc` | r_data.c, r_things.c sprite setup (textures, flats, colormaps, sprite frames) |
+| `doom.render.draw` | `src/doom/render/draw.nuc` | r_draw.c (column and span drawers, view border) |
+| `doom.render.main` | `src/doom/render/main.nuc` | r_main.c, r_sky.c (projection, light tables, the frame) |
+| `doom.render.bsp` | `src/doom/render/bsp.nuc` | r_bsp.c |
+| `doom.render.plane` | `src/doom/render/plane.nuc` | r_plane.c, plus one clip store for every C clip array |
+| `doom.render.segs` | `src/doom/render/segs.nuc` | r_segs.c |
+| `doom.render.things` | `src/doom/render/things.nuc` | r_things.c (vissprites, masked walls, player sprites) |
+| `doom.play.tick` | `src/doom/play/tick.nuc` | p_tick.c (the thinker list; a `Thinker` union with an explicit state) |
+| `doom.play.setup` | `src/doom/play/setup.nuc` | p_setup.c, including vanilla's REJECT padding |
+| `doom.play.mobj` | `src/doom/play/mobj.nuc` | p_mobj.c spawning, p_maputl.c position links |
+| `doom.play.pspr` | `src/doom/play/pspr.nuc` | p_pspr.c (only a stand-in raised pistol so far) |
+| `doom.play.user` | `src/doom/play/user.nuc` | p_user.c (`calc-height` so far) |
+| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`; a stand-in level tic) |
 | `tests.*` | `src/tests/*.nuc` | unit tests; `scripts/run-tests.sh` |
 
 - The trig tables can't be generated: no closed-form `sin`/`tan`/`atan` (double,
@@ -61,12 +79,15 @@
 ## Gates
 
 - `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info).
-- `scripts/check-frames.sh`: `title` matches the reference byte for byte;
-  `e1m1` fails until M3.
+- `scripts/check-frames.sh`: `title` matches the reference byte for byte.
+  `e1m1` matches except the status bar (M5) and 3 view pixels at x=178..180,
+  y=87: a distant barrel whose two-frame animation needs the thinkers (M4).
 - `scripts/check-demos.sh`: from M4.
 - `scripts/check-probes.sh`: issue probes.
 
 ## Next steps
 
-- Milestone 3: map loading (p_setup), BSP and the renderer (r_*). Gate:
-  `scripts/check-frames.sh e1m1`.
+- Milestone 4: the playsim (p_*), tic commands, demo playback and `-tichash`.
+  `states`/`mobj-info` are constants; fast/nightmare mode mutates them in the
+  C, so they need a mutable copy. Replace the stand-ins in `doom.play.pspr`
+  and `doom.main`'s level tic. Gate: `scripts/check-demos.sh`.

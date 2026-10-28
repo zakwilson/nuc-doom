@@ -1,0 +1,194 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The level as both the renderer and the playsim see it (r_defs.h, p_mobj.h,
+; d_player.h, d_think.h): map structures, things, thinkers and players, and
+; the level's tables. Everything that points into the level lives here so the
+; two halves can share it without importing each other.
+
+(ns doom.world)
+
+(import-use nucleus.arena)
+(import-use nucleus.create)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.table)
+
+;; Bounding boxes (m_bbox.h).
+(defconst BOXTOP 0)
+(defconst BOXBOTTOM 1)
+(defconst BOXLEFT 2)
+(defconst BOXRIGHT 3)
+
+;; Map geometry, in map units (p_local.h).
+(defconst MAPBLOCKUNITS 128)
+(defconst MAPBLOCKSHIFT (+ FRAC-BITS 7))
+(defconst MAXRADIUS (* 32 FRAC-UNIT))
+(defconst ONFLOORZ -2147483648)
+(defconst ONCEILINGZ 2147483647)
+(defconst VIEWHEIGHT (* 41 FRAC-UNIT))
+
+; Sprite frame flags (p_pspr.h).
+(defconst FF-FULLBRIGHT 0x8000)
+(defconst FF-FRAMEMASK 0x7fff)
+
+(defenum SlopeType ST-HORIZONTAL ST-VERTICAL ST-POSITIVE ST-NEGATIVE)
+
+(defstruct Vertex x:Fixed y:Fixed)
+
+; A sector's sound origin: a point that isn't a thing (degenmobj_t).
+(defstruct SoundOrg x:Fixed y:Fixed z:Fixed)
+
+(defstruct Sector
+  floor-height:Fixed ceiling-height:Fixed
+  floor-pic:i32 ceiling-pic:i32
+  light-level:i32 special:i32 tag:i32
+  sound-traversed:i32 sound-target:?&Mobj
+  blockbox:(array i32 4)
+  sound-org:SoundOrg
+  validcount:i32
+  thing-list:?&Mobj
+  ; The floor, ceiling, door or plat moving this sector, if any.
+  special-data:?&ThinkerNode
+  line-count:i32 lines:ptr:&Line)
+
+(defstruct Side
+  texture-offset:Fixed row-offset:Fixed
+  top-texture:i32 bottom-texture:i32 mid-texture:i32
+  sector:&Sector)
+
+(defstruct Line
+  v1:&Vertex v2:&Vertex
+  dx:Fixed dy:Fixed
+  flags:i32 special:i32 tag:i32
+  ; -1 for no side.
+  side-num:(array i32 2)
+  bbox:(array Fixed 4)
+  slope-type:i32
+  front-sector:?&Sector back-sector:?&Sector
+  validcount:i32)
+
+(defstruct Subsector sector:&Sector num-lines:i32 first-line:i32)
+
+(defstruct Seg
+  v1:&Vertex v2:&Vertex
+  offset:Fixed angle:Angle
+  side-def:&Side line-def:&Line
+  front-sector:&Sector back-sector:?&Sector)
+
+; bbox is [child][BOX*], flattened.
+(defstruct Node x:Fixed y:Fixed dx:Fixed dy:Fixed bbox:(array Fixed 8) children:(array i32 2))
+
+(defn node-bbox (n:&Node side:i32):ptr:Fixed (unsafe/ptr+ (n 'bbox) (* side 4)))
+
+(defstruct MapThing x:i32 y:i32 angle:i32 type:i32 options:i32)
+
+;; Thinkers (d_think.h). The C keeps one list of structs that start with a
+;; thinker_t and tells them apart by function pointer. Here each node says
+;; what it belongs to, and a removed or suspended thinker is a state, not a
+;; magic function value.
+
+(defunion Thinker
+  cap                      ; the list head
+  (mobj m:&Mobj))
+
+(defenum ThinkState TH-ACTIVE TH-STASIS TH-REMOVED)
+
+(defstruct ThinkerNode prev:?&ThinkerNode next:?&ThinkerNode self:Thinker state:i32)
+
+(defstruct Mobj
+  th:ThinkerNode
+  x:Fixed y:Fixed z:Fixed
+  ; Links in the sector's thing list.
+  snext:?&Mobj sprev:?&Mobj
+  angle:Angle
+  sprite:i32 frame:i32
+  ; Links in the blockmap cell's thing list.
+  bnext:?&Mobj bprev:?&Mobj
+  subsector:?&Subsector
+  floorz:Fixed ceilingz:Fixed
+  radius:Fixed height:Fixed
+  momx:Fixed momy:Fixed momz:Fixed
+  validcount:i32
+  type:i32
+  tics:i32
+  ; A StateNum; the C keeps a pointer into states[].
+  state:i32
+  flags:i32 health:i32
+  movedir:i32 movecount:i32
+  target:?&Mobj
+  reaction-time:i32 threshold:i32
+  player:?&Player
+  last-look:i32
+  spawn-point:MapThing
+  tracer:?&Mobj)
+
+;; Players (d_player.h, d_ticcmd.h).
+
+(defenum PlayerState PST-LIVE PST-DEAD PST-REBORN)
+
+(defconst CF-NOCLIP 1)
+(defconst CF-GODMODE 2)
+(defconst CF-NOMOMENTUM 4)
+
+(defstruct TicCmd forward-move:i8 side-move:i8 angle-turn:i16 chat-char:ui8 buttons:ui8 consistancy:ui8)
+
+(defenum PsprNum PS-WEAPON PS-FLASH NUM-PSPRITES)
+
+; state is a StateNum, S-NULL when the sprite is off.
+(defstruct PspDef state:i32 tics:i32 sx:Fixed sy:Fixed)
+
+(defstruct Player
+  mo:?&Mobj
+  player-state:i32
+  cmd:TicCmd
+  viewz:Fixed view-height:Fixed delta-view-height:Fixed bob:Fixed
+  health:i32 armor-points:i32 armor-type:i32
+  powers:(array i32 6)
+  cards:(array bool 6)
+  backpack:bool
+  frags:(array i32 4)
+  ready-weapon:i32 pending-weapon:i32
+  weapon-owned:(array i32 9)
+  ammo:(array i32 4) max-ammo:(array i32 4)
+  attack-down:i32 use-down:i32
+  cheats:i32 refire:i32
+  kill-count:i32 item-count:i32 secret-count:i32
+  message:CStr
+  damage-count:i32 bonus-count:i32
+  attacker:?&Mobj
+  extra-light:i32 fixed-colormap:i32 colormap:i32
+  psprites:(array PspDef 2)
+  did-secret:bool)
+
+;; The loaded level (p_setup.c).
+
+(defvar vertexes:&(Table Vertex) (new (Table Vertex) g-arena))
+(defvar sectors:&(Table Sector) (new (Table Sector) g-arena))
+(defvar sides:&(Table Side) (new (Table Side) g-arena))
+(defvar lines:&(Table Line) (new (Table Line) g-arena))
+(defvar subsectors:&(Table Subsector) (new (Table Subsector) g-arena))
+(defvar segs:&(Table Seg) (new (Table Seg) g-arena))
+(defvar nodes:&(Table Node) (new (Table Node) g-arena))
+
+; The blockmap: a grid of MAPBLOCKUNITS cells, each with a list of line
+; numbers (in the lump) and a list of things (blocklinks).
+; Globals start at (Fixed 0): FIXED-ZERO is refused here. ISSUE-016
+(defvar bmap-org-x:Fixed (Fixed 0))
+(defvar bmap-org-y:Fixed (Fixed 0))
+(defvar bmap-width:i32 0)
+(defvar bmap-height:i32 0)
+(defvar blockmap-lump:&(Table i16) (new (Table i16) g-arena))
+; A (Table ?&Mobj) would stamp its elements non-null. ISSUE-013
+(defstruct BlockLink head:?&Mobj)
+(defvar blocklinks:&(Table BlockLink) (new (Table BlockLink) g-arena))
+(defvar reject-matrix:&(Table ui8) (new (Table ui8) g-arena))
+
+; Bumped before each traversal that marks what it has visited; the renderer
+; and the playsim share it, as in the C.
+(defvar validcount:i32 1)
+
+(defn sector-line (s:&Sector i:i32):&Line (aref (s 'lines) i))
+
+(defn sector-index (s:&Sector):i32 (index-of sectors s))
+(defn line-index (l:&Line):i32 (index-of lines l))

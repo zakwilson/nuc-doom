@@ -1,0 +1,215 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The view (r_main.c, r_sky.c): projection and light tables for the current
+; window size, the per-frame view point, and the frame's passes.
+
+(ns doom.render.main)
+
+(import-use doom.math)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.geom)
+(import-use doom.render.data)
+(import-use doom.render.draw)
+(import-use doom.render.bsp)
+(import-use doom.render.plane)
+(import-use doom.render.things)
+(import-use doom.render.segs)
+
+(defconst LIGHTLEVELS 16)
+(defconst LIGHTSEGSHIFT 4)
+(defconst MAXLIGHTSCALE 48)
+(defconst LIGHTSCALESHIFT 12)
+(defconst MAXLIGHTZ 128)
+(defconst LIGHTZSHIFT 20)
+(defconst NUMCOLORMAPS 32)
+(defconst- FIELDOFVIEW 2048)
+(defconst- DISTMAP 2)
+
+(defconst ANGLETOSKYSHIFT 22)
+
+; Globals start at (Fixed 0): FIXED-ZERO is refused here. ISSUE-016
+(defvar view-x:Fixed (Fixed 0))
+(defvar view-y:Fixed (Fixed 0))
+(defvar view-z:Fixed (Fixed 0))
+(defvar view-angle:Angle 0)
+(defvar view-cos:Fixed (Fixed 0))
+(defvar view-sin:Fixed (Fixed 0))
+(defvar view-player:?&Player null)
+(defvar extra-light:i32 0)
+; A colormap forced on everything (invulnerability, light amp); 0 for none.
+(defvar fixed-colormap:i32 0)
+
+(defvar center-x:i32 0)
+(defvar center-x-frac:Fixed (Fixed 0))
+(defvar center-y-frac:Fixed (Fixed 0))
+(defvar projection:Fixed (Fixed 0))
+
+; Screen column of each fine view angle, and view angle of each column.
+(defvar view-angle-to-x:(array i32 4096))
+(defvar x-to-view-angle:(array ui32 321))
+(defvar clip-angle:Angle 0)
+
+; Colormap numbers by [light level][wall scale] and [light level][distance].
+(defvar scale-light:(array i32 768))
+(defvar z-light:(array i32 2048))
+
+; Per row and column factors for flats.
+(defvar y-slope:(array Fixed 200))
+(defvar dist-scale:(array Fixed 320))
+
+(defvar psprite-scale:Fixed (Fixed 0))
+(defvar psprite-iscale:Fixed (Fixed 0))
+
+(defvar frame-count:i32 0)
+
+(defvar sky-flat-num:i32 0)
+(defvar sky-texture:i32 0)
+(defvar sky-texture-mid:Fixed (Fixed (* 100 FRAC-UNIT)))
+
+(defvar set-size-needed:bool false)
+(defvar- set-blocks:i32 0)
+(defvar- set-detail:i32 0)
+
+(defn x-angle (x:i32):Angle (aref x-to-view-angle x))
+
+; The scale-light row for a light level, clamped.
+(defn light-row (light:i32):i32
+  (cond (< light 0) 0
+    (>= light LIGHTLEVELS) (- LIGHTLEVELS 1)
+    true light))
+
+(defn scale-light-map (row:i32 index:i32):i32
+  (aref scale-light (+ (* row MAXLIGHTSCALE) (if (>= index MAXLIGHTSCALE) (- MAXLIGHTSCALE 1) index))))
+
+(defn z-light-map (row:i32 index:i32):i32
+  (aref z-light (+ (* row MAXLIGHTZ) (if (>= index MAXLIGHTZ) (- MAXLIGHTZ 1) index))))
+
+(defn point-to-view-angle (x:Fixed y:Fixed):Angle
+  (point-to-angle (- x view-x) (- y view-y)))
+
+; Distance from the view point, along the line to (x, y).
+(defn point-to-dist (x:Fixed y:Fixed):Fixed
+  (let (dx (fx-abs (- x view-x))
+        dy (fx-abs (- y view-y)))
+    (when (> dy dx) (let (t dx) (set! dx dy) (set! dy t)))
+    (let (frac (if (!= (dx 'v) 0) (/ dy dx) (Fixed 0))
+          angle (fine-index (+ (tan-to-angle (bit-shr (frac 'v) DBITS)) ANG90)))
+      (/ dx (fine-sine angle)))))
+
+; The scale of a wall at `visangle`, given the wall's normal and distance.
+(defn scale-from-global-angle (visangle:Angle normal:Angle distance:Fixed):Fixed
+  (let (sinea (fine-sine (fine-index (+ ANG90 (- visangle view-angle))))
+        sineb (fine-sine (fine-index (+ ANG90 (- visangle normal))))
+        num (fx-shl (* projection sineb) detail-shift)
+        den (* distance sinea))
+    (if (> (den 'v) (bit-shr (num 'v) FRAC-BITS))
+      (let (scale (/ num den))
+        (cond (> (scale 'v) (* 64 FRAC-UNIT)) (Fixed (* 64 FRAC-UNIT))
+          (< (scale 'v) 256) (Fixed 256)
+          true scale))
+      (Fixed (* 64 FRAC-UNIT)))))
+
+(defn- init-texture-mapping ():void
+  (let (focal (/ center-x-frac (fine-tangent (+ (/ FINE-ANGLES 4) (/ FIELDOFVIEW 2)))))
+    (dotimes (i (/ FINE-ANGLES 2))
+      (let (t (fine-tangent i))
+        (set! (aref view-angle-to-x i)
+              (cond (> (t 'v) (* FRAC-UNIT 2)) -1
+                (< (t 'v) (* FRAC-UNIT -2)) (+ view-width 1)
+                true (let (x (bit-shr (- (+ ((- center-x-frac (* t focal)) 'v) FRAC-UNIT) 1) FRAC-BITS))
+                       (cond (< x -1) -1
+                         (> x (+ view-width 1)) (+ view-width 1)
+                         true x))))))
+    ; The first angle whose column is at or left of x.
+    (dotimes (x (+ view-width 1))
+      (let (i:i32 0)
+        (while (> (aref view-angle-to-x i) x) (inc! i))
+        (set! (aref x-to-view-angle x) (- (bit-shl (as ui32 i) ANGLE-TO-FINE-SHIFT) ANG90))))
+    (dotimes (i (/ FINE-ANGLES 2))
+      (cond (= (aref view-angle-to-x i) -1) (set! (aref view-angle-to-x i) 0)
+        (= (aref view-angle-to-x i) (+ view-width 1)) (set! (aref view-angle-to-x i) view-width)))
+    (set! clip-angle (aref x-to-view-angle 0))))
+
+(defn- init-light-tables ():void
+  (dotimes (i LIGHTLEVELS)
+    (let (start (/ (* (* (- LIGHTLEVELS 1 i) 2) NUMCOLORMAPS) LIGHTLEVELS))
+      (dotimes (j MAXLIGHTZ)
+        (let (scale (fx-shr (/ (Fixed (* (/ 320 2) FRAC-UNIT)) (Fixed (bit-shl (+ j 1) LIGHTZSHIFT)))
+                            LIGHTSCALESHIFT)
+              level (- start (/ (scale 'v) DISTMAP)))
+          (set! (aref z-light (+ (* i MAXLIGHTZ) j))
+                (cond (< level 0) 0
+                  (>= level NUMCOLORMAPS) (- NUMCOLORMAPS 1)
+                  true level)))))))
+
+(defn set-view-size (blocks:i32 detail:i32):void
+  (set! set-size-needed true)
+  (set! set-blocks blocks)
+  (set! set-detail detail))
+
+(defn execute-set-view-size ():void
+  (set! set-size-needed false)
+  (if (= set-blocks 11)
+    (do (set! scaled-view-width 320) (set! view-height 200))
+    (do (set! scaled-view-width (* set-blocks 32))
+        (set! view-height (bit-and (/ (* set-blocks 168) 10) (bit-not 7)))))
+  (set! detail-shift set-detail)
+  (set! view-width (bit-shr scaled-view-width detail-shift))
+  (set! center-y (/ view-height 2))
+  (set! center-x (/ view-width 2))
+  (set! center-x-frac (fx center-x))
+  (set! center-y-frac (fx center-y))
+  (set! projection center-x-frac)
+  (init-buffer scaled-view-width view-height)
+  (init-texture-mapping)
+  (set! psprite-scale (Fixed (/ (* FRAC-UNIT view-width) 320)))
+  (set! psprite-iscale (Fixed (/ (* FRAC-UNIT 320) view-width)))
+  (set-screen-heights view-height)
+  (dotimes (i view-height)
+    (let (dy (fx-abs (Fixed (+ (bit-shl (- i (/ view-height 2)) FRAC-BITS) (/ FRAC-UNIT 2)))))
+      (set! (aref y-slope i) (/ (Fixed (* (/ (bit-shl view-width detail-shift) 2) FRAC-UNIT)) dy))))
+  (dotimes (i view-width)
+    (let (cosadj (fx-abs (fine-cosine (fine-index (aref x-to-view-angle i)))))
+      (set! (aref dist-scale i) (/ FIXED-ONE cosadj))))
+  (dotimes (i LIGHTLEVELS)
+    (let (start (/ (* (* (- LIGHTLEVELS 1 i) 2) NUMCOLORMAPS) LIGHTLEVELS))
+      (dotimes (j MAXLIGHTSCALE)
+        (let (level (- start (/ (/ (* j 320) (bit-shl view-width detail-shift)) DISTMAP)))
+          (set! (aref scale-light (+ (* i MAXLIGHTSCALE) j))
+                (cond (< level 0) 0
+                  (>= level NUMCOLORMAPS) (- NUMCOLORMAPS 1)
+                  true level)))))))
+
+(defn init-renderer (blocks:i32 detail:i32):!void
+  (try (init-data))
+  (set-view-size blocks detail)
+  (init-light-tables)
+  (init-translation-tables)
+  (set! frame-count 0)
+  (ok))
+
+(defn- setup-frame (p:&Player mo:&Mobj):void
+  (set! view-player p)
+  (set! view-x (mo 'x))
+  (set! view-y (mo 'y))
+  (set! view-angle (mo 'angle))
+  (set! extra-light (p 'extra-light))
+  (set! view-z (p 'viewz))
+  (set! view-sin (fine-sine (fine-index view-angle)))
+  (set! view-cos (fine-cosine (fine-index view-angle)))
+  (set! fixed-colormap (p 'fixed-colormap))
+  (inc! frame-count)
+  (inc! validcount))
+
+(defn render-player-view (p:&Player):void
+  (when-some (mo (p 'mo))
+    (setup-frame p mo)
+    (clear-clip-segs)
+    (clear-draw-segs)
+    (clear-planes)
+    (clear-sprites)
+    (render-bsp-node (- (table-len nodes) 1))
+    (draw-planes)
+    (draw-masked)))

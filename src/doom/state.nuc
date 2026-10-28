@@ -1,0 +1,42 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Game-wide state (doomstat.c, and the globals g_game.c owns).
+
+(ns doom.state)
+
+(import-use doom.defs)
+(import-use doom.world)
+
+(defvar game-mode:i32 SHAREWARE)
+(defvar game-mission:i32 DOOM)
+
+(defvar game-skill:i32 SK-MEDIUM)
+(defvar game-episode:i32 1)
+(defvar game-map:i32 1)
+(defvar game-state:i32 GS-DEMOSCREEN)
+(defvar game-action:i32 GA-NOTHING)
+
+(defvar netgame:bool false)
+(defvar deathmatch:i32 0)
+(defvar nomonsters:bool false)
+(defvar respawn-monsters:bool false)
+(defvar fast-parm:bool false)
+
+(defvar players:(array Player 4))
+(defvar player-in-game:(array bool 4))
+(defvar console-player:i32 0)
+(defvar display-player:i32 0)
+
+(defvar level-time:i32 0)
+(defvar total-kills:i32 0)
+(defvar total-items:i32 0)
+(defvar total-secret:i32 0)
+
+(defvar demo-playback:bool false)
+(defvar paused:bool false)
+(defvar menu-active:bool false)
+(defvar automap-active:bool false)
+(defvar view-active:bool false)
+
+(defn player (i:i32):&Player (unsafe/cast &Player (unsafe/ptr+ (unsafe/cast ptr:Player &players) i)))

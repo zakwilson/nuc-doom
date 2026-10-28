@@ -17,6 +17,16 @@ Format and rules: `PROMPT.md` §7.
 | — | ISSUE-009 | minor | diagnostics | 137 |
 | — | ISSUE-010 | major | bug | 2 |
 | — | ISSUE-011 | major | known-limitation | 1 |
+| — | ISSUE-012 | major | bug | 1 |
+| — | ISSUE-013 | minor | known-limitation | 2 |
+| — | ISSUE-014 | major | bug | 1 |
+| — | ISSUE-015 | minor | bug | 0 |
+| — | ISSUE-016 | papercut | bug | 24 |
+| — | ISSUE-017 | papercut | design gap | 1 |
+| — | ISSUE-018 | papercut | design gap | 4 |
+| — | ISSUE-019 | papercut | diagnostics | 0 |
+| — | ISSUE-020 | papercut | docs | 1 |
+| — | ISSUE-021 | minor | design gap | many |
 
 ---
 
@@ -148,11 +158,11 @@ then suggests a pointer cast, which is the wrong fix.
 
 - **Severity:** major (a correct program is refused, and the message points at lines that don't exist)
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `01b61c1`
 - **Probe:** `probes/issue-008.nuc` (with `probes/issue-008/a.nuc`, `b.nuc`). Expected: it compiles and exits 0. Actual: `issue-008/b.nuc:99: error: duplicate definition of 'count' — the same parameter types are already defined at issue-008/a.nuc:99`. Both files are under 15 lines. Line 99 is `count` in `lib/nucleus/vector.nuc`.
-- **Port sites:** `src/doom/wad.nuc` (`add-lump`, `; ISSUE-008`)
-- **Workaround:** make the private helper public (`defn` for `defn-`).
-- **Suggestion:** a stamped stdlib method belongs to the template's namespace, so its privacy, duplicate check and reported location should be the template's, not the calling file's.
+- **Port sites:** `src/doom/wad.nuc` (`add-lump`, private again since the fix)
+- **Workaround:** none needed after the fix. Before it, the private helper was made public (`defn` for `defn-`).
+- **Suggestion:** done. A stamped method now takes the template's `src-file` and `priv`, as it already took its namespace and imports. A stamp made from inside a `defn-` body had been private, so the next namespace's memo probe missed it and stamped a duplicate.
 
 Context: it takes three things in `a.nuc` to trigger: a `defn-` that calls
 `count` on a `(Vector Lump)`, a public `defn` that also calls it, and a
@@ -214,6 +224,172 @@ wrote that extent to pin the union's ABI, and it costs Nucleus the most
 important type in SDL. The message names the union's declaration line, not
 the member that caused it, so finding the cause meant reading
 `SDL_events.h`.
+
+---
+
+## ISSUE-012: A user `defunion` shaped like a `Maybe` refuses its own arm names
+
+- **Severity:** major (any two-arm "nothing or a reference" union is unusable)
+- **Kind:** bug
+- **Status:** fixed in nucleus `dd3f165`
+- **Probe:** `probes/issue-012.nuc`. Expected: `(defunion Slot empty (full b:&Box))` constructs and matches as `Slot-empty`/`Slot-full`. Actual: `niche (Maybe (ref T)) has arms `some`/`none`, not 'empty'`.
+- **Port sites:** `src/doom/world.nuc` (`Thinker`, while it had only the list head and the mobj arm)
+- **Workaround:** `:repr tagged`, or a third arm.
+- **Suggestion:** fixed by giving such a union the tagged layout unless its arms are named `some`/`none` (or `ok`/`err` for the error niche). The niche value is a bare pointer and can't carry other names.
+
+Context: `structs-unions.md` says the layout rules are invisible: "User code
+does not need to know which rule applies." Rule 2 matched on shape alone,
+though, and the niche constructors and `match` know only `Maybe`'s arm names.
+So the first draft of the thinker union (a list-head arm and a mobj arm) failed
+in the union's own definition, with an error naming arms the user never wrote.
+
+---
+
+## ISSUE-013: A struct template stamped over a nullable pointer gets a non-null field
+
+- **Severity:** minor (it is refused at compile time, not silently wrong, and a wrapper struct gets around it)
+- **Kind:** known-limitation
+- **Status:** worked-around
+- **Probe:** `probes/issue-013.nuc`. Expected: `((Box ?&M) null)` builds a box holding null. Actual: `assignment: unchecked pointer where non-null (ref ...) is required`. `(?ref M)`, `(? (ref M))` and `?ptr:M` fail the same way.
+- **Port sites:** `src/doom/world.nuc` (`BlockLink`, `; ISSUE-013`), `src/doom/play/mobj.nuc`
+- **Workaround:** a one-field struct, `(defstruct BlockLink head:?&Mobj)`, and a `(Table BlockLink)`.
+- **Suggestion:** carry the pointer kind through the stamp and into the memo key (`type-mangle-token`). `design/deferred/overview.md` already names that as the fix.
+
+Context: the blockmap's per-cell thing lists are a table of possibly-null list
+heads, the most natural `(Table ?&Mobj)` there is. `design/deferred/overview.md`
+("A template stamp loses the pointer kind") records this as deferred. Its
+effect on users isn't documented: `docs/types.md` mentions only that a stamped
+instance *prints* with the first spelling's kind. The error appears at the
+first `null` store, far from the type that caused it, and says nothing about
+templates.
+
+---
+
+## ISSUE-014: Once a unit has an import cycle, a C `typedef struct Tag {…} Name` is refused by value
+
+- **Severity:** major (any import cycle, anywhere, breaks every by-value use of a typedef'd C struct)
+- **Kind:** bug
+- **Status:** fixed in nucleus `068cc73`
+- **Probe:** `probes/issue-014.nuc` (with `probes/issue-014/a.nuc`, `b.nuc`). Expected: `(alloca ENTRY)` from `search.h`, and a store to `(e 'key)`, compile. Actual: `field assignment: 'ENTRY' has no layout at this point — its definition has not been emitted yet`, with a note blaming "a file this unit imports circularly". The cycle is `a` ↔ `b`; neither touches `search.h`.
+- **Port sites:** `src/doom/main.nuc` (`pump-events` reads `SDL_CommonEvent`). The renderer's namespaces import each other, and that cycle broke the event loop.
+- **Workaround:** none needed after the fix.
+- **Suggestion:** done. `cheader-adopt-shape` (`src/cheader.nuc`) copied a typedef alias's fields from its tag but not `laid-out`, so `sdef-layout-pending` reported every such alias as pending whenever `g-import-cycles` was non-null. It now copies `laid-out` with the fields.
+
+Context: the diagnostic is very specific and wrong. It says the type "is
+defined in a file this unit imports circularly", for a type from a system
+header that no file in the cycle imports. It took a three-file reduction to
+see that the cycle's members don't matter, only that a cycle exists. `struct
+tm` (no typedef) is unaffected, which made the first reduction pass by mistake.
+
+---
+
+## ISSUE-015: Compiled by absolute path with a relative `-I`, an import cycle loads a file twice
+
+- **Severity:** minor (`nucleus build` passes consistent paths; only a hand-run `nucleusc` hits it)
+- **Kind:** bug
+- **Status:** open
+- **Probe:** `probes/issue-015.nuc` (with `probes/issue-015/a.nuc`, `b.nuc`). Expected: compiles and exits 0. Actual: `probes/issue-015/a.nuc:3: error: duplicate definition of 'a-one' — the same parameter types are already defined at /home/…/probes/issue-015/a.nuc:3`. That is the same file under two spellings.
+- **Port sites:** none; `scripts/check-probes.sh` gained `$ROOT` expansion in `; flags:` so the ISSUE-014 probe can avoid it.
+- **Workaround:** pass `-I` and the main file the same way, both absolute or both relative.
+- **Suggestion:** canonicalize a file's path (`realpath`) before the import-cycle and already-loaded checks.
+
+Context: found while writing the ISSUE-014 probe, which `check-probes.sh` runs
+by absolute path. The ISSUE-008 probe uses the same layout without a cycle and
+is unaffected.
+
+---
+
+## ISSUE-016: A `defvar` can't be initialized with an aggregate `defconst`, contrary to the docs
+
+- **Severity:** papercut
+- **Kind:** bug (the documented behaviour is a startup initializer)
+- **Status:** worked-around
+- **Probe:** `probes/issue-016.nuc`. Expected: `(defvar g:Fx ZERO)` with `(defconst ZERO (Fx 0))` compiles and runs at startup, as `docs/toplevel.md` ("Names") says. Actual: `defvar: a Fx slot must be initialized with a (Fx ...) compound literal`.
+- **Port sites:** 24 `Fixed` globals in `world.nuc` and `render/{main,plane,segs,things}.nuc`; the first in each file is tagged `; ISSUE-016`.
+- **Workaround:** write the literal, `(Fixed 0)`, not `FIXED-ZERO`.
+- **Suggestion:** let a named aggregate constant through to the run-time tier (or fold it: its value is known). The same check also refuses a union arm constructor as a field of a global's struct literal, which the docs do list as refused (a non-constant element of a constant aggregate). The thinker list head in `play/tick.nuc` is zero-filled because of that.
+
+---
+
+## ISSUE-017: A constant subexpression doesn't adapt to the other operand's type the way its leaves do
+
+- **Severity:** papercut
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** `probes/issue-017.nuc`. Expected: `(- (- BIG 1) x)` at `x:ui32` compiles, since `(- BIG x)` does. Actual: `_-: mixed signed/unsigned operands — use explicit cast`. A literal `(- 0x40000000 1)` behaves the same.
+- **Port sites:** `src/doom/render/things.nuc` (`ROT-BIAS`, `; ISSUE-017`)
+- **Workaround:** name the expression with a `defconst`, which adapts as a single constant.
+- **Suggestion:** fold a constant operator tree first, then adapt the result as a literal. That is the rule a `defconst` already gets.
+
+Context: the angle code is all `ui32` arithmetic with constant offsets
+(`ANG90 - 1`, `ANG45/2 * 9`). The adaptation rule is per leaf, so whether it
+applies depends on whether the constant is spelled as one name or as an
+expression.
+
+---
+
+## ISSUE-018: `inc!` takes only a variable, not a place
+
+- **Severity:** papercut
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** `probes/issue-018.nuc`. Expected: `(inc! (p 'n))` increments the field, as `set!` accepts the same place. Actual: `inc!: target must be symbol`.
+- **Port sites:** `src/doom/play/setup.nuc` (`group-lines`, four `; ISSUE-018`)
+- **Workaround:** `(set! (p 'n) (+ (p 'n) 1))`.
+- **Suggestion:** accept any `set!` place, evaluating its receiver once.
+
+Context: `docs/builtins.md` says "Increment a variable", so it is as documented.
+But C's `sector->linecount++` and `count[i]++` are the common shape, and every
+one has to be written twice.
+
+---
+
+## ISSUE-019: A parameter that shadows a function gives an error that names neither
+
+- **Severity:** papercut
+- **Kind:** diagnostics
+- **Status:** open
+- **Probe:** `probes/issue-019.nuc`. Expected: a note that `fx` is the `i32` parameter, shadowing the function `fx`. Actual: `value is not callable: no `invoke` method is defined for this type`.
+- **Port sites:** none left (the parameters were renamed)
+- **Workaround:** rename the parameter.
+- **Suggestion:** when the head of a call is a local that isn't callable and a function of that name is in scope, say so.
+
+Context: the port has a function `fx` (int to fixed) and C code full of
+variables named `fx`. The message names no type and no binding, so the first
+hit took a while to read.
+
+---
+
+## ISSUE-020: `docs/builtins.md` gives `case` two different syntaxes
+
+- **Severity:** papercut
+- **Kind:** docs
+- **Status:** worked-around
+- **Probe:** none (documentation). `docs/builtins.md` line 816 gives the flat macro form `(case x v1 r1 v2 r2 default)`. Line 914 describes clauses `(KEY body...)` with `_` as the default, lowering to `switch`. Only the flat form compiles; the clause form fails with `0 is not callable`.
+- **Port sites:** `src/doom/play/setup.nuc` (`pad-reject`, `; ISSUE-020`)
+- **Workaround:** the flat form.
+- **Suggestion:** drop or rewrite the stale row at line 914.
+
+---
+
+## ISSUE-021: Nested places and array elements need explicit `&`, and the stdlib has no fixed-length element view
+
+- **Severity:** minor
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** none; the rule is documented and the errors are clear.
+- **Port sites:** `src/doom/table.nuc` (the whole module); `(set! (&(aref …) 'f) v)` and `(set! (&(s 'sound-org) 'x) v)` in `play/pspr.nuc`, `play/setup.nuc` and the renderer
+- **Workaround:**
+  - Write `&(aref arr i)` or `&(s 'inner)` before the field.
+  - A global struct template is indexed through `(&g i)`, so level tables are `&(Table T)` from `new`.
+  - `doom.table` defines a bounds-checked `(Table T)` whose `invoke` returns `&T`.
+- **Suggestion:** treat `(aref a i)` and `(s 'f)` as places when their base is one, as C's lvalue rule does. Add a stdlib slice type, a pointer plus a length with `invoke` returning `&T`, so map data needn't be either a growable `Vector` or a raw `ptr`.
+
+Context: `docs/structs-unions.md` is explicit that a member place needs the
+receiver's storage, "a binding, not a temporary". But a global array's element
+and a field of a field *have* storage in C's model. Map structures are linked
+by address and mutated in place everywhere in the C. A `Vector` may move its
+elements and a `ptr` has no bounds, so neither fits.
 
 ---
 

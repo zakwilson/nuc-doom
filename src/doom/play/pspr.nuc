@@ -1,0 +1,23 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Weapon sprites (p_pspr.c).
+
+(ns doom.play.pspr)
+
+(import-use doom.math)
+(import-use doom.info)
+(import-use doom.world)
+
+(defconst WEAPONBOTTOM (* 128 FRAC-UNIT))
+(defconst WEAPONTOP (* 32 FRAC-UNIT))
+
+; Until the weapon actions exist, the pistol is shown raised and ready, as it
+; is from the 17th tic of a level on.
+(defn setup-psprites (p:&Player):void
+  (dotimes (i NUM-PSPRITES)
+    (set! (&(aref (p 'psprites) i) 'state) S-NULL))
+  (let (w &(aref (p 'psprites) PS-WEAPON))
+    (set! (w 'state) S-PISTOL)
+    (set! (w 'sx) FIXED-ONE)
+    (set! (w 'sy) (Fixed WEAPONTOP))))

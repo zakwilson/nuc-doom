@@ -1,0 +1,212 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Floors and ceilings (r_plane.c). Walls mark, column by column, the screen
+; rows of each visible plane; afterwards each plane is drawn as horizontal
+; spans. Also the clip store that walls and sprites share.
+
+(ns doom.render.plane)
+
+(import-use "string.h")
+(import-use doom.math)
+(import-use doom.wad)
+(import-use doom.system)
+(import-use doom.table)
+(import-use doom.video)
+(import-use doom.render.main)
+(import-use doom.render.data)
+(import-use doom.render.draw)
+
+;; The clip store: per-column clip rows, as one array so a "pointer" to a run
+;; of them is a base index. The C points into several arrays and biases the
+;; pointers by -x1; a base here is likewise biased, so column x is at base+x.
+
+(defconst CLIP-SCREEN-HEIGHT 0)
+(defconst CLIP-NEG-ONE 320)
+(defconst CLIP-SPR-BOTTOM 640)
+(defconst CLIP-SPR-TOP 960)
+(defconst CLIP-OPENINGS 1280)
+(defconst- MAXOPENINGS (* 320 64))
+(defconst NO-CLIP -1)
+
+(defvar clip-store:(array i16 21760))
+(defvar last-opening:i32 CLIP-OPENINGS)
+
+(defn clip-at (base:i32 x:i32):i32 (as i32 (aref clip-store (+ base x))))
+(defn set-clip (base:i32 x:i32 v:i32):void (set! (aref clip-store (+ base x)) v))
+
+(defn set-screen-heights (h:i32):void
+  (dotimes (i SCREEN-WIDTH)
+    (set! (aref clip-store (+ CLIP-SCREEN-HEIGHT i)) h)
+    (set! (aref clip-store (+ CLIP-NEG-ONE i)) -1)))
+
+; The lowest row walls have covered from above, and the highest from below.
+(defvar floor-clip:(array i16 320))
+(defvar ceiling-clip:(array i16 320))
+
+;; Visplanes: one per distinct height, flat and light. top/bottom are stored
+;; one column right, so the C's writes to [-1] and [SCREENWIDTH] land in range.
+
+(defconst- MAXVISPLANES 128)
+
+(defstruct Visplane
+  height:Fixed picnum:i32 light-level:i32
+  minx:i32 maxx:i32
+  top:(array ui8 322) bottom:(array ui8 322))
+
+(defvar- visplanes:(array Visplane 128))
+(defvar- last-visplane:i32 0)
+; The planes the current subsector's walls mark; -1 for none.
+(defvar floor-plane:i32 -1)
+(defvar ceiling-plane:i32 -1)
+
+(defn visplane (i:i32):&Visplane &(aref visplanes i))
+
+(defn plane-top (pl:&Visplane x:i32):i32 (as i32 (aref (pl 'top) (+ x 1))))
+(defn plane-bottom (pl:&Visplane x:i32):i32 (as i32 (aref (pl 'bottom) (+ x 1))))
+(defn set-plane-top (pl:&Visplane x:i32 v:i32):void (set! (aref (pl 'top) (+ x 1)) v))
+(defn set-plane-bottom (pl:&Visplane x:i32 v:i32):void (set! (aref (pl 'bottom) (+ x 1)) v))
+
+(defn- clear-top (pl:&Visplane):void
+  (memset (unsafe/ptr+ (pl 'top) 1) 0xff SCREEN-WIDTH))
+
+(defvar- span-start:(array i32 200))
+(defvar- cached-height:(array Fixed 200))
+(defvar- cached-distance:(array Fixed 200))
+(defvar- cached-xstep:(array Fixed 200))
+(defvar- cached-ystep:(array Fixed 200))
+; Globals start at (Fixed 0): FIXED-ZERO is refused here. ISSUE-016
+(defvar- base-xscale:Fixed (Fixed 0))
+(defvar- base-yscale:Fixed (Fixed 0))
+(defvar- plane-height:Fixed (Fixed 0))
+(defvar- plane-zlight:i32 0)
+(defvar- plane-source:ptr:ui8 null)
+
+(defn clear-planes ():void
+  (dotimes (i view-width)
+    (set! (aref floor-clip i) view-height)
+    (set! (aref ceiling-clip i) -1))
+  (set! last-visplane 0)
+  (set! last-opening CLIP-OPENINGS)
+  (memset (unsafe/cast ptr &cached-height) 0 (sizeof (array Fixed 200)))
+  (let (angle (fine-index (- view-angle ANG90)))
+    (set! base-xscale (/ (fine-cosine angle) center-x-frac))
+    (set! base-yscale (fx-neg (/ (fine-sine angle) center-x-frac)))))
+
+(defn- new-plane (height:Fixed picnum:i32 light:i32):i32
+  (when (= last-visplane MAXVISPLANES) (fatal "R_FindPlane: no more visplanes"))
+  (let (pl (visplane last-visplane))
+    (set! (pl 'height) height)
+    (set! (pl 'picnum) picnum)
+    (set! (pl 'light-level) light)
+    (inc! last-visplane)
+    (- last-visplane 1)))
+
+(defn find-plane (height:Fixed picnum:i32 light:i32):i32
+  ; All skies map together.
+  (when (= picnum sky-flat-num)
+    (set! height (Fixed 0))
+    (set! light 0))
+  (let (i:i32 0 found -1)
+    (while (and (< i last-visplane) (= found -1))
+      (let (pl (visplane i))
+        (when (and (= height (pl 'height)) (= picnum (pl 'picnum)) (= light (pl 'light-level)))
+          (set! found i)))
+      (inc! i))
+    (if (!= found -1)
+      found
+      (let (n (new-plane height picnum light) pl (visplane n))
+        (set! (pl 'minx) SCREEN-WIDTH)
+        (set! (pl 'maxx) -1)
+        (clear-top pl)
+        n))))
+
+; Widens plane `n` to cover [start, stop], or starts a new plane with the same
+; look if the columns overlap ones it already has.
+(defn check-plane (n:i32 start:i32 stop:i32):i32
+  (let (pl (visplane n)
+        intrl (if (< start (pl 'minx)) (pl 'minx) start)
+        unionl (if (< start (pl 'minx)) start (pl 'minx))
+        intrh (if (> stop (pl 'maxx)) (pl 'maxx) stop)
+        unionh (if (> stop (pl 'maxx)) stop (pl 'maxx))
+        x intrl)
+    (while (and (<= x intrh) (= (plane-top pl x) 0xff)) (inc! x))
+    (if (> x intrh)
+      (do (set! (pl 'minx) unionl)
+          (set! (pl 'maxx) unionh)
+          n)
+      (let (m (new-plane (pl 'height) (pl 'picnum) (pl 'light-level)) np (visplane m))
+        (set! (np 'minx) start)
+        (set! (np 'maxx) stop)
+        (clear-top np)
+        m))))
+
+(defn- map-plane (y:i32 x1:i32 x2:i32):void
+  (when (or (< x2 x1) (< x1 0) (>= x2 view-width) (> y view-height))
+    (fatal "R_MapPlane: span out of range"))
+  (let (distance:Fixed (Fixed 0) xstep:Fixed (Fixed 0) ystep:Fixed (Fixed 0))
+    (if (!= plane-height (aref cached-height y))
+      (do (set! (aref cached-height y) plane-height)
+          (set! distance (* plane-height (aref y-slope y)))
+          (set! (aref cached-distance y) distance)
+          (set! xstep (* distance base-xscale))
+          (set! (aref cached-xstep y) xstep)
+          (set! ystep (* distance base-yscale))
+          (set! (aref cached-ystep y) ystep))
+      (do (set! distance (aref cached-distance y))
+          (set! xstep (aref cached-xstep y))
+          (set! ystep (aref cached-ystep y))))
+    (let (length (* distance (aref dist-scale x1))
+          angle (fine-index (+ view-angle (x-angle x1)))
+          cmap (if (!= fixed-colormap 0)
+                 fixed-colormap
+                 (z-light-map plane-zlight (bit-shr (distance 'v) LIGHTZSHIFT)))
+          span (Span y x1 x2
+                     (+ view-x (* (fine-cosine angle) length))
+                     (- (fx-neg view-y) (* (fine-sine angle) length))
+                     xstep ystep plane-source cmap))
+      (draw-span span))))
+
+(defn- make-spans (x:i32 t1:i32 b1:i32 t2:i32 b2:i32):void
+  (while (and (< t1 t2) (<= t1 b1))
+    (map-plane t1 (aref span-start t1) (- x 1))
+    (inc! t1))
+  (while (and (> b1 b2) (>= b1 t1))
+    (map-plane b1 (aref span-start b1) (- x 1))
+    (set! b1 (- b1 1)))
+  (while (and (< t2 t1) (<= t2 b2))
+    (set! (aref span-start t2) x)
+    (inc! t2))
+  (while (and (> b2 b1) (>= b2 t2))
+    (set! (aref span-start b2) x)
+    (set! b2 (- b2 1))))
+
+(defn- draw-sky (pl:&Visplane):void
+  (let (x (pl 'minx))
+    (while (<= x (pl 'maxx))
+      (let (yl (plane-top pl x) yh (plane-bottom pl x))
+        (when (<= yl yh)
+          (let (angle (unsafe/cast i32 (bit-shr (+ view-angle (x-angle x)) ANGLETOSKYSHIFT))
+                c (Column x yl yh (fx-shr psprite-iscale detail-shift) sky-texture-mid
+                          (texture-column sky-texture angle) 0 0))
+            (draw-column COL-NORMAL c))))
+      (inc! x))))
+
+(defn draw-planes ():void
+  (dotimes (i last-visplane)
+    (let (pl (visplane i))
+      (when (<= (pl 'minx) (pl 'maxx))
+        (if (= (pl 'picnum) sky-flat-num)
+          (draw-sky pl)
+          (let (l (+ first-flat @(flat-translation (pl 'picnum)))
+                light (+ (bit-shr (pl 'light-level) LIGHTSEGSHIFT) extra-light))
+            (set! plane-source ((lump l) 'data))
+            (set! plane-height (fx-abs (- (pl 'height) view-z)))
+            (set! plane-zlight (light-row light))
+            (set-plane-top pl (+ (pl 'maxx) 1) 0xff)
+            (set-plane-top pl (- (pl 'minx) 1) 0xff)
+            (let (x (pl 'minx) stop (+ (pl 'maxx) 1))
+              (while (<= x stop)
+                (make-spans x (plane-top pl (- x 1)) (plane-bottom pl (- x 1))
+                            (plane-top pl x) (plane-bottom pl x))
+                (inc! x)))))))))

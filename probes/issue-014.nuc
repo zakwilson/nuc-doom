@@ -1,0 +1,13 @@
+; ISSUE-014: once a unit has any import cycle, a C `typedef struct Tag {...}
+; Name;` is refused by value under its typedef name ("has no layout at this
+; point ... defined in a file this unit imports circularly"), though no file in
+; the cycle defines or imports it. Here the cycle is a <-> b and ENTRY comes
+; from search.h.
+; flags: -I $ROOT/probes
+; fixed-when: runs
+(import-use "search.h")
+(import-use issue-014.a)
+(defn main ():i32
+  (let (e:&ENTRY (alloca ENTRY))
+    (set! (e 'key) null)
+    (- (a-one) (if (null? (e 'key)) 0 1))))

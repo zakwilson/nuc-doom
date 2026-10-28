@@ -1,0 +1,60 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The thinker list (p_tick.c): every moving thing and sector effect, run once
+; per tic in the order added. Demo sync depends on that order, so the list is
+; the C's circular one, with a removed thinker unlinked only when the run
+; reaches it.
+
+(ns doom.play.tick)
+
+(import-use doom.world)
+
+; Zero-filled: the cap arm, active. An arm constructor is refused in a global's init.
+(defvar thinker-cap:ThinkerNode)
+
+(defn- cap ():&ThinkerNode &thinker-cap)
+
+(defn init-thinkers ():void
+  (set! (thinker-cap 'prev) (cap))
+  (set! (thinker-cap 'next) (cap)))
+
+(defn add-thinker (n:&ThinkerNode self:Thinker):void
+  (set! (n 'self) self)
+  (set! (n 'state) TH-ACTIVE)
+  (when-some (last (thinker-cap 'prev))
+    (set! (last 'next) n))
+  (set! (n 'next) (cap))
+  (set! (n 'prev) (thinker-cap 'prev))
+  (set! (thinker-cap 'prev) n))
+
+(defn remove-thinker (n:&ThinkerNode):void (set! (n 'state) TH-REMOVED))
+
+; The first thinker, or null at the end of the list.
+(defn first-thinker ():?&ThinkerNode (next-thinker (cap)))
+
+(defn next-thinker (n:&ThinkerNode):?&ThinkerNode
+  (let (nx (n 'next))
+    (if (= (unsafe/cast ptr nx) (unsafe/cast ptr (cap))) null nx)))
+
+; The mobj a live thinker belongs to, or null (the C's test for
+; function == P_MobjThinker).
+(defn thinker-mobj (n:&ThinkerNode):?&Mobj
+  (if (!= (n 'state) TH-ACTIVE)
+    null
+    (match (n 'self)
+      ((mobj m) m)
+      (_ null))))
+
+; Runs each thinker with `think`, unlinking the removed ones as it passes.
+(defn run-thinkers (think:(fn void)(&ThinkerNode)):void
+  (let (cur (first-thinker))
+    (while (not (null? cur))
+      (when-some (n cur)
+        (if (= (n 'state) TH-REMOVED)
+          (let (nx (next-thinker n))
+            (when-some (p (n 'prev)) (set! (p 'next) (n 'next)))
+            (when-some (q (n 'next)) (set! (q 'prev) (n 'prev)))
+            (set! cur nx))
+          (do (when (= (n 'state) TH-ACTIVE) (think n))
+              (set! cur (next-thinker n))))))))

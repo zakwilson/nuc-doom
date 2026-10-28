@@ -1,0 +1,289 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Loading a map (p_setup.c): its lumps become the level tables in
+; doom.world, linked by address, and its things are spawned.
+
+(ns doom.play.setup)
+
+(import-use "string.h")
+(import-use nucleus.error)
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.table)
+(import-use doom.system)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.render.data)
+(import-use doom.play.tick)
+(import-use doom.play.mobj)
+
+(defvar deathmatch-starts:(array MapThing 10))
+(defvar deathmatch-count:i32 0)
+(defvar player-starts:(array MapThing 4))
+(defvar player-start-in-game:(array bool 4))
+
+(defvar total-lines:i32 0)
+
+; The sector a seg sees behind a two-sided line with no back side. Vanilla
+; reads it from address 0, and Chocolate Doom emulates that with zeros.
+(defvar- null-sector:Sector)
+
+(defn- load-vertexes (b:Bytes):void
+  (level-table vertexes Vertex (/ (b 'len) 4))
+  (dotimes (i (table-len vertexes))
+    (let (v (vertexes i))
+      (set! (v 'x) (fx (le-i16 b (* i 4))))
+      (set! (v 'y) (fx (le-i16 b (+ (* i 4) 2)))))))
+
+(defn- load-sectors (b:Bytes):void
+  (level-table sectors Sector (/ (b 'len) 26))
+  (dotimes (i (table-len sectors))
+    (let (s (sectors i) o (* i 26))
+      (set! (s 'floor-height) (fx (le-i16 b o)))
+      (set! (s 'ceiling-height) (fx (le-i16 b (+ o 2))))
+      (set! (s 'floor-pic) (flat-num-for-key (key-at b (+ o 4))))
+      (set! (s 'ceiling-pic) (flat-num-for-key (key-at b (+ o 12))))
+      (set! (s 'light-level) (le-i16 b (+ o 20)))
+      (set! (s 'special) (le-i16 b (+ o 22)))
+      (set! (s 'tag) (le-i16 b (+ o 24))))))
+
+(defn- load-sidedefs (b:Bytes):void
+  (level-table sides Side (/ (b 'len) 30))
+  (dotimes (i (table-len sides))
+    (let (s (sides i) o (* i 30))
+      (set! (s 'texture-offset) (fx (le-i16 b o)))
+      (set! (s 'row-offset) (fx (le-i16 b (+ o 2))))
+      (set! (s 'top-texture) (texture-num-for-key (key-at b (+ o 4))))
+      (set! (s 'bottom-texture) (texture-num-for-key (key-at b (+ o 12))))
+      (set! (s 'mid-texture) (texture-num-for-key (key-at b (+ o 20))))
+      (set! (s 'sector) (sectors (le-i16 b (+ o 28)))))))
+
+(defn- side-sector (n:i32):?&Sector
+  (if (= n -1) null ((sides n) 'sector)))
+
+(defn- load-linedefs (b:Bytes):void
+  (level-table lines Line (/ (b 'len) 14))
+  (dotimes (i (table-len lines))
+    (let (l (lines i) o (* i 14)
+          v1 (vertexes (le-i16 b (+ o 0)))
+          v2 (vertexes (le-i16 b (+ o 2))))
+      (set! (l 'flags) (le-i16 b (+ o 4)))
+      (set! (l 'special) (le-i16 b (+ o 6)))
+      (set! (l 'tag) (le-i16 b (+ o 8)))
+      (set! (l 'v1) v1)
+      (set! (l 'v2) v2)
+      (set! (l 'dx) (- (v2 'x) (v1 'x)))
+      (set! (l 'dy) (- (v2 'y) (v1 'y)))
+      (set! (l 'slope-type)
+            (cond (= ((l 'dx) 'v) 0) ST-VERTICAL
+              (= ((l 'dy) 'v) 0) ST-HORIZONTAL
+              (> ((/ (l 'dy) (l 'dx)) 'v) 0) ST-POSITIVE
+              true ST-NEGATIVE))
+      (let (bb (l 'bbox))
+        (if (< (v1 'x) (v2 'x))
+          (do (set! (aref bb BOXLEFT) (v1 'x)) (set! (aref bb BOXRIGHT) (v2 'x)))
+          (do (set! (aref bb BOXLEFT) (v2 'x)) (set! (aref bb BOXRIGHT) (v1 'x))))
+        (if (< (v1 'y) (v2 'y))
+          (do (set! (aref bb BOXBOTTOM) (v1 'y)) (set! (aref bb BOXTOP) (v2 'y)))
+          (do (set! (aref bb BOXBOTTOM) (v2 'y)) (set! (aref bb BOXTOP) (v1 'y)))))
+      (let (s0 (le-i16 b (+ o 10)) s1 (le-i16 b (+ o 12)))
+        (set! (aref (l 'side-num) 0) s0)
+        (set! (aref (l 'side-num) 1) s1)
+        (set! (l 'front-sector) (side-sector s0))
+        (set! (l 'back-sector) (side-sector s1))))))
+
+(defn- load-subsectors (b:Bytes):void
+  (level-table subsectors Subsector (/ (b 'len) 4))
+  (dotimes (i (table-len subsectors))
+    (let (s (subsectors i))
+      (set! (s 'num-lines) (le-i16 b (* i 4)))
+      (set! (s 'first-line) (le-i16 b (+ (* i 4) 2))))))
+
+(defn- load-nodes (b:Bytes):void
+  (level-table nodes Node (/ (b 'len) 28))
+  (dotimes (i (table-len nodes))
+    (let (n (nodes i) o (* i 28))
+      (set! (n 'x) (fx (le-i16 b o)))
+      (set! (n 'y) (fx (le-i16 b (+ o 2))))
+      (set! (n 'dx) (fx (le-i16 b (+ o 4))))
+      (set! (n 'dy) (fx (le-i16 b (+ o 6))))
+      (dotimes (j 2)
+        (set! (aref (n 'children) j) (le-u16 b (+ o 24 (* j 2))))
+        (dotimes (k 4)
+          (set! (aref (n 'bbox) (+ (* j 4) k)) (fx (le-i16 b (+ o 8 (* j 8) (* k 2))))))))))
+
+(defn- load-segs (b:Bytes):void
+  (level-table segs Seg (/ (b 'len) 12))
+  (dotimes (i (table-len segs))
+    (let (s (segs i) o (* i 12)
+          ldef (lines (le-i16 b (+ o 6)))
+          side (le-i16 b (+ o 8))
+          sidenum (aref (ldef 'side-num) side))
+      (set! (s 'v1) (vertexes (le-i16 b o)))
+      (set! (s 'v2) (vertexes (le-i16 b (+ o 2))))
+      (set! (s 'angle) (bit-shl (unsafe/cast ui32 (le-i16 b (+ o 4))) FRAC-BITS))
+      (set! (s 'offset) (fx (le-i16 b (+ o 10))))
+      (set! (s 'line-def) ldef)
+      (when (or (< sidenum 0) (>= sidenum (table-len sides)))
+        (fatal "P_LoadSegs: linedef for seg references a non-existent sidedef"))
+      (set! (s 'side-def) (sides sidenum))
+      (set! (s 'front-sector) ((sides sidenum) 'sector))
+      (set! (s 'back-sector)
+            (if (!= (bit-and (ldef 'flags) ML-TWOSIDED) 0)
+              (let (other (aref (ldef 'side-num) (bit-xor side 1)))
+                (if (or (< other 0) (>= other (table-len sides)))
+                  &null-sector
+                  ((sides other) 'sector)))
+              null)))))
+
+(defn- load-blockmap (b:Bytes):void
+  (let (count (/ (b 'len) 2))
+    (level-table blockmap-lump i16 count)
+    (dotimes (i count) (set! (blockmap-lump i) (unsafe/cast i16 (le-i16 b (* i 2)))))
+    (set! bmap-org-x (fx (as i32 @(blockmap-lump 0))))
+    (set! bmap-org-y (fx (as i32 @(blockmap-lump 1))))
+    (set! bmap-width @(blockmap-lump 2))
+    (set! bmap-height @(blockmap-lump 3))
+    (level-table blocklinks BlockLink (* bmap-width bmap-height))))
+
+(defn- add-to-box (box:ptr:Fixed x:Fixed y:Fixed):void
+  (when (< x (aref box BOXLEFT)) (set! (aref box BOXLEFT) x))
+  (when (> x (aref box BOXRIGHT)) (set! (aref box BOXRIGHT) x))
+  (when (< y (aref box BOXBOTTOM)) (set! (aref box BOXBOTTOM) y))
+  (when (> y (aref box BOXTOP)) (set! (aref box BOXTOP) y)))
+
+; Gives each sector its lines, sound origin and blockmap extent.
+(defn- group-lines ():void
+  (dotimes (i (table-len subsectors))
+    (let (ss (subsectors i))
+      (set! (ss 'sector) (((segs (ss 'first-line)) 'side-def) 'sector))))
+  (set! total-lines 0)
+  (dotimes (i (table-len lines))
+    (let (l (lines i))
+      (inc! total-lines)
+      (when-some (f (l 'front-sector)) (set! (f 'line-count) (+ (f 'line-count) 1))) ; ISSUE-018
+      (when-some (bk (l 'back-sector))
+        (when (!= (unsafe/cast ptr bk) (unsafe/cast ptr (l 'front-sector)))
+          (set! (bk 'line-count) (+ (bk 'line-count) 1)) ; ISSUE-018
+          (inc! total-lines)))))
+  (let (buf (unsafe/cast ptr:&Line (level-alloc (* total-lines (unsafe/cast i32 (sizeof ptr))))))
+    (dotimes (i (table-len sectors))
+      (let (s (sectors i))
+        (set! (s 'lines) buf)
+        (set! buf (unsafe/ptr+ buf (s 'line-count)))
+        (set! (s 'line-count) 0))))
+  (dotimes (i (table-len lines))
+    (let (l (lines i))
+      (when-some (f (l 'front-sector))
+        (set! (aref (f 'lines) (f 'line-count)) l)
+        (set! (f 'line-count) (+ (f 'line-count) 1))) ; ISSUE-018
+      (when-some (bk (l 'back-sector))
+        (when (!= (unsafe/cast ptr bk) (unsafe/cast ptr (l 'front-sector)))
+          (set! (aref (bk 'lines) (bk 'line-count)) l)
+          (set! (bk 'line-count) (+ (bk 'line-count) 1)))))) ; ISSUE-018
+  (let (box:ptr:Fixed (alloca (array Fixed 4)))
+    (dotimes (i (table-len sectors))
+      (let (s (sectors i))
+        (set! (aref box BOXTOP) FIXED-MIN)
+        (set! (aref box BOXRIGHT) FIXED-MIN)
+        (set! (aref box BOXBOTTOM) FIXED-MAX)
+        (set! (aref box BOXLEFT) FIXED-MAX)
+        (dotimes (j (s 'line-count))
+          (let (l (sector-line s j))
+            (add-to-box box ((l 'v1) 'x) ((l 'v1) 'y))
+            (add-to-box box ((l 'v2) 'x) ((l 'v2) 'y))))
+        (set! (&(s 'sound-org) 'x) (/ (+ (aref box BOXRIGHT) (aref box BOXLEFT)) 2))
+        (set! (&(s 'sound-org) 'y) (/ (+ (aref box BOXTOP) (aref box BOXBOTTOM)) 2))
+        (let (bb (s 'blockbox)
+              top (bit-shr ((+ (- (aref box BOXTOP) bmap-org-y) (Fixed MAXRADIUS)) 'v) MAPBLOCKSHIFT)
+              bottom (bit-shr ((- (- (aref box BOXBOTTOM) bmap-org-y) (Fixed MAXRADIUS)) 'v) MAPBLOCKSHIFT)
+              right (bit-shr ((+ (- (aref box BOXRIGHT) bmap-org-x) (Fixed MAXRADIUS)) 'v) MAPBLOCKSHIFT)
+              left (bit-shr ((- (- (aref box BOXLEFT) bmap-org-x) (Fixed MAXRADIUS)) 'v) MAPBLOCKSHIFT))
+          (set! (aref bb BOXTOP) (if (>= top bmap-height) (- bmap-height 1) top))
+          (set! (aref bb BOXBOTTOM) (if (< bottom 0) 0 bottom))
+          (set! (aref bb BOXRIGHT) (if (>= right bmap-width) (- bmap-width 1) right))
+          (set! (aref bb BOXLEFT) (if (< left 0) 0 left)))))))
+
+; A short REJECT lump is padded with what vanilla happened to read past it
+; (p_rejectpad.c).
+(defn- load-reject (b:Bytes):void
+  (let (n (table-len sectors)
+        minlen (/ (+ (* n n) 7) 8)
+        len (if (> (b 'len) minlen) (b 'len) minlen))
+    (level-table reject-matrix ui8 len)
+    (memcpy (unsafe/cast ptr (reject-matrix 'data)) (unsafe/cast ptr (b 'data)) (as usize (b 'len)))
+    (when (< (b 'len) minlen)
+      (pad-reject (b 'len) (- minlen (b 'len))))))
+
+; What vanilla read past a short REJECT lump: the header of the next zone
+; block (its size, a link, PU_LEVEL and the zone id), then zeros.
+(defn- pad-reject (at:i32 n:i32):void
+  (dotimes (i n)
+    (when (< i 16)
+      (let (w (case (/ i 4) ; ISSUE-020
+                  0 (+ (bit-and (+ (* total-lines 4) 3) (bit-not 3)) 24)
+                  2 50
+                  3 0x1d4a11
+                  0))
+        (set! (reject-matrix (+ at i)) (unsafe/cast ui8 (bit-and (bit-shr w (* 8 (bit-and i 3))) 255)))))))
+
+(defn- spawn-map-things (b:Bytes):void
+  (let (n (/ (b 'len) 10) i:i32 0 stop false)
+    (while (and (< i n) (not stop))
+      (let (o (* i 10)
+            mt (MapThing (le-i16 b o) (le-i16 b (+ o 2)) (le-i16 b (+ o 4))
+                         (le-i16 b (+ o 6)) (le-i16 b (+ o 8))))
+        ; Doom II monsters end the list outside Doom II, as vanilla breaks
+        ; out of the loop rather than skipping them.
+        (if (and (!= game-mode COMMERCIAL) (doom2-only? (mt 'type)))
+          (set! stop true)
+          (spawn-map-thing mt)))
+      (inc! i)))
+  (when (= deathmatch 0)
+    (dotimes (i MAX-PLAYERS)
+      (when (and (aref player-in-game i) (not (aref player-start-in-game i)))
+        (fatal "P_LoadThings: Player start missing (vanilla crashes here)"))
+      (set! (aref player-start-in-game i) false))))
+
+(defn- doom2-only? (type:i32):bool
+  (or (= type 68) (= type 64) (= type 88) (= type 89) (= type 69)
+      (= type 67) (= type 71) (= type 65) (= type 66) (= type 84)))
+
+(defn- map-lump (base:i32 which:i32):Bytes (lump (+ base which)))
+
+(defn setup-level (episode:i32 map:i32 skill:i32):!void
+  (set! total-kills 0)
+  (set! total-items 0)
+  (set! total-secret 0)
+  (dotimes (i MAX-PLAYERS)
+    (let (p (player i))
+      (set! (p 'kill-count) 0)
+      (set! (p 'secret-count) 0)
+      (set! (p 'item-count) 0)))
+  ; Makes the first P_Ticker run even if the menu is up.
+  (set! ((player console-player) 'viewz) (Fixed 1))
+  (free-level)
+  (init-thinkers)
+  (let (name (if (= game-mode COMMERCIAL)
+               (if (< map 10) (str "MAP0" map) (str "MAP" map))
+               (str "E" episode "M" map))
+        base (try (lump-num (string-as-view &name))))
+    (set! level-time 0)
+    (load-blockmap (map-lump base ML-BLOCKMAP))
+    (load-vertexes (map-lump base ML-VERTEXES))
+    (load-sectors (map-lump base ML-SECTORS))
+    (load-sidedefs (map-lump base ML-SIDEDEFS))
+    (load-linedefs (map-lump base ML-LINEDEFS))
+    (load-subsectors (map-lump base ML-SSECTORS))
+    (load-nodes (map-lump base ML-NODES))
+    (load-segs (map-lump base ML-SEGS))
+    (group-lines)
+    (load-reject (map-lump base ML-REJECT))
+    (set! deathmatch-count 0)
+    (spawn-map-things (map-lump base ML-THINGS)))
+  (ok))

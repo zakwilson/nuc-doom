@@ -14,6 +14,13 @@
 (import-use doom.video)
 (import-use doom.sys.video)
 (import-use doom.defs)
+(import-use doom.state)
+(import-use doom.game)
+(import-use doom.render.main)
+(import-use doom.render.draw)
+(import-use doom.math)
+(import-use doom.world)
+(import-use doom.play.user)
 
 (defvar gametic:i32 0)
 ; One tic per frame, as fast as possible: for -framedump and -timedemo.
@@ -48,11 +55,39 @@
       (when (= ((unsafe/cast ptr:SDL_CommonEvent buf) 'type) SDL_QUIT)
         (set! quit-requested true)))))
 
+; Until the playsim exists, a level tic only settles the view height.
+(defn- level-ticker ():void
+  (dotimes (i MAX-PLAYERS)
+    (when (aref player-in-game i)
+      (let (p (player i))
+        (when-some (mo (p 'mo))
+          (set! on-ground (<= (mo 'z) (mo 'floorz)))
+          (calc-height p)))))
+  (inc! level-time))
+
 (defn- ticker ():void
+  (when (= game-state GS-LEVEL) (level-ticker))
   (inc! gametic))
 
+(defn- arg-int (i:i32):i32
+  (let (s (arg i) n:i32 0)
+    (dotimes (k (s 'len))
+      (set! n (+ (* n 10) (- (as i32 (aref (s 'data) k)) 48))))
+    n))
+
+(defvar- old-game-state:i32 -1)
+
 (defn- display ():!void
-  (try (draw-patch 0 0 (try (patch-named page-name))))
+  (when set-size-needed
+    (execute-set-view-size)
+    (set! old-game-state -1))
+  (if (= game-state GS-LEVEL)
+    (do (render-player-view (player display-player))
+        (when (!= old-game-state GS-LEVEL)
+          (try (fill-back-screen "FLOOR7_2")))
+        (draw-view-border))
+    (try (draw-patch 0 0 (try (patch-named page-name)))))
+  (set! old-game-state game-state)
   (finish-update)
   (try (framedump-check gametic))
   (ok))
@@ -60,6 +95,11 @@
 (defn doom-main ():!void
   (try (add-wad-files))
   (set-palette (try (lump-named "PLAYPAL")))
+  (try (init-renderer 9 0))
+  (set! (aref player-in-game 0) true)
+  (let (p (check-parm-with-args "-warp" 2))
+    (when (!= p 0)
+      (try (init-new SK-MEDIUM (arg-int (+ p 1)) (arg-int (+ p 2))))))
   (framedump-init)
   (set! single-tics (parm-exists? "-framedump"))
   (try (init-graphics))
