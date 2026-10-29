@@ -210,7 +210,7 @@
   (when have-background
     (memcpy (unsafe/ptr+ (unsafe/cast ptr:ui8 &screen) ofs)
             (unsafe/ptr+ (unsafe/cast ptr:ui8 &background) ofs)
-            (as usize count))))
+            (as usize count)))) ; ISSUE-046
 
 (defn draw-view-border ():void
   (when (!= scaled-view-width SCREEN-WIDTH)

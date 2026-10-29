@@ -12,7 +12,7 @@
 | 5 | Playable | done; playtest requested |
 | 6 | Sound and music (optional) | done; playtest requested |
 | 7 | Savegames and config (optional) | done; playtest requested |
-| 8 | Idiom pass and final report | next |
+| 8 | Idiom pass and final report | done |
 
 ## Reference harness
 
@@ -211,7 +211,21 @@ and plays without music. Please try:
   file (e.g. `:fire "f"`) and check that it works. A bad entry should print a
   warning and keep the default.
 
+## Final report
+
+`ISSUES.md` opens with the executive summary (the five changes that would
+help most), the per-subsystem line counts (`scripts/count-lines.py`) and the
+ranked table. 46 issues: 18 fixed in nucleus on `doom-bugfixes`, the rest
+worked around with every site tagged `; ISSUE-NNN`. Every bug has a probe.
+`scripts/check-probes.sh` reports 15 that still reproduce.
+
+The idiom pass found no tags left for fixed issues. It tagged the
+counter-pushing early exits as ISSUE-026, logged the `usize` index friction
+as ISSUE-046 (43 sites), normalized severities and kinds to PROMPT's sets,
+and tidied the WAD loader.
+
 ## Next steps
 
-- Milestone 8: the idiom pass, the final ISSUES.md ranking, the line-count
-  table and the executive summary.
+- All milestones are done. Work in any playtest feedback as it arrives. If
+  a compiler fix lands for an open issue, remove its tagged workarounds and
+  rerun every gate.

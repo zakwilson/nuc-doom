@@ -218,7 +218,7 @@
         minlen (/ (+ (* n n) 7) 8)
         len (if (> (b 'len) minlen) (b 'len) minlen))
     (level-table reject-matrix ui8 len)
-    (memcpy (unsafe/cast ptr (reject-matrix 'data)) (unsafe/cast ptr (b 'data)) (as usize (b 'len)))
+    (memcpy (unsafe/cast ptr (reject-matrix 'data)) (unsafe/cast ptr (b 'data)) (as usize (b 'len))) ; ISSUE-046
     (when (< (b 'len) minlen)
       (pad-reject (b 'len) (- minlen (b 'len))))))
 

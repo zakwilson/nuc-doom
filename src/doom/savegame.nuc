@@ -231,7 +231,7 @@
     (let (cur (first-thinker))
       (while (not (null? cur))
         (when-some (n cur) (index-of-node n) (set! cur (next-thinker n)))))
-    (let (in-list (unsafe/cast i32 (count &save-objects)))
+    (let (in-list (unsafe/cast i32 (count &save-objects))) ; ISSUE-046
       (put-globals)
       (put-world)
       (put-links)

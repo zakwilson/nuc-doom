@@ -68,7 +68,7 @@
   (match (get &node-index (unsafe/cast i64 n))
     ((some i) i)
     (none (do (conj &save-objects n)
-              (let (i (unsafe/cast i32 (count &save-objects)))
+              (let (i (unsafe/cast i32 (count &save-objects))) ; ISSUE-046
                 (assoc &node-index (unsafe/cast i64 n) i)
                 i)))))
 

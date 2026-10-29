@@ -189,7 +189,7 @@
 (defn- draw-on-level (level:i32 c:ptr:Patch n:i32):!void
   (let (node (aref LEVEL-NODES (+ (* (wbs 'epsd) NUM-MAPS) level))
         i 0)
-    (while (< i n)
+    (while (< i n) ; ISSUE-026
       (let (p (aref c i)
             left (- (node 'x) (patch-left p))
             top (- (node 'y) (patch-top p)))

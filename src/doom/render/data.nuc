@@ -52,7 +52,7 @@
       (when (< pos 0) (set! count (+ count pos)) (set! pos 0))
       (when (> (+ pos count) height) (set! count (- height pos)))
       (when (> count 0)
-        (memcpy (unsafe/ptr+ cache pos) (unsafe/ptr+ (b 'data) (+ at 3)) (as usize count)))
+        (memcpy (unsafe/ptr+ cache pos) (unsafe/ptr+ (b 'data) (+ at 3)) (as usize count))) ; ISSUE-046
       (set! at (+ at len 4)))))
 
 ; The patch's horizontal span clipped to the texture, as [x, x2).

@@ -36,7 +36,7 @@
 
 ; Zeroed bytes that live until the next level loads.
 (defn level-alloc (size:i32):ptr
-  (let (p (allocate-zeroed &level-arena (as usize (if (> size 0) size 1)) 8))
+  (let (p (allocate-zeroed &level-arena (as usize (if (> size 0) size 1)) 8)) ; ISSUE-046
     (when (null? p) (fatal "level-alloc: out of memory"))
     (unsafe/cast ptr p)))
 

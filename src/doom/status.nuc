@@ -317,7 +317,7 @@
     (dotimes (i NUM-WEAPONS)
       (set! (aref old-weapons-owned i) (aref (p 'weapon-owned) i)))))
 
-;; Cheats.
+;; Cheats. The literals leave `params` out, so it zero-fills. ISSUE-030
 
 (defvar- cheat-mus:Cheat (Cheat "idmus" 2))
 (defvar- cheat-god:Cheat (Cheat "iddqd" 0))

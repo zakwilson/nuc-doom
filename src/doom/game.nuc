@@ -403,7 +403,7 @@
     (if (and (= game-state GS-LEVEL) (!= next-weapon 0))
       (set! buttons (bit-or buttons (bit-or BT-CHANGE (bit-shl (pick-next-weapon next-weapon) BT-WEAPONSHIFT))))
       (let (i:i32 0)
-        (while (< i 8)
+        (while (< i 8) ; ISSUE-026
           (if (key-down? (aref key-weapons i))
             (do (set! buttons (bit-or buttons (bit-or BT-CHANGE (bit-shl i BT-WEAPONSHIFT))))
                 (set! i 8))
@@ -596,7 +596,7 @@
 
 (defn- do-save-game ():void
   (set! game-action GA-NOTHING)
-  (let (d (strview (unsafe/cast &ui8 &save-description) (as usize save-description-len)))
+  (let (d (strview (unsafe/cast &ui8 &save-description) (as usize save-description-len))) ; ISSUE-046
     (match (save-to-slot save-slot d)
       ((ok) (set! ((player console-player) 'message) "game saved."))
       ((err e) (set! ((player console-player) 'message) "couldn't save the game")))))

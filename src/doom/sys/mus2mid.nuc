@@ -141,7 +141,7 @@
   ; The header: "MUS\x1a", then score length and score start, both u16.
   (when (or (< (mus 'len) 14) (!= (le-i32 mus 0) 0x1a53554d)) (return (err bad-mus)))
   (let (r:Reader (Reader mus (le-u16 mus 6)) ; ISSUE-025
-        start (unsafe/cast i32 (count out))
+        start (unsafe/cast i32 (count out)) ; ISSUE-046
         done false)
     (dotimes (i 22) (conj out (aref MIDI-HEADER i)))
     (set! track-size 0)

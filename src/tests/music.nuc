@@ -10,7 +10,7 @@
 
 (defn- fnv1a (v:&(Vector ui8)):i64
   (let (h:ui32 2166136261)
-    (dotimes (i (unsafe/cast i32 (count v)))
+    (dotimes (i (unsafe/cast i32 (count v))) ; ISSUE-046
       (set! h (* (bit-xor h (as ui32 (v (as usize i)))) 16777619)))
     (as i64 h)))
 

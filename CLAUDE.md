@@ -118,6 +118,7 @@ scripts/run-tests.sh        # unit tests (test/build.edn → test/build/tests)
 scripts/check-probes.sh     # which ISSUES.md probes still reproduce
 scripts/check-frames.sh     # framedump gate against reference/data/frames/
 scripts/check-savegames.sh  # demos again with -savetest: save/reload/restore every 37 tics
+scripts/count-lines.py      # C vs Nucleus line counts per subsystem (ISSUES.md table)
 scripts/build-compiler.sh && scripts/build-compiler.sh -k test bootstrap   # after a Nucleus fix
 ```
 

@@ -42,7 +42,7 @@
   (lump-key (StrView (unsafe/cast &ui8 (unsafe/ptr+ (b 'data) off)) 8)))
 
 (defn- add-lump (l:Lump):void
-  (assoc &lump-index (l 'key) (unsafe/cast i32 (count &lumps)))
+  (assoc &lump-index (l 'key) (unsafe/cast i32 (count &lumps))) ; ISSUE-046
   (conj &lumps l))
 
 ; The file name minus directory and extension, as M_ExtractFileBase.
@@ -70,12 +70,11 @@
           ; "IWAD" and "PWAD" as little-endian words.
           (when (and (!= id 0x44415749) (!= id 0x44415750))
             (return (err wad-bad-header)))
-          (let (n (le-i32 b 4) dir (le-i32 b 8) i:i32 0)
-            (while (< i n)
+          (let (dir (le-i32 b 8))
+            (dotimes (i (le-i32 b 4))
               (let (e (+ dir (* i 16)))
-                (add-lump (Lump (key-at b (+ e 8)) fi (le-i32 b e) (le-i32 b (+ e 4)))))
-              (inc! i))))))
-    (return (ok))))
+                (add-lump (Lump (key-at b (+ e 8)) fi (le-i32 b e) (le-i32 b (+ e 4)))))))))))
+  (ok))
 
 (defn wad-bytes (f:i32):Bytes
   ; A copy of the String header shares its buffer, which is all a view needs.

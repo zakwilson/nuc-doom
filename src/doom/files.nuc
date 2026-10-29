@@ -37,7 +37,7 @@
 (defn make-dirs (path:StrView):!void
   (dotimes (i (unsafe/cast i32 (path 'len)))
     (when (and (> i 0) (= (aref (path 'data) i) 47))
-      (try (make-dir (strview-take-bytes path (as usize i))))))
+      (try (make-dir (strview-take-bytes path (as usize i)))))) ; ISSUE-046
   (make-dir path))
 
 (defn read-file (path:StrView):!String

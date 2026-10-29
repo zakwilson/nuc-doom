@@ -81,7 +81,7 @@
 
 (defn draw-block (x:i32 y:i32 w:i32 h:i32 src:ptr:ui8):void
   (dotimes (row h)
-    (memcpy (pixel-at x (+ y row)) (unsafe/ptr+ src (* row w)) (as usize w))))
+    (memcpy (pixel-at x (+ y row)) (unsafe/ptr+ src (* row w)) (as usize w)))) ; ISSUE-046
 
 (defn fill-box (x:i32 y:i32 w:i32 h:i32 c:ui8):void
   (dotimes (row h)

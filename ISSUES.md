@@ -2,55 +2,144 @@
 
 Format and rules: `PROMPT.md` §7.
 
-## Summary
+## Executive summary
 
-| Rank | Issue | Severity | Kind | Sites |
-|---|---|---|---|---|
-| — | ISSUE-001 | minor | tooling | build.edn |
-| — | ISSUE-002 | papercut | diagnostics | 1 |
-| — | ISSUE-003 | major | bug | 1 |
-| — | ISSUE-004 | minor | tooling | test/build.edn |
-| — | ISSUE-005 | papercut | tooling | 0 |
-| — | ISSUE-006 | minor | interop | 1 |
-| — | ISSUE-007 | minor | known-limitation | 2 |
-| — | ISSUE-008 | major | bug | 1 |
-| — | ISSUE-009 | minor | diagnostics | 137 |
-| — | ISSUE-010 | major | bug | 2 |
-| — | ISSUE-011 | major | known-limitation | 1 |
-| — | ISSUE-012 | major | bug | 1 |
-| — | ISSUE-013 | minor | known-limitation | 2 |
-| — | ISSUE-014 | major | bug | 1 |
-| — | ISSUE-015 | minor | bug | 0 |
-| — | ISSUE-016 | papercut | bug | 24 |
-| — | ISSUE-017 | papercut | design gap | 1 |
-| — | ISSUE-018 | papercut | design gap | 4 |
-| — | ISSUE-019 | papercut | diagnostics | 0 |
-| — | ISSUE-020 | papercut | docs | 1 |
-| — | ISSUE-021 | minor | design gap | many |
-| — | ISSUE-022 | major | bug | 1 |
-| — | ISSUE-023 | major | bug | 1 |
-| — | ISSUE-024 | minor | bug | 8 |
-| — | ISSUE-025 | minor | design gap | 13 |
-| — | ISSUE-026 | minor | design gap | ~15 |
-| — | ISSUE-027 | major | bug | 1 |
-| — | ISSUE-028 | papercut | stdlib gap | 1 |
-| — | ISSUE-029 | papercut | diagnostics | 0 |
-| — | ISSUE-030 | minor | bug | 1 |
-| — | ISSUE-031 | minor | bug | 0 |
-| — | ISSUE-032 | major | bug | 0 |
-| — | ISSUE-033 | major | bug | 0 |
-| — | ISSUE-034 | minor | bug | 0 |
-| — | ISSUE-035 | papercut | stdlib gap | 4 |
-| — | ISSUE-036 | papercut | stdlib gap | 5 |
-| — | ISSUE-037 | papercut | design gap | 1 |
-| — | ISSUE-038 | major | bug | 0 |
-| — | ISSUE-039 | major | bug | 0 |
-| — | ISSUE-040 | critical | bug | 0 |
-| — | ISSUE-041 | major | bug | 1 |
-| — | ISSUE-042 | major | bug | 0 |
-| — | ISSUE-043 | papercut | diagnostics | 1 |
-| — | ISSUE-044 | minor | bug | 0 |
-| — | ISSUE-045 | minor | known-limitation | 1 |
+The port plays the shareware game with sound, music, savegames and a config
+file, in about 14,800 lines of Nucleus. All three demos stay in sync with
+Chocolate Doom for every tic, including when the game is saved, reloaded and
+restored every 37 tics. The port found 46 issues. 18 were fixed in the
+compiler on the `doom-bugfixes` branch, each with a regression test; the rest
+are worked around, with every site tagged. The five changes that would help
+most:
+
+1. **Loop control, and Maybes that aren't pointers** (ISSUE-026, ISSUE-007):
+   `break` and `continue`, a loop that runs while a Maybe has a value, and
+   `if-some`/`unwrap-or` for a `?usize`. Twenty loops in the playsim and
+   renderer carry a flag only to stop early, and every `?usize` the stdlib
+   returns needs a full `match`. These loops are the most-read code in the
+   port, and the C reads better in each one.
+2. **Places that compose** (ISSUE-021, ISSUE-025, ISSUE-018, ISSUE-030):
+   `(set! ((aref a i) 'f) v)` without an explicit `&`, a struct literal in an
+   untyped `let` that is a value rather than a `&S`, and `inc!` on any place.
+   "This field of that element" is the commonest thing a C port says, and
+   today each one needs an `&`, a type annotation or a spelled-out `(+ x 1)`.
+   The workaround is mechanical, but it appears dozens of times, and the
+   errors it avoids ("the receiver is a temporary struct value") don't point
+   at the fix.
+3. **Finish name resolution per namespace** (ISSUE-041; fixed: ISSUE-032,
+   ISSUE-038, ISSUE-042). A bare value name that two flattened namespaces
+   define should be an error, as a bare call already is. It's the only silent
+   wrong binding left open. Three of the fixed bugs had the same root cause,
+   something decided per compilation unit (a private key, a solitary
+   binding) where the language means per namespace. An audit of every
+   registry still keyed per unit would probably find more.
+4. **Integer conversions spelled by their risk** (ISSUE-046, ISSUE-037,
+   ISSUE-017, ISSUE-035): any integer type as a collection index, a checked
+   narrowing distinct from `unsafe/cast`, exact integer-to-float through
+   `as`, constant subexpressions that adapt like their leaves, and scalar
+   `min`, `max` and `abs`. The port has 276 `unsafe/cast`s, most of them
+   integer conversions that can't go wrong. When harmless and dangerous
+   casts share a spelling, grepping for `unsafe/` stops being an audit.
+5. **C interop for headers like SDL's** (ISSUE-011, ISSUE-006, ISSUE-001):
+   fold `?:` in an array extent so that `SDL_Event` imports, import header
+   variables such as `stderr`, and map headers on the default include path to
+   their pkg-config package. Every SDL program meets all three on its first
+   day, and `SDL_Event` alone forces an opaque buffer and casts onto the
+   input path.
+
+One pattern among the fixed bugs is worth a test generator rather than more
+one-off fixes. Three were silent wrong values on the path between struct
+values and references: a struct through `if` (ISSUE-003), through `match`
+(ISSUE-022) and through an array field (ISSUE-040). A fourth (ISSUE-023) came
+from the type pass and the emitter disagreeing about a `let`. A differential
+test over those shapes (value, literal, field, element; `if`, `match`, `let`,
+argument, return), checked against both passes, would likely find the rest.
+
+## Line counts
+
+Code lines (not blank, not comment-only) of the C each subsystem replaces,
+against the Nucleus it became; `scripts/count-lines.py` produces the table.
+The C is also counted without its brace-only lines, which a Lisp folds into
+the line before, and the ratio is against that count. Where the C does more
+than the port, the note says what.
+
+| Subsystem | C | C without braces | Nucleus | Ratio | Notes |
+|---|---:|---:|---:|---:|---|
+| Fixed point, trig and RNG | 121 | 98 | 76 | 0.78 |  |
+| Trig tables (data) | 2199 | 2171 | 2151 | 0.99 | embedded, checked element-wise against the C |
+| Thing, state and sound tables (data) | 6171 | 5884 | 1590 | 0.27 | one row per line, expanded by `tablegen` macros |
+| WAD files | 671 | 483 | 106 | 0.22 | whole files in memory; no merging or checksums |
+| Types and globals | 2126 | 1887 | 377 | 0.20 | `d_englsh.h`'s 587 lines of strings are inlined where they're used |
+| Renderer | 3666 | 2991 | 1485 | 0.50 |  |
+| Playsim | 9511 | 7749 | 4101 | 0.53 | every `gameversion` branch kept |
+| Game flow and main loop | 4244 | 3113 | 1021 | 0.33 | no netgame, demo recording or response files |
+| Menus, HUD, status bar, cheats | 3766 | 2914 | 1336 | 0.46 | no chat |
+| Automap, intermission, finale, wipe | 3020 | 2321 | 1196 | 0.52 | single-player intermission only |
+| Video and input | 1966 | 1418 | 236 | 0.17 | no scaling options, fullscreen toggle or joystick |
+| Sound and music | 2493 | 1682 | 463 | 0.28 | SDL_mixer only: no OPL, PC speaker or GUS |
+| Savegames and config | 2986 | 2403 | 631 | 0.26 | the C config covers every Chocolate Doom setting |
+| **Total** | **42940** | **35114** | **14769** | **0.42** | |
+
+The data tables are about the same size where they are data (the trig
+tables) and a quarter of it where macros expand rows (`doom.info`). The
+playsim and renderer, which are almost line-for-line ports, come out at
+about half. The platform layers shrink most, partly because SDL2 and
+`nucleus.file` do work that Chocolate Doom does itself, and partly because the
+port leaves out features (see the notes).
+
+## Ranking
+
+Ranked by porter pain removed per unit of language work. The fixed issues
+follow, in issue order.
+
+| Rank | Issue | Claim | Severity | Kind | Sites |
+|---|---|---|---|---|---|
+| 1 | ISSUE-026 | Loops have no `break` or `continue`, and no form loops while a Maybe has a value | major | design | 23 |
+| 2 | ISSUE-021 | Nested places and array elements need explicit `&`, and the stdlib has no fixed-length element view | major | design | many |
+| 3 | ISSUE-041 | A `defvar` defined by two `import-use`d namespaces silently resolves to the first import's | major | bug | 1 |
+| 4 | ISSUE-046 | Sizes and indexes are `usize`, so every crossing from a C port's `int` is a cast, and one direction is `unsafe` | major | design | 43 |
+| 5 | ISSUE-025 | A struct literal bound by an untyped `let` is a `&S`, so `S`'s operators and `set!`s don't apply | major | design | 19 |
+| 6 | ISSUE-011 | `SDL_Event` imports as an opaque type, because the importer can't fold a `?:` in an array extent | major | known-limitation | 1 |
+| 7 | ISSUE-007 | `unwrap-or` and `if-some` work only on pointer Maybes, so a `?usize` from the stdlib needs a full `match` | minor | known-limitation | 2 |
+| 8 | ISSUE-035 | No scalar `min`, `max` or `abs` in the stdlib | papercut | stdlib | 4 |
+| 9 | ISSUE-036 | `Vector` and `HashMap` have no `clear`, though `String` has `string-clear` | papercut | stdlib | 5 |
+| 10 | ISSUE-016 | A `defvar` can't be initialized with an aggregate `defconst`, contrary to the docs | minor | bug | 24 |
+| 11 | ISSUE-045 | `derive-edn` reads a struct only if every field is present | minor | known-limitation | 1 |
+| 12 | ISSUE-001 | A package's header on clang's default include path gets no link flags, and the failure is a raw linker error | minor | tooling | build.edn |
+| 13 | ISSUE-024 | A computed `defconst` doesn't resolve across an import cycle, though the docs say constants do | minor | bug | 8 |
+| 14 | ISSUE-006 | C header variables such as `stderr` are not imported, and the error doesn't say why | minor | interop | 2 |
+| 15 | ISSUE-017 | A constant subexpression doesn't adapt to the other operand's type the way its leaves do | papercut | design | 6 |
+| 16 | ISSUE-018 | `inc!` takes only a variable, not a place | papercut | design | 5 |
+| 17 | ISSUE-037 | `as` calls an exact `i32` → `f64` conversion "lossy" | papercut | design | 1 |
+| 18 | ISSUE-013 | A struct template stamped over a nullable pointer gets a non-null field | minor | known-limitation | 3 |
+| 19 | ISSUE-030 | A struct literal can fill an array field in a global initializer but not in a function | minor | bug | 1 |
+| 20 | ISSUE-009 | `bit-or` takes exactly two operands, and in a constant initializer the arity error becomes "not a compile-time constant" | minor | diagnostics | 137 |
+| 21 | ISSUE-043 | `(ok)` as a statement is "unknown: ok — not defined anywhere" | papercut | diagnostics | 1 |
+| 22 | ISSUE-004 | A project builds one program, so the unit tests need a second project that reaches outside itself | minor | tooling | test/build.edn |
+| 23 | ISSUE-005 | The project-root search crosses repository boundaries, so the Nucleus test suite fails inside another project | papercut | tooling | 0 |
+| 24 | ISSUE-015 | Compiled by absolute path with a relative `-I`, an import cycle loads a file twice | minor | bug | 0 |
+| 25 | ISSUE-028 | `nucleus.fmt` has no hexadecimal (or any radix) formatting | papercut | stdlib | 1 |
+| 26 | ISSUE-002 | A function-like C macro is reported as "not defined anywhere" | papercut | diagnostics | 1 |
+| 27 | ISSUE-019 | A parameter that shadows a function gives an error that names neither | papercut | diagnostics | 0 |
+| 28 | ISSUE-020 | `docs/builtins.md` gives `case` two different syntaxes | papercut | docs | 1 |
+| fixed `ca581b5` | ISSUE-003 | An `if` returning a struct value or a struct literal silently returns zero | major | bug | 1 |
+| fixed `01b61c1` | ISSUE-008 | A stdlib template method is reported as a duplicate public definition between two namespaces | major | bug | 1 |
+| fixed `0f703f5` | ISSUE-010 | A `fn` that reads a global table is refused as capturing a "runtime local" | major | bug | 2 |
+| fixed `dd3f165` | ISSUE-012 | A user `defunion` shaped like a `Maybe` refuses its own arm names | major | bug | 1 |
+| fixed `068cc73` | ISSUE-014 | Once a unit has an import cycle, a C `typedef struct Tag {…} Name` is refused by value | major | bug | 1 |
+| fixed `5daff8f` | ISSUE-022 | A `match` whose arms mix a struct value and a struct literal silently returns zero | major | bug | 1 |
+| fixed `ec21b5e` | ISSUE-023 | An untyped `let` binding that shares a function's name loses the let's tail to the function | major | bug | 1 |
+| fixed `1e1495c` | ISSUE-027 | A field access on a string literal or string `defconst` emits invalid IR | major | bug | 1 |
+| fixed `5f2bfae` | ISSUE-029 | `try` on a void call reports a `match` error | papercut | diagnostics | 0 |
+| fixed `3d8c5ab` | ISSUE-031 | An array `defconst` used above its definition is "not defined anywhere", even in the same file | minor | bug | 0 |
+| fixed `5d3cfe8` | ISSUE-032 | Two namespaces with a `defn-` returning `!void` fail with an LLVM "redefinition of type" | major | bug | 0 |
+| fixed `5f2bfae` | ISSUE-033 | `try` on an overloaded call whose argument is a macro call picks the wrong arm shape | major | bug | 0 |
+| fixed `4d7ea58` | ISSUE-034 | A char literal is "not a compile-time constant" inside a global aggregate | minor | bug | 0 |
+| fixed `1862c27` | ISSUE-038 | A template method first stamped inside a `defn-`, in a file with no `ns`, gets no definition | major | bug | 0 |
+| fixed `95b70b9` | ISSUE-039 | With `nucleus.error` loaded only by `import-ct`, every `err` calls an undefined function | major | bug | 0 |
+| fixed `712308d` | ISSUE-040 | An array field of a struct binding decays into a copy, so stores through it vanish | major | bug | 0 |
+| fixed `cab687d` | ISSUE-042 | A function name used as a value is "undefined" once another namespace defines the same name | major | bug | 0 |
+| fixed `6518d10` | ISSUE-044 | `nucleus build` reports a syntax error in an imported file at the importer's path | minor | bug | 0 |
 
 ---
 
@@ -149,7 +238,7 @@ scratch project's meaning depends on where the checkout happens to live.
 - **Kind:** interop
 - **Status:** open
 - **Probe:** `probes/issue-006.nuc`. Expected: `stderr` resolves to `extern FILE *stderr`. Actual: `error: undefined: stderr — not defined anywhere in this compilation unit`. In a namespaced file whose unit also imports `nucleus.vector`, the error is `undefined: stderr — defined in namespace 'nucleus.vector', which this file does not import`. That points at an unrelated library, which declares its own `(extern stderr:ptr)`.
-- **Port sites:** `src/doom/bytes.nuc` (`; ISSUE-006`)
+- **Port sites:** `src/doom/bytes.nuc`, `src/doom/system.nuc` (`; ISSUE-006`; 2 sites)
 - **Workaround:** an explicit `(extern stderr:ptr)` beside the import.
 - **Suggestion:** import a header's object declarations as `extern`s, as functions are imported as `declare`s. Failing that, the "undefined" error could note that the name is a variable in an imported header.
 
@@ -237,7 +326,7 @@ the first test to compare a table element tripped it.
 - **Kind:** known-limitation
 - **Status:** worked-around
 - **Probe:** `probes/issue-011.nuc`. Expected: `(alloca SDL_Event)` compiles. Actual: `alloca: 'SDL_Event' is an opaque type declared at /usr/include/SDL2/SDL_events.h:655; only pointers to it are valid`.
-- **Port sites:** `src/doom/main.nuc` (`pump-events`, `; ISSUE-011`); the input code in M5 adds more
+- **Port sites:** `src/doom/sys/input.nuc` (`pump-events`, `; ISSUE-011`)
 - **Workaround:** a 64-byte, 8-aligned `EventBuf` struct, passed to `SDL_PollEvent` with `unsafe/cast` and read through `SDL_CommonEvent`/`SDL_KeyboardEvent` casts. These are the casts the import was supposed to remove.
 - **Suggestion:** fold `?:` and the comparison operators in the header constant evaluator. Clang has already preprocessed the text, and the operators are the same C integer semantics the evaluator implements for `+` and `<<`. Short of that, the "opaque type" error could say which member made the type opaque (here, `padding`'s extent).
 
@@ -275,7 +364,7 @@ in the union's own definition, with an error naming arms the user never wrote.
 - **Kind:** known-limitation
 - **Status:** worked-around
 - **Probe:** `probes/issue-013.nuc`. Expected: `((Box ?&M) null)` builds a box holding null. Actual: `assignment: unchecked pointer where non-null (ref ...) is required`. `(?ref M)`, `(? (ref M))` and `?ptr:M` fail the same way.
-- **Port sites:** `src/doom/world.nuc` (`BlockLink`, `; ISSUE-013`), `src/doom/play/mobj.nuc`
+- **Port sites:** `src/doom/world.nuc` (`BlockLink`, `; ISSUE-013`) and its two uses in `src/doom/play/maputl.nuc` (3 sites)
 - **Workaround:** a one-field struct, `(defstruct BlockLink head:?&Mobj)`, and a `(Table BlockLink)`.
 - **Suggestion:** carry the pointer kind through the stamp and into the memo key (`type-mangle-token`). `design/deferred/overview.md` already names that as the fix.
 
@@ -325,7 +414,7 @@ is unaffected.
 
 ## ISSUE-016: A `defvar` can't be initialized with an aggregate `defconst`, contrary to the docs
 
-- **Severity:** papercut
+- **Severity:** minor (24 sites)
 - **Kind:** bug (the documented behaviour is a startup initializer)
 - **Status:** worked-around
 - **Probe:** `probes/issue-016.nuc`. Expected: `(defvar g:Fx ZERO)` with `(defconst ZERO (Fx 0))` compiles and runs at startup, as `docs/toplevel.md` ("Names") says. Actual: `defvar: a Fx slot must be initialized with a (Fx ...) compound literal`.
@@ -338,10 +427,10 @@ is unaffected.
 ## ISSUE-017: A constant subexpression doesn't adapt to the other operand's type the way its leaves do
 
 - **Severity:** papercut
-- **Kind:** design gap
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** `probes/issue-017.nuc`. Expected: `(- (- BIG 1) x)` at `x:ui32` compiles, since `(- BIG x)` does. Actual: `_-: mixed signed/unsigned operands — use explicit cast`. A literal `(- 0x40000000 1)` behaves the same.
-- **Port sites:** `src/doom/render/things.nuc` (`ROT-BIAS`, `; ISSUE-017`)
+- **Port sites:** `src/doom/render/things.nuc` (`ROT-BIAS`), and the `(as ui32 1)` operands of the angle jitter in `play/pspr.nuc` (3) and `play/mobj.nuc` (2), all tagged `; ISSUE-017` (6 sites)
 - **Workaround:** name the expression with a `defconst`, which adapts as a single constant.
 - **Suggestion:** fold a constant operator tree first, then adapt the result as a literal. That is the rule a `defconst` already gets.
 
@@ -355,10 +444,10 @@ expression.
 ## ISSUE-018: `inc!` takes only a variable, not a place
 
 - **Severity:** papercut
-- **Kind:** design gap
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** `probes/issue-018.nuc`. Expected: `(inc! (p 'n))` increments the field, as `set!` accepts the same place. Actual: `inc!: target must be symbol`.
-- **Port sites:** `src/doom/play/setup.nuc` (`group-lines`, four `; ISSUE-018`)
+- **Port sites:** `src/doom/play/setup.nuc` (`group-lines`, four), `src/doom/cheat.nuc` (one); `; ISSUE-018` (5 sites)
 - **Workaround:** `(set! (p 'n) (+ (p 'n) 1))`.
 - **Suggestion:** accept any `set!` place, evaluating its receiver once.
 
@@ -398,8 +487,8 @@ hit took a while to read.
 
 ## ISSUE-021: Nested places and array elements need explicit `&`, and the stdlib has no fixed-length element view
 
-- **Severity:** minor
-- **Kind:** design gap
+- **Severity:** major (recurs widely)
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** none; the rule is documented and the errors are clear.
 - **Port sites:** `src/doom/table.nuc` (the whole module); `(set! (&(aref …) 'f) v)` and `(set! (&(s 'sound-org) 'x) v)` in `play/pspr.nuc`, `play/setup.nuc` and the renderer
@@ -468,11 +557,11 @@ it said nothing about constants, and it named only one cycle pair.
 
 ## ISSUE-025: A struct literal bound by an untyped `let` is a `&S`, so `S`'s operators and `set!`s don't apply
 
-- **Severity:** minor
-- **Kind:** design gap
+- **Severity:** major (recurs widely)
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** none; this is the documented rule (`docs/structs-unions.md`, "Compound literals in by-value struct positions").
-- **Port sites:** 13 `name:Fixed (Fixed …)` bindings in `play/*.nuc`; `movers.nuc` `do-donut` (`s3-height`); 2 in `automap.nuc`
+- **Port sites:** 19 typed `let` bindings of struct literals, tagged `; ISSUE-025`: `name:Fixed (Fixed …)` in `play/*.nuc` and `automap.nuc`, `movers.nuc` `do-donut` (`s3-height`), and the `SaveHeader`/`Player` literals of the savegame and its test
 - **Workaround:** give the binding its type: `(let (range:Fixed (Fixed …)) …)`.
 - **Suggestion:** bind an untyped struct literal as an `S` value, the way a `:S` binding takes it. Then join a `&S` literal branch with `S` siblings as `S` even with no want. Today `(let (h (if-some (s x) (s 'floor-height) (Fixed 0))) …)` collapses to void.
 
@@ -485,11 +574,11 @@ Instead it fails with "no matching method for '_*' with operand types
 
 ## ISSUE-026: Loops have no `break` or `continue`, and no form loops while a Maybe has a value
 
-- **Severity:** minor
-- **Kind:** design gap
+- **Severity:** major (recurs widely)
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
-- **Port sites:** about 15 loops in `play/map.nuc`, `play/maputl.nuc`, `play/movers.nuc`, `play/setup.nuc` and `render/bsp.nuc` carry an `ok`/`go`/`going`/`stopped` flag; 4 linked-list walks in `play/thinkers.nuc`, `render/things.nuc` and `automap.nuc`
+- **Port sites:** 23 tagged loops. About 15 in `play/map.nuc`, `play/maputl.nuc`, `play/movers.nuc`, `play/setup.nuc` and `render/bsp.nuc` carry an `ok`/`go`/`going`/`stopped` flag; 3 in `game.nuc`, `menu.nuc` and `intermission.nuc` break by pushing the counter past its bound; 4 linked-list walks in `play/thinkers.nuc`, `render/things.nuc` and `automap.nuc`
 - **Workaround:** a flag in the `while` test; for lists, `(while (not (null? cur)) (when-some (n cur) … (set! cur (next n))))`, hidden in `do-mobjs`. `(return)` covers a loop at the end of a function.
 - **Suggestion:** a `break` (and `continue`) scoped to the nearest `while`/`dotimes`, and a `while-some` that binds the narrowed value each pass, as `when-some` does once. `label`/`goto` can express both, but they're function-scoped and read as C.
 
@@ -518,7 +607,7 @@ the expression.
 ## ISSUE-028: `nucleus.fmt` has no hexadecimal (or any radix) formatting
 
 - **Severity:** papercut
-- **Kind:** stdlib gap
+- **Kind:** stdlib
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
 - **Port sites:** `src/doom/status.nuc` (the `idmypos` cheat message)
@@ -633,7 +722,7 @@ place for one: each item's hotkey, as in the C's `menuitem_t`.
 ## ISSUE-035: No scalar `min`, `max` or `abs` in the stdlib
 
 - **Severity:** papercut
-- **Kind:** stdlib gap
+- **Kind:** stdlib
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
 - **Port sites:** `src/doom/math.nuc` (`imin`, `imax`, `iabs`), used by `src/doom/menu.nuc` and `src/doom/finale.nuc`; `src/doom/sys/sound.nuc` (`imid`, a clamp)
@@ -649,7 +738,7 @@ already hand-written `iabs` in milestone 1 for the same reason.
 ## ISSUE-036: `Vector` and `HashMap` have no `clear`, though `String` has `string-clear`
 
 - **Severity:** papercut
-- **Kind:** stdlib gap
+- **Kind:** stdlib
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
 - **Port sites:** `src/doom/sys/music.nuc` (`play-song` reuses one MIDI
@@ -673,7 +762,7 @@ an element type with a `Drop` it would leak.
 ## ISSUE-037: `as` calls an exact `i32` → `f64` conversion "lossy"
 
 - **Severity:** papercut
-- **Kind:** design gap
+- **Kind:** design
 - **Status:** worked-around
 - **Probe:** none; this is the documented rule (`docs/types.md`, "Implicit Type
   Coercion": `float`↔`int` is `unsafe/cast` only).
@@ -699,7 +788,7 @@ soon as code touches audio or other host-side arithmetic.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed in nucleus 1862c27
+- **Status:** fixed in nucleus `1862c27`
 - **Probe:** `probes/issue-038.nuc`. Expected `count 1`. Actual: "nucleusc:
   failed to parse generated IR …: use of undefined value
   '@nuc_count.pnuc_Vector.u8'".
@@ -724,7 +813,7 @@ form caused it. Making the same function a `defn` hides it.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed in nucleus 95b70b9
+- **Status:** fixed in nucleus `95b70b9`
 - **Probe:** `probes/issue-039.nuc`. Expected `ok 1`. Actual: "nucleusc:
   failed to parse generated IR …: use of undefined value
   '@nuc_err-find-handler'".
@@ -747,9 +836,9 @@ neither the import nor the `err`.
 
 ## ISSUE-040: An array field of a struct binding decays into a copy, so stores through it vanish
 
-- **Severity:** critical (silent wrong code)
+- **Severity:** major (silent wrong code)
 - **Kind:** bug
-- **Status:** fixed in nucleus 712308d
+- **Status:** fixed in nucleus `712308d`
 - **Probe:** `probes/issue-040.nuc`. Expected `1 9`. Actual: `0 0`.
 - **Port sites:** none found. The port's array fields are written through
   `&T` receivers (`(p 'powers)` on a `&Player`), which were always right. It
@@ -804,7 +893,7 @@ the same name would have compiled and read the wrong variable.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed in nucleus cab687d
+- **Status:** fixed in nucleus `cab687d`
 - **Probe:** `probes/issue-042.nuc` (with `probes/issue-042/lib.nuc` and `m.nuc`).
   Expected `run 1`. Actual: "undefined: pick — defined in namespace
   'issue-042.lib', which this file does not import", reported at `m.nuc`'s
@@ -858,7 +947,7 @@ match arm that was out of tail position for the same reason.
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** fixed in nucleus 6518d10
+- **Status:** fixed in nucleus `6518d10`
 - **Probe:** `probes/issue-044.nuc` (run with `--list-imports`). Expected
   `issue-044/lib.nuc:3: error: unexpected )`. Actual: `issue-044.nuc:3`, the
   importer's path with the imported file's line.
@@ -900,6 +989,37 @@ struct with `derive-edn` would have been about five lines. It wasn't usable,
 because a file written before a setting existed would fail to load at all.
 The by-hand reader and writer are about 75 lines, and they also give key bindings by name
 (`"ctrl"`, `"f5"`, `"space"`), which a struct of `i32`s wouldn't.
+
+---
+
+## ISSUE-046: Sizes and indexes are `usize`, so every crossing from a C port's `int` is a cast, and one direction is `unsafe`
+
+- **Severity:** major (recurs widely, and every reading of a length is an `unsafe/cast`)
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** none; it's the documented rule (`docs/collections.md`: "an
+  already-typed value of a wider or wrong-sign type still needs an explicit
+  `as`/`unsafe/cast`"). `(&v i)` with `i:i32` reports "i32 does not convert
+  to usize implicitly (signed to unsigned) -- use (as usize ...)", and
+  `(as i32 (count &v))` reports "as: lossy conversion from usize to i32 --
+  use unsafe/cast".
+- **Port sites:** 43, in 17 files: 16 `(unsafe/cast i32 (count …))`, and
+  `(as usize …)` on indexes and `memcpy`/`malloc` sizes. The first in each file
+  is tagged `; ISSUE-046`.
+- **Workaround:** `(as usize i)` going in, `(unsafe/cast i32 (count v))` coming
+  out, with the bounds check left to the collection.
+- **Suggestion:** let a collection's `invoke` take any integer index. The
+  bounds check already rejects a negative `i32`, which is exactly what makes
+  `size_t` indexing safe in the first place. Give `count` an `i32`-returning
+  sibling, or add a checked narrowing (`as-checked`, failing loudly) between
+  `as` and `unsafe/cast`, so that reading a length isn't spelled like
+  reinterpreting memory.
+
+Context: Doom indexes everything with `int`, and the fixed-point code relies
+on it being 32 bits, so the port keeps `i32` indexes rather than retype every
+loop. Each crossing into a `Vector` is then a cast, and the way back is an
+`unsafe/cast` that a reviewer has to check by hand. That's 16 of the port's
+276 `unsafe/cast`s, for a length that is never anywhere near 2^31.
 
 ---
 
@@ -946,3 +1066,17 @@ The by-hand reader and writer are about 75 lines, and they also give key binding
   (ISSUE-002). `mus2mid` ported from a byte-reading `!i32` reader and matched
   Chocolate Doom's output byte for byte on all twelve shareware songs the first
   time it compiled.
+- **`struct-fields` made the savegame a derivation, not a list.** p_saveg.c
+  writes raw struct images and patches pointers by hand, type by type. The
+  port's `derive-save` macro (`src/doom/savecodec.nuc`, about 30 lines) reads
+  each struct's fields at expansion time and writes its encoder and decoder,
+  so 16 structs are one line each, `(derive-save Mobj th snext sprev bnext
+  bprev)`, and a field added to `Mobj` is saved without anyone remembering
+  to. Overloaded `put-field`/`take-field` per field type do the rest:
+  pointers to mobjs, sectors, lines and players become table indexes by the
+  field's declared type. A save, map reload and restore on every tic of
+  demo1 kept all 5658 tic hashes.
+- **`with` and `!T` for files.** The savegame and config I/O (`doom.files`)
+  is write-to-temp-and-rename, reading and creating directories, in about 40
+  lines. Every path closes its file on every exit, and errors come back as
+  values the menu turns into a message.

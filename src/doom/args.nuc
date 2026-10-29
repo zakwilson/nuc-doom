@@ -16,7 +16,7 @@
   (dotimes (i argc)
     (conj &args (strview-from-cstr (aref argv i)))))
 
-(defn arg-count ():i32 (unsafe/cast i32 (count &args)))
+(defn arg-count ():i32 (unsafe/cast i32 (count &args))) ; ISSUE-046
 
 (defn arg (i:i32):StrView (&args (as usize i)))
 

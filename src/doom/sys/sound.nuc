@@ -62,7 +62,7 @@
 (defn- expand (data:Bytes rate:i32):ptr
   (let (len (data 'len)
         out-len (unsafe/cast i32 (/ (* (as i64 len) (as i64 mixer-freq)) (as i64 rate)))
-        mem (malloc (as usize (* out-len 4)))
+        mem (malloc (as usize (* out-len 4))) ; ISSUE-046
         out (unsafe/cast &i16 mem)
         ratio (/ (bit-shl len 8) out-len))
     (dotimes (i out-len)

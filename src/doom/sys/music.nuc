@@ -52,7 +52,7 @@
     (stop-song)
     (set! (midi 'len) 0) ; ISSUE-036
     (match (mus-to-midi mus &midi)
-      ((ok) (let (rw (SDL_RWFromConstMem (unsafe/cast ptr (midi 'data)) (unsafe/cast i32 (count &midi))))
+      ((ok) (let (rw (SDL_RWFromConstMem (unsafe/cast ptr (midi 'data)) (unsafe/cast i32 (count &midi)))) ; ISSUE-046
               (when (not (null? rw))
                 (set! song (Mix_LoadMUS_RW rw 1))
                 (if (null? song)

@@ -62,7 +62,7 @@
     (try (check-eq-int (as i64 (count &atan)) 2049 "tantoangle length"))
     (try (check-eq-int (as i64 (count &gamma)) 1280 "gammatable length"))
     (dotimes (i 4096)
-      (try (check-eq-int (as i64 (aref fine-tangent-table i)) (&tan (as usize i)) "finetangent")))
+      (try (check-eq-int (as i64 (aref fine-tangent-table i)) (&tan (as usize i)) "finetangent"))) ; ISSUE-046
     (dotimes (i 10240)
       (try (check-eq-int (as i64 (aref fine-sine-table i)) (&sine (as usize i)) "finesine")))
     (dotimes (i 2049)
