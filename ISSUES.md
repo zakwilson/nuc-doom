@@ -40,7 +40,9 @@ Format and rules: `PROMPT.md` §7.
 | — | ISSUE-032 | major | bug | 0 |
 | — | ISSUE-033 | major | bug | 0 |
 | — | ISSUE-034 | minor | bug | 0 |
-| — | ISSUE-035 | papercut | stdlib gap | 3 |
+| — | ISSUE-035 | papercut | stdlib gap | 4 |
+| — | ISSUE-036 | papercut | stdlib gap | 1 |
+| — | ISSUE-037 | papercut | design gap | 1 |
 
 ---
 
@@ -626,13 +628,58 @@ place for one: each item's hotkey, as in the C's `menuitem_t`.
 - **Kind:** stdlib gap
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
-- **Port sites:** `src/doom/math.nuc` (`imin`, `imax`, `iabs`), used by `src/doom/menu.nuc` and `src/doom/finale.nuc`
+- **Port sites:** `src/doom/math.nuc` (`imin`, `imax`, `iabs`), used by `src/doom/menu.nuc` and `src/doom/finale.nuc`; `src/doom/sys/sound.nuc` (`imid`, a clamp)
 - **Workaround:** one-line `if` helpers per type.
 - **Suggestion:** generic `min`/`max`/`abs`/`clamp` over the numeric types in a prelude module. `nucleus.combinators` already has an iterator `min`, so a two-argument scalar overload would sit beside it.
 
 Context: `(min a b)` is the first thing a C programmer reaches for when clamping
 a length or an index. The error ("unknown: min") is clear, but the port had
 already hand-written `iabs` in milestone 1 for the same reason.
+
+---
+
+## ISSUE-036: `Vector` has no `clear`, though `String` has `string-clear`
+
+- **Severity:** papercut
+- **Kind:** stdlib gap
+- **Status:** worked-around
+- **Probe:** none; nothing is broken.
+- **Port sites:** `src/doom/sys/music.nuc` (`play-song` reuses one MIDI buffer)
+- **Workaround:** `(set! (v 'len) 0)`, writing the struct's length field directly.
+- **Suggestion:** `(clear v)` (and probably `truncate`) on `(Vector T)`, dropping
+  the elements and keeping the capacity. `string-clear` is already
+  `(set! ((ref self 'bytes) 'len) 0)`, so the Vector version is the same line
+  plus a drop loop for elements that own memory.
+
+Context: the music player converts each song into the same buffer. The first
+guess, `(set! (midi 'count) 0)`, fails with "no field 'count'". `count` is a
+function and the field is `len`. The workaround depends on the layout, and for
+an element type with a `Drop` it would leak.
+
+---
+
+## ISSUE-037: `as` calls an exact `i32` → `f64` conversion "lossy"
+
+- **Severity:** papercut
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** none; this is the documented rule (`docs/types.md`, "Implicit Type
+  Coercion": `float`↔`int` is `unsafe/cast` only).
+- **Port sites:** `src/doom/sys/sound.nuc` (the resampler's low-pass filter, 4 casts)
+- **Workaround:** `(unsafe/cast f64 n)` for every integer operand.
+- **Suggestion:** let `as` (and the implicit coercions) accept integer → float
+  conversions that are exact for every value of the source type: `i8`/`i16`/`i32`
+  and their unsigned forms into `f64`, and 8- and 16-bit integers into `f32`.
+  Keep `unsafe/cast` for `i64` → `f64`, which can round, and for float → int.
+  At minimum, the error should not say "lossy" about a conversion that loses
+  nothing.
+
+Context: `(as f64 mixer-freq)` reports "as: lossy conversion from i32 to f64 --
+use unsafe/cast". Every `f64` holds every `i32` exactly. So the only spelling
+left for a safe conversion is the one the language reserves for unsafe ones,
+and an `unsafe/` search over the port now finds four harmless casts. The
+playsim never uses floats, so the rule costs nothing there. It shows up as
+soon as code touches audio or other host-side arithmetic.
 
 ---
 
@@ -666,3 +713,16 @@ already hand-written `iabs` in milestone 1 for the same reason.
   C makes implicitly: angle arithmetic wraps, turn offsets are signed, button
   bits are bytes. Once the M4 modules compiled, all three demos stayed in sync
   for every tic on the first run.
+- **A union for sound origins.** `S_StartSound` takes a `void *` that is a
+  `mobj_t *`, a sector's `degenmobj_t`, NULL, or (through a vanilla bug) a
+  pointer into a button record. The port's `Origin` union names all four.
+  Where the C's pointer comparison has to be reproduced (`S_StopSound`,
+  `S_GetChannel`), `same-origin?` spells out each case, including the one
+  that never matches.
+- **SDL_mixer imported without a binding.** `Mix_*` functions, `AUDIO_S16SYS`
+  (defined under `#if` on byte order) and `SDL_RWFromConstMem` all came
+  straight from `(import-use "SDL2/SDL_mixer.h")`. Only `Mix_PlayChannel`, a
+  function-like macro, needed the underlying `Mix_PlayChannelTimed`
+  (ISSUE-002). `mus2mid` ported from a byte-reading `!i32` reader and matched
+  Chocolate Doom's output byte for byte on all twelve shareware songs the first
+  time it compiled.

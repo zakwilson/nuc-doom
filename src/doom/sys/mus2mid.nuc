@@ -1,0 +1,167 @@
+; Copyright(C) 2006 Ben Ryves; Copyright(C) 2006-2017 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; MUS to MIDI conversion (mus2mid.c): Doom's music lumps become a type 0
+; MIDI file that SDL_mixer can play.
+
+(ns doom.sys.mus2mid)
+
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use doom.bytes)
+
+(deferror bad-mus "MUS lump is malformed")
+
+(defconst- NUM-CHANNELS 16)
+(defconst- MIDI-PERCUSSION-CHAN 9)
+(defconst- MUS-PERCUSSION-CHAN 15)
+
+; MUS events, in a descriptor's bits 4-6.
+(defconst- MUS-RELEASE-KEY 0x00)
+(defconst- MUS-PRESS-KEY 0x10)
+(defconst- MUS-PITCH-WHEEL 0x20)
+(defconst- MUS-SYSTEM-EVENT 0x30)
+(defconst- MUS-CHANGE-CONTROLLER 0x40)
+(defconst- MUS-SCORE-END 0x60)
+
+(defconst- MIDI-RELEASE-KEY 0x80)
+(defconst- MIDI-PRESS-KEY 0x90)
+(defconst- MIDI-CHANGE-CONTROLLER 0xB0)
+(defconst- MIDI-CHANGE-PATCH 0xC0)
+(defconst- MIDI-PITCH-WHEEL 0xE0)
+
+; The MIDI header and an empty track header; the track length goes at 18.
+(defconst- MIDI-HEADER
+  (array ui8 0x4d 0x54 0x68 0x64 0 0 0 6 0 0 0 1 0 0x46 0x4d 0x54 0x72 0x6b 0 0 0 0))
+(defconst- TRACK-LENGTH-AT 18)
+
+(defconst- CONTROLLER-MAP
+  (array i32 0x00 0x20 0x01 0x07 0x0A 0x0B 0x5B 0x5D 0x40 0x43 0x78 0x7B 0x7E 0x7F 0x79))
+
+; Like the C's statics, these carry from one song to the next.
+(defvar- channel-velocities:(array i32 16)
+  (array i32 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127))
+(defvar- queued-time:ui32 0)
+
+(defvar- track-size:i32 0)
+(defvar- channel-map:(array i32 16))
+
+(defstruct- Reader b:Bytes pos:i32)
+
+(defn- read-byte (r:&Reader):!i32
+  (if (< (r 'pos) ((r 'b) 'len))
+    (let (v (u8 (r 'b) (r 'pos)))
+      (set! (r 'pos) (+ (r 'pos) 1))
+      (ok v))
+    (err bad-mus)))
+
+(defn- out-byte (out:&(Vector ui8) v:i32):void
+  (conj out (unsafe/cast ui8 (bit-and v 0xff)))
+  (inc! track-size))
+
+; A variable-length delta time: seven bits a byte, most significant first.
+(defn- write-time (out:&(Vector ui8)):void
+  (let (time queued-time buffer (bit-and time 0x7f) go true)
+    (set! time (bit-shr time 7))
+    (while (!= time 0)
+      (set! buffer (bit-or (bit-shl buffer 8) (bit-or (bit-and time 0x7f) 0x80)))
+      (set! time (bit-shr time 7)))
+    (while go
+      (out-byte out (unsafe/cast i32 (bit-and buffer 0xff)))
+      (if (!= (bit-and buffer 0x80) 0)
+        (set! buffer (bit-shr buffer 8))
+        (set! go false))))
+  (set! queued-time 0))
+
+; An event with its delta time: a status byte and up to two data bytes.
+(defn- write-event (out:&(Vector ui8) status:i32 n:i32 a:i32 b:i32):void
+  (write-time out)
+  (out-byte out status)
+  (out-byte out a)
+  (when (= n 2) (out-byte out b)))
+
+(defn- write-controller (out:&(Vector ui8) channel:i32 control:i32 value:i32):void
+  ; MUS controller values may have the top bit set; MIDI players reject that.
+  (write-event out (bit-or MIDI-CHANGE-CONTROLLER channel) 2 (bit-and control 0x7f)
+               (if (!= (bit-and value 0x80) 0) 0x7f value)))
+
+; The next MIDI channel after the highest one in use, skipping percussion.
+(defn- allocate-midi-channel ():i32
+  (let (max -1)
+    (dotimes (i NUM-CHANNELS)
+      (when (> (aref channel-map i) max) (set! max (aref channel-map i))))
+    (if (= (+ max 1) MIDI-PERCUSSION-CHAN) (+ max 2) (+ max 1))))
+
+(defn- midi-channel (out:&(Vector ui8) mus-channel:i32):i32
+  (cond (= mus-channel MUS-PERCUSSION-CHAN) MIDI-PERCUSSION-CHAN
+        (!= (aref channel-map mus-channel) -1) (aref channel-map mus-channel)
+        true
+        (let (c (allocate-midi-channel))
+          (set! (aref channel-map mus-channel) c)
+          ; All notes off on first use, for "the D_DDTBLU disease".
+          (write-controller out c 0x7b 0)
+          c)))
+
+; One event; true when it ends the score.
+(defn- convert-event (r:&Reader out:&(Vector ui8) descriptor:i32):!bool
+  (let (channel (midi-channel out (bit-and descriptor 0x0f)))
+    (case (bit-and descriptor 0x70)
+      MUS-RELEASE-KEY
+      (let (key (try (read-byte r)))
+        (write-event out (bit-or MIDI-RELEASE-KEY channel) 2 (bit-and key 0x7f) 0))
+      MUS-PRESS-KEY
+      (let (key (try (read-byte r)))
+        (when (!= (bit-and key 0x80) 0)
+          (set! (aref channel-velocities channel) (bit-and (try (read-byte r)) 0x7f)))
+        (write-event out (bit-or MIDI-PRESS-KEY channel) 2 (bit-and key 0x7f)
+                     (aref channel-velocities channel)))
+      MUS-PITCH-WHEEL
+      ; The C ignores a pitch wheel cut off by the end of the lump.
+      (match (read-byte r)
+        ((ok key) (let (wheel (* key 64))
+                    (write-event out (bit-or MIDI-PITCH-WHEEL channel) 2
+                                 (bit-and wheel 0x7f) (bit-and (bit-shr wheel 7) 0x7f))))
+        ((err e) (do)))
+      MUS-SYSTEM-EVENT
+      (let (n (try (read-byte r)))
+        (when (or (< n 10) (> n 14)) (return (err bad-mus)))
+        (write-controller out channel (aref CONTROLLER-MAP n) 0))
+      MUS-CHANGE-CONTROLLER
+      (let (n (try (read-byte r)) value (try (read-byte r)))
+        (cond (= n 0) (write-event out (bit-or MIDI-CHANGE-PATCH channel) 1 (bit-and value 0x7f) 0)
+              (or (< n 1) (> n 9)) (return (err bad-mus))
+              true (write-controller out channel (aref CONTROLLER-MAP n) value)))
+      MUS-SCORE-END (return (ok true))
+      (return (err bad-mus))))
+  (ok false))
+
+; Appends the MIDI file for the MUS lump `mus` to `out`.
+(defn mus-to-midi (mus:Bytes out:&(Vector ui8)):!void
+  (dotimes (i NUM-CHANNELS) (set! (aref channel-map i) -1))
+  ; The header: "MUS\x1a", then score length and score start, both u16.
+  (when (or (< (mus 'len) 14) (!= (le-i32 mus 0) 0x1a53554d)) (return (err bad-mus)))
+  (let (r:Reader (Reader mus (le-u16 mus 6)) ; ISSUE-025
+        start (unsafe/cast i32 (count out))
+        done false)
+    (dotimes (i 22) (conj out (aref MIDI-HEADER i)))
+    (set! track-size 0)
+    (while (not done)
+      ; A block of events, the last with its top bit set, then a delay.
+      (let (more true)
+        (while (and more (not done))
+          (let (d (try (read-byte &r)))
+            (set! done (try (convert-event &r out d)))
+            (set! more (= (bit-and d 0x80) 0)))))
+      (when (not done)
+        (let (delay:ui32 0 more true)
+          (while more
+            (let (b (try (read-byte &r)))
+              (set! delay (+ (* delay 128) (unsafe/cast ui32 (bit-and b 0x7f))))
+              (set! more (!= (bit-and b 0x80) 0))))
+          (set! queued-time (+ queued-time delay)))))
+    (write-event out 0xff 2 0x2f 0)
+    (let (at (+ start TRACK-LENGTH-AT))
+      (dotimes (i 4)
+        (set out (as usize (+ at i))
+             (unsafe/cast ui8 (bit-and (bit-shr track-size (* 8 (- 3 i))) 0xff))))))
+  (ok))

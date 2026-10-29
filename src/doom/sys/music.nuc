@@ -1,0 +1,73 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Music through SDL_mixer's MIDI player (i_sdlmusic.c). Chocolate Doom's OPL
+; emulation is not ported, so the sound is whatever MIDI synth SDL_mixer has.
+
+(ns doom.sys.music)
+
+(import-use "SDL2/SDL.h")
+(import-use "SDL2/SDL_mixer.h")
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use doom.bytes)
+(import-use doom.sys.sound)
+(import-use doom.sys.mus2mid)
+(import-use doom.system)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+
+(defvar- music-ok:bool false)
+(defvar- song:ptr null)
+; The converted song; the mixer may read from it for as long as it plays.
+(defvar- midi:(Vector ui8) (make (Vector ui8)))
+(defvar- volume:i32 127)
+(defvar- paused:bool false)
+
+(defn init-music ():bool
+  (set! music-ok (open-mixer))
+  music-ok)
+
+(defn- apply-volume ():void
+  (Mix_VolumeMusic (if paused 0 (/ (* volume MIX_MAX_VOLUME) 127))))
+
+; Volume is 0..127.
+(defn set-song-volume (v:i32):void
+  (set! volume v)
+  (when music-ok (apply-volume)))
+
+(defn stop-song ():void
+  (when (and music-ok (not (null? song)))
+    (Mix_HaltMusic)
+    (Mix_FreeMusic song)
+    (set! song null)))
+
+(defvar- load-warned:bool false)
+
+; Plays a MUS lump. A song that won't convert or load is skipped, as Chocolate
+; Doom does, but the first load failure says why: usually no MIDI synth.
+(defn play-song (mus:Bytes looping:bool):void
+  (when music-ok
+    (stop-song)
+    (set! (midi 'len) 0) ; ISSUE-036
+    (match (mus-to-midi mus &midi)
+      ((ok) (let (rw (SDL_RWFromConstMem (unsafe/cast ptr (midi 'data)) (unsafe/cast i32 (count &midi))))
+              (when (not (null? rw))
+                (set! song (Mix_LoadMUS_RW rw 1))
+                (if (null? song)
+                  (when (not load-warned)
+                    (set! load-warned true)
+                    (let (msg:String (str "music: SDL_mixer cannot load MIDI: " (strview-from-cstr (SDL_GetError))))
+                      (warn (string-as-view &msg))))
+                  (do (Mix_PlayMusic song (if looping -1 1))
+                      (apply-volume))))))
+      ((err e) (do)))))
+
+(defn pause-song ():void
+  (set! paused true)
+  (when music-ok (apply-volume)))
+
+(defn resume-song ():void
+  (set! paused false)
+  (when music-ok (apply-volume)))

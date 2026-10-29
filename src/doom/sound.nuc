@@ -1,9 +1,9 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 ;
-; Sound effects (s_sound.c). Until there is a mixer this only decides whether
-; a sound would be heard, because an audible sound draws m-random for its
-; pitch and the tic hash records that index even under -nosound.
+; Sound effects and music (s_sound.c): channel allocation, distance and stereo
+; for moving sources, and level music. An audible sound draws m-random for
+; its pitch even with no mixer, and the tic hash records that index.
 
 (ns doom.sound)
 
@@ -12,59 +12,157 @@
 (import-use doom.sounds)
 (import-use doom.world)
 (import-use doom.state)
+(import-use doom.defs)
 (import-use doom.system)
 (import-use doom.geom)
+(import-use doom.wad)
+(import-use doom.sys.sound)
+(import-use doom.sys.music)
 
 (defconst- S-CLIPPING-DIST (* 1200 FRAC-UNIT))
 (defconst- S-CLOSE-DIST (* 200 FRAC-UNIT))
 (defconst- S-ATTENUATOR (bit-shr (- S-CLIPPING-DIST S-CLOSE-DIST) FRAC-BITS))
+(defconst- S-STEREO-SWING (Fixed (* 96 FRAC-UNIT)))
+(defconst- NORM-SEP 128)
+(defconst- NUM-CHANNELS 8)
 
-; The menu's 0..15 volume times 8, as S_Init is given it.
+; Volumes are 0..127: the menu's 0..15 times 8, as S_Init is given them.
 (defvar sfx-volume:i32 64)
+(defvar music-volume:i32 64)
 
-; The volume a sound from (x, y) reaches the listener with; 0 is inaudible.
-(defn- volume-at (listener:&Mobj x:Fixed y:Fixed volume:i32):i32
+; Where a sound comes from. The C keeps a `mobj_t *` that may really point
+; at a sector's sound origin or, through a vanilla bug, at a bare point.
+(defunion Origin
+  nowhere
+  (thing m:&Mobj)
+  (point o:&SoundOrg)
+  (at x:Fixed y:Fixed))
+
+; The C compares origin pointers. A bare point was a pointer into whatever
+; memory the bug read, which nothing else shares.
+(defn- same-origin? (a:&Origin b:&Origin):bool
+  (match a
+    (nowhere (match b (nowhere true) (_ false)))
+    ((thing m) (match b ((thing n) (= (unsafe/cast ptr m) (unsafe/cast ptr n))) (_ false)))
+    ((point o) (match b ((point p) (= (unsafe/cast ptr o) (unsafe/cast ptr p))) (_ false)))
+    ((at x y) false)))
+
+(defn- origin-x (o:&Origin):Fixed
+  (match o (nowhere (Fixed 0)) ((thing m) (m 'x)) ((point p) (p 'x)) ((at x y) x)))
+
+(defn- origin-y (o:&Origin):Fixed
+  (match o (nowhere (Fixed 0)) ((thing m) (m 'y)) ((point p) (p 'y)) ((at x y) y)))
+
+; `sfx` is SFX-NONE on a free channel.
+(defstruct- Channel sfx:i32 origin:Origin handle:i32)
+
+(defvar- channels:(array Channel 8))
+
+(defn- channel (i:i32):&Channel &(aref channels i))
+
+(defn- stop-channel (i:i32):void
+  (let (c (channel i))
+    (when (!= (c 'sfx) SFX-NONE)
+      (when (sound-playing? (c 'handle)) (stop-sound-on (c 'handle)))
+      (set! (c 'sfx) SFX-NONE)
+      (set! (c 'origin) (Origin-nowhere)))))
+
+(defn- stop-origin (origin:&Origin):void
+  (dotimes (i NUM-CHANNELS)
+    (let (c (channel i))
+      (when (and (!= (c 'sfx) SFX-NONE) (same-origin? &(c 'origin) origin))
+        (stop-channel i)
+        (return)))))
+
+; A free channel, else one this origin already has, else the first whose
+; sound matters no more than this one; -1 when every channel outranks it.
+(defn- get-channel (origin:&Origin sfx:i32):i32
+  (let (found -1)
+    (dotimes (i NUM-CHANNELS)
+      (when (< found 0)
+        (let (c (channel i))
+          (cond (= (c 'sfx) SFX-NONE) (set! found i)
+                (match origin (nowhere false) (_ (same-origin? &(c 'origin) origin)))
+                (do (stop-channel i) (set! found i))))))
+    (when (< found 0)
+      (dotimes (i NUM-CHANNELS)
+        (when (and (< found 0)
+                   (>= ((aref sfx-info ((channel i) 'sfx)) 'priority) ((aref sfx-info sfx) 'priority)))
+          (set! found i)))
+      (when (< found 0) (return -1))
+      (stop-channel found))
+    (let (c (channel found))
+      (set! (c 'sfx) sfx)
+      (set! (c 'origin) @origin))
+    found))
+
+; The volume and stereo separation a sound from (x, y) reaches the listener
+; with; volume 0 means inaudible. Distance uses snd_SfxVolume, as the C does,
+; not the sound's own linked volume.
+(defn- adjust (listener:&Mobj x:Fixed y:Fixed vol:&i32 sep:&i32):bool
   (let (adx (fx-abs (- (listener 'x) x))
         ady (fx-abs (- (listener 'y) y))
         dist (- (+ adx ady) (fx-shr (if (< adx ady) adx ady) 1)))
-    (cond (and (!= game-map 8) (> (dist 'v) S-CLIPPING-DIST)) 0
-      (< (dist 'v) S-CLOSE-DIST) volume
-      (= game-map 8)
-      (let (d (if (> (dist 'v) S-CLIPPING-DIST) S-CLIPPING-DIST (dist 'v)))
-        (+ 15 (/ (* (- volume 15) (bit-shr (- S-CLIPPING-DIST d) FRAC-BITS)) S-ATTENUATOR)))
-      true (/ (* volume (bit-shr (- S-CLIPPING-DIST (dist 'v)) FRAC-BITS)) S-ATTENUATOR))))
+    (when (and (!= game-map 8) (> (dist 'v) S-CLIPPING-DIST)) (return false))
+    (let (angle (point-to-angle2 (listener 'x) (listener 'y) x y))
+      (set! angle (if (> angle (listener 'angle))
+                    (- angle (listener 'angle))
+                    (+ angle (- ANG-MAX (listener 'angle)))))
+      (set! @sep (- 128 (fx-int (* S-STEREO-SWING (fine-sine (fine-index angle)))))))
+    (set! @vol
+          (cond (< (dist 'v) S-CLOSE-DIST) sfx-volume
+                (= game-map 8)
+                (let (d (imin (dist 'v) S-CLIPPING-DIST))
+                  (+ 15 (/ (* (- sfx-volume 15) (bit-shr (- S-CLIPPING-DIST d) FRAC-BITS)) S-ATTENUATOR)))
+                true (/ (* sfx-volume (bit-shr (- S-CLIPPING-DIST (dist 'v)) FRAC-BITS)) S-ATTENUATOR)))
+    (> @vol 0)))
 
-; A sound from a point; `from-listener` when the listener itself made it.
-(defn- start (from-listener:bool x:Fixed y:Fixed sfx:i32):void
+(defn- listener ():?&Mobj ((player console-player) 'mo))
+
+(defn- listener? (origin:&Origin):bool
+  (match origin
+    ((thing m) (match (listener)
+                 ((some l) (= (unsafe/cast ptr m) (unsafe/cast ptr l)))
+                 (none false)))
+    (_ false)))
+
+(defn- start (origin:Origin sfx:i32):void
   (when (or (< sfx 1) (> sfx NUM-SFX)) (fatal "Bad sfx #"))
   (let (info &(aref sfx-info sfx)
         volume:i32 sfx-volume
-        audible true)
+        sep NORM-SEP)
     (when (!= (info 'link) -1)
       (set! volume (+ volume (info 'volume)))
-      (when (< volume 1) (set! audible false))
+      (when (< volume 1) (return))
       (when (> volume sfx-volume) (set! volume sfx-volume)))
-    (when (and audible (not from-listener))
-      (when-some (listener ((player console-player) 'mo))
-        (when (<= (volume-at listener x y volume) 0) (set! audible false))))
-    (when audible
-      ; The pitch variation; the draw is what matters here.
-      (cond (and (>= sfx SFX-SAWUP) (<= sfx SFX-SAWHIT)) (m-random)
-        (and (!= sfx SFX-ITEMUP) (!= sfx SFX-TINK)) (m-random)
-        true 0))))
+    (match origin
+      (nowhere (do))
+      (_ (when (not (listener? &origin))
+           (when-some (l (listener))
+             (let (x (origin-x &origin) y (origin-y &origin)
+                   audible (adjust l x y &volume &sep))
+               (when (and (= x (l 'x)) (= y (l 'y))) (set! sep NORM-SEP))
+               (when (not audible) (return)))))))
+    ; The pitch variation; nothing plays pitch-shifted, but the draw is kept.
+    (cond (and (>= sfx SFX-SAWUP) (<= sfx SFX-SAWHIT)) (m-random)
+          (and (!= sfx SFX-ITEMUP) (!= sfx SFX-TINK)) (m-random)
+          true 0)
+    (stop-origin &origin)
+    (let (cnum (get-channel &origin sfx))
+      (when (>= cnum 0)
+        (set! ((channel cnum) 'handle) (start-sound-on sfx cnum volume sep))))))
 
 ; A sound from a thing, or from nowhere (full volume) when `origin` is null.
 (defn start-sound (origin:?&Mobj sfx:i32):void
-  (if-some (o origin)
-    (let (listener ((player console-player) 'mo))
-      (start (= (unsafe/cast ptr o) (unsafe/cast ptr listener)) (o 'x) (o 'y) sfx))
-    (start true (Fixed 0) (Fixed 0) sfx)))
+  (match origin
+    ((some m) (start (Origin-thing m) sfx))
+    (none (start (Origin-nowhere) sfx))))
 
 ; A sound from a sector's sound origin, or from nowhere when `org` is null.
 (defn start-org-sound (org:?&SoundOrg sfx:i32):void
-  (if-some (o org)
-    (start false (o 'x) (o 'y) sfx)
-    (start true (Fixed 0) (Fixed 0) sfx)))
+  (match org
+    ((some o) (start (Origin-point o) sfx))
+    (none (start (Origin-nowhere) sfx))))
 
 (defn start-sector-sound (sec:&Sector sfx:i32):void
   (start-org-sound &(sec 'sound-org) sfx))
@@ -72,11 +170,89 @@
 ; A sound from a bare point, for the vanilla bug that reads one out of
 ; memory that isn't an origin at all.
 (defn start-sound-at (x:Fixed y:Fixed sfx:i32):void
-  (start false x y sfx))
+  (start (Origin-at x y) sfx))
 
-; Music plays once there is a mixer (milestone 6); for now only its choice.
-(defvar music-playing:i32 0)
-(defvar music-volume:i32 64)
+; Called as a thing is removed, so no channel outlives its origin.
+(defn stop-sound (origin:&Mobj):void
+  (stop-origin &(Origin-thing origin)))
+
+; Once a frame: frees finished channels and moves the rest with the listener.
+(defn update-sounds ():void
+  (dotimes (i NUM-CHANNELS)
+    (let (c (channel i))
+      (when (!= (c 'sfx) SFX-NONE)
+        (if (not (sound-playing? (c 'handle)))
+          (stop-channel i)
+          (let (info &(aref sfx-info (c 'sfx)) volume sfx-volume sep NORM-SEP)
+            (when (!= (info 'link) -1)
+              (set! volume (imin (+ volume (info 'volume)) sfx-volume)))
+            (cond (< volume 1) (stop-channel i)
+                  (match (c 'origin) (nowhere false) (_ (not (listener? &(c 'origin)))))
+                  (when-some (l (listener))
+                    (if (adjust l (origin-x &(c 'origin)) (origin-y &(c 'origin)) &volume &sep)
+                      (update-sound-params (c 'handle) volume sep)
+                      (stop-channel i))))))))))
+
+(defn set-sfx-volume (v:i32):void
+  (when (or (< v 0) (> v 127)) (fatal "Attempt to set sfx volume out of range"))
+  (set! sfx-volume v))
+
+(defn set-music-volume (v:i32):void
+  (when (or (< v 0) (> v 127)) (fatal "Attempt to set music volume out of range"))
+  (set-song-volume v)
+  (set! music-volume v))
+
+;; Music.
+
+(defvar music-playing:i32 MUS-NONE)
+(defvar- music-paused:bool false)
+
+(defn stop-music ():void
+  (when (!= music-playing MUS-NONE)
+    (when music-paused (resume-song))
+    (stop-song)
+    (set! music-paused false)
+    (set! music-playing MUS-NONE)))
 
 (defn change-music (music:i32 looping:bool):void
-  (set! music-playing music))
+  (when (or (<= music MUS-NONE) (>= music NUM-MUSIC)) (fatal "Bad music number"))
+  (when (!= music music-playing)
+    (stop-music)
+    (let (n (check-num-for-key (bit-or (lump-key "D_") (bit-shl (lump-key (aref music-names music)) 16))))
+      ; The C stops on a missing lump; a song the IWAD lacks (idmus in the
+      ; shareware game) is only silence here.
+      (when (>= n 0) (play-song (lump n) looping)))
+    (set! music-playing music)))
+
+(defn start-music (music:i32):void (change-music music false))
+
+(defn pause-sound ():void
+  (when (and (!= music-playing MUS-NONE) (not music-paused))
+    (pause-song)
+    (set! music-paused true)))
+
+(defn resume-sound ():void
+  (when (and (!= music-playing MUS-NONE) music-paused)
+    (resume-song)
+    (set! music-paused false)))
+
+; E4's maps reuse songs from the first three episodes.
+(defconst- E4-MUSIC
+  (array i32 MUS-E3M4 MUS-E3M2 MUS-E3M3 MUS-E1M5 MUS-E2M7 MUS-E2M4 MUS-E2M6 MUS-E2M5 MUS-E1M9))
+
+; At level start, before the old level's memory goes: every channel stops,
+; then the level's music starts.
+(defn sound-start ():void
+  (dotimes (i NUM-CHANNELS) (stop-channel i))
+  (set! music-paused false)
+  (change-music (cond (= game-mode COMMERCIAL) (+ MUS-RUNNIN game-map -1)
+                      (< game-episode 4) (+ MUS-E1M1 (* (- game-episode 1) 9) game-map -1)
+                      true (aref E4-MUSIC (- game-map 1)))
+                true))
+
+; Opens the mixer unless -nosound, -nosfx or -nomusic says otherwise.
+(defn sound-init (nosfx:bool nomusic:bool):void
+  (when (and (not nosfx) (not (init-sound))) (warn "sound effects: cannot open the mixer"))
+  (when (and (not nomusic) (not (init-music))) (warn "music: cannot open the mixer"))
+  (set-sfx-volume sfx-volume)
+  (set-music-volume music-volume))

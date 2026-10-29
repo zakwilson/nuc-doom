@@ -11,3 +11,7 @@
 ; Wall-clock time in tics since SDL started.
 (defn get-time ():i32
   (unsafe/cast i32 (/ (* (as ui64 (SDL_GetTicks)) TIC-RATE) 1000)))
+
+; Sleeps for `count` frames of the 70Hz VGA refresh.
+(defn wait-vbl (count:i32):void
+  (SDL_Delay (as ui32 (/ (* count 1000) 70))))

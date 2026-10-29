@@ -373,7 +373,9 @@
   (when (not netgame)
     (start-sound null (if (= game-mode COMMERCIAL)
                         (aref QUIT-SOUNDS2 (bit-and (bit-shr game-tic 2) 7))
-                        (aref QUIT-SOUNDS (bit-and (bit-shr game-tic 2) 7)))))
+                        (aref QUIT-SOUNDS (bit-and (bit-shr game-tic 2) 7))))
+    ; Long enough for the quit sound to be heard.
+    (wait-vbl 105))
   (set! quit-requested true))
 
 (defn- new-game ():void
@@ -443,9 +445,9 @@
     DO-SENSITIVITY (set! mouse-sensitivity (step mouse-sensitivity choice 9))
     DO-SOUND (setup-next-menu SOUND-MENU)
     DO-SFX-VOLUME (do (set! sfx-level (step sfx-level choice 15))
-                      (set! sfx-volume (* sfx-level 8)))
+                      (set-sfx-volume (* sfx-level 8)))
     DO-MUSIC-VOLUME (do (set! music-level (step music-level choice 15))
-                        (set! music-volume (* music-level 8)))
+                        (set-music-volume (* music-level 8)))
     DO-READ-THIS2 (setup-next-menu (if (= game-mode COMMERCIAL) MAIN-MENU READ2-MENU))
     DO-FINISH-READ (setup-next-menu MAIN-MENU)
     DO-LOAD-SLOT (load-select choice)

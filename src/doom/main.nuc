@@ -31,6 +31,8 @@
 (import-use doom.intermission)
 (import-use doom.finale)
 (import-use doom.play.spec)
+(import-use doom.sound)
+(import-use doom.sys.sound)
 
 ; One tic per frame, as fast as possible: for -framedump and -timedemo.
 (defvar single-tics:bool false)
@@ -165,6 +167,7 @@
         (try (menu-drawer))
         (finish-update)))
     (do (try (try-run-tics))
+        (update-sounds)
         (if (try (display))
           (do (wipe-end-screen)
               (set! wiping true)
@@ -192,6 +195,8 @@
   (try (status-init))
   (try (hud-init))
   (try (automap-init))
+  (let (nosound (parm-exists? "-nosound"))
+    (sound-init (or nosound (parm-exists? "-nosfx")) (or nosound (parm-exists? "-nomusic"))))
   (set! (aref player-in-game 0) true)
   (let (start-skill SK-MEDIUM start-episode 1 start-map 1 autostart false)
     (let (p (check-parm-with-args "-skill" 1))
@@ -224,5 +229,7 @@
   (try (try-run-tics))
   (while (not quit-requested)
     (try (run-frame)))
+  (stop-music)
+  (close-mixer)
   (shutdown-graphics)
   (ok))

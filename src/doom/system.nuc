@@ -14,3 +14,6 @@
 (defn fatal (msg:StrView):void
   (fprintf stderr "nuc-doom: %.*s\n" (unsafe/cast i32 (msg 'len)) (msg 'data))
   (exit 1))
+
+(defn warn (msg:StrView):void
+  (fprintf stderr "nuc-doom: %.*s\n" (unsafe/cast i32 (msg 'len)) (msg 'data)))

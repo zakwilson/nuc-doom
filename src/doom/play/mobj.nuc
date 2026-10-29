@@ -287,6 +287,7 @@
     (when (= item-que-head item-que-tail)
       (set! item-que-tail (bit-and (+ item-que-tail 1) (- ITEMQUESIZE 1)))))
   (unset-thing-position mobj)
+  (stop-sound mobj)
   (remove-thinker &(mobj 'th)))
 
 (defn- type-of-doomed-num (n:i32):i32

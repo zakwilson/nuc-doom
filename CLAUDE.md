@@ -67,6 +67,11 @@ Other environment facts:
 - **SIGTERM doesn't stop the port** (nor the reference): SDL turns it into a
   window-close event, which opens the quit prompt as in vanilla. Use
   `timeout -k 5 N`, never a bare `timeout`.
+- **Audio can be checked headless.** `SDL_AUDIODRIVER=disk
+  SDL_DISKAUDIOFILE=<file>` writes the mixer's output as raw S16LE stereo at
+  44.1kHz. The container has no MIDI soundfont (`timidity.cfg`), so music
+  always fails to load here. `src/tests/music.nuc` checks the MIDI bytes
+  instead.
 - **Probes** state their own pass condition on a `; fixed-when:` header line
   (see `scripts/check-probes.sh`).
 - **Commits** need an identity the container lacks: pass

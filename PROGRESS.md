@@ -10,8 +10,8 @@
 | 3 | Level load and renderer | done |
 | 4 | Playsim, demos, `-tichash` | done |
 | 5 | Playable | done; playtest requested |
-| 6 | Sound and music (optional) | next |
-| 7 | Savegames and config (optional) | — |
+| 6 | Sound and music (optional) | done; playtest requested |
+| 7 | Savegames and config (optional) | next |
 | 8 | Idiom pass and final report | — |
 
 ## Reference harness
@@ -75,7 +75,10 @@
 | `doom.play.movers` | `src/doom/play/movers.nuc` | p_floor.c, p_ceilng.c, p_doors.c, p_plats.c |
 | `doom.play.lights` | `src/doom/play/lights.nuc` | p_lights.c |
 | `doom.play.spec` | `src/doom/play/spec.nuc` | p_spec.c, p_switch.c, p_telept.c |
-| `doom.sound` | `src/doom/sound.nuc` | s_sound.c's effect on the game: the `M_Random` pitch draws only |
+| `doom.sound` | `src/doom/sound.nuc` | s_sound.c (eight channels, an `Origin` union for the C's `void *` origin, level music) |
+| `doom.sys.sound` | `src/doom/sys/sound.nuc` | i_sdlsound.c (SDL_mixer; DMX lumps resampled once and cached) |
+| `doom.sys.music` | `src/doom/sys/music.nuc` | i_sdlmusic.c (SDL_mixer's MIDI player) |
+| `doom.sys.mus2mid` | `src/doom/sys/mus2mid.nuc` | mus2mid.c |
 | `doom.status` | `src/doom/status.nuc` | st_stuff.c, st_lib.c (the bar, face and palette, redrawn whole each frame) and the cheats |
 | `doom.cheat` | `src/doom/cheat.nuc` | m_cheat.c |
 | `doom.items` | `src/doom/items.nuc` | d_items.c (the weapon table, out of `play.pspr` to break an import cycle) |
@@ -109,12 +112,18 @@
   of scope (PROMPT §5).
 - Savegames are milestone 7. Until then the load and save menus show empty
   slots, and saving says so in a message.
+- Music plays through SDL_mixer's MIDI support. Chocolate Doom's default OPL
+  emulation (`i_oplmusic.c`, `opl/`) is not ported, so the music sounds like
+  General MIDI rather than an AdLib. Sound effects play unpitched, as with Chocolate
+  Doom's default `snd_pitchshift` for Doom, but the pitch's `M_Random` draw
+  is kept. `-nosound`, `-nosfx` and `-nomusic` work as in Chocolate Doom.
 - Doom II, Final Doom and Chex Quest have code paths in the menu, HUD,
   intermission and finale, but only the shareware IWAD has been run.
 
 ## Gates
 
-- `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info).
+- `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info, and
+  `mus2mid` against Chocolate Doom's output for all twelve shareware songs).
 - `scripts/check-frames.sh`: `title` and `e1m1` (status bar included) match
   the reference byte for byte.
 - `scripts/check-demos.sh`: demo1, demo2 and demo3 match the reference's
@@ -126,8 +135,13 @@
   with key events injected through a temporary hook (since removed). There is
   no reference to compare those frames with, since the reference engine takes
   no scripted input.
+- Sound with the mixer live (`SDL_AUDIODRIVER=dummy`, no `-nosound`): all
+  three demos stay in sync, and E1M1 to E1M9 run 1500 tics on UV. Under
+  SDL's `disk` driver the demo1 sound effects reach the output file. Music is
+  silent in the container, which has no MIDI soundfont (`timidity.cfg`), and
+  the port says so once on stderr.
 
-## Playtest request (milestone 5)
+## Playtest request (milestones 5 and 6)
 
 The compiler has fixes on `doom-bugfixes` the host binary lacks, so rebuild it
 first:
@@ -138,8 +152,10 @@ cd /home/zak/code/nuc-doom && . scripts/env.sh && nucleus build
 build/nuc-doom -iwad /home/zak/code/chocolate-doom/src/DOOM1.WAD
 ```
 
-There is no sound yet (milestone 6), and no savegames (milestone 7). Please
-try:
+There are no savegames yet (milestone 7). Music needs a MIDI synth that
+SDL_mixer can use (Timidity with a `timidity.cfg`, or FluidSynth with a
+soundfont). Without one the game prints "music: SDL_mixer cannot load MIDI"
+and plays without music. Please try:
 
 - The title loop, then Esc: the main menu, New Game through episode and skill
   (nightmare asks first), Options (messages, detail, screen size with `-`/`=`,
@@ -155,10 +171,13 @@ try:
   here" marker, then E1M8's ending text and picture.
 - F-keys: F1 help, F4 volume, F5 detail, F7 end game, F8 messages, F10 quit,
   F11 gamma.
+- Sound: the title music, each level's music, intermission and E1M8
+  ending music, and effects panning left and right as you turn. Check that
+  distant monsters fade, that the volume sliders work, that pause silences the
+  music, and that a quit plays its sound before the window closes.
 
 ## Next steps
 
-- Milestone 6: sound effects and music through SDL_mixer.
 - Milestone 7: savegames and a config file.
 - Milestone 8: the idiom pass, the final ISSUES.md ranking, the line-count
   table and the executive summary.

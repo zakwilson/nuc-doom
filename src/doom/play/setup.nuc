@@ -18,6 +18,7 @@
 (import-use doom.system)
 (import-use doom.world)
 (import-use doom.state)
+(import-use doom.sound)
 (import-use doom.render.data)
 (import-use doom.play.thinkers)
 (import-use doom.play.mobj)
@@ -268,6 +269,7 @@
       (set! (p 'item-count) 0)))
   ; Makes the first P_Ticker run even if the menu is up.
   (set! ((player console-player) 'viewz) (Fixed 1))
+  (sound-start)
   (free-level)
   (init-thinkers)
   (let (name (if (= game-mode COMMERCIAL)

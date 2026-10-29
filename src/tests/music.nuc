@@ -1,0 +1,40 @@
+(ns tests.music)
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.test)
+(import-use doom.wad)
+(import-use doom.sys.mus2mid)
+(import-use tests.env)
+
+(defn- fnv1a (v:&(Vector ui8)):i64
+  (let (h:ui32 2166136261)
+    (dotimes (i (unsafe/cast i32 (count v)))
+      (set! h (* (bit-xor h (as ui32 (v (as usize i)))) 16777619)))
+    (as i64 h)))
+
+(defn- check-song (name:StrView len:i64 hash:i64):!void
+  (let (out (make (Vector ui8)))
+    (try (mus-to-midi (try (lump-named name)) &out))
+    (try (check-eq-int (as i64 (count &out)) len name))
+    (try (check-eq-int (fnv1a &out) hash name)))
+  (ok))
+
+; Lengths and FNV-1a hashes from Chocolate Doom's own mus2mid.c, run over the
+; shareware IWAD's songs in directory order. The order matters: velocities
+; and the pending delay carry from one song to the next.
+(deftest mus2mid-matches-chocolate
+  (try (ensure-iwad))
+  (try (check-song "D_E1M1" 23426 3828062436))
+  (try (check-song "D_E1M2" 43461 3515353617))
+  (try (check-song "D_E1M3" 30079 3267941572))
+  (try (check-song "D_E1M4" 25160 675877632))
+  (try (check-song "D_E1M5" 13122 1807091655))
+  (try (check-song "D_E1M6" 13385 1658038538))
+  (try (check-song "D_E1M7" 11415 3978108985))
+  (try (check-song "D_E1M8" 72527 2261391842))
+  (try (check-song "D_E1M9" 31163 623105483))
+  (try (check-song "D_INTER" 39605 3767831239))
+  (try (check-song "D_INTRO" 2062 284448501))
+  (try (check-song "D_VICTOR" 18187 3508670831)))

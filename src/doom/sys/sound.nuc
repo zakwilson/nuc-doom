@@ -1,0 +1,125 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Sound effects through SDL_mixer (i_sdlsound.c). DMX lumps are expanded once,
+; on first use, to the mixer's rate as 16-bit stereo, and stay cached.
+
+(ns doom.sys.sound)
+
+(import-use "SDL2/SDL.h")
+(import-use "SDL2/SDL_mixer.h")
+(import-use "stdlib.h")
+(import-use doom.wad)
+(import-use doom.bytes)
+(import-use doom.sounds)
+
+; The mixer's channels; s_sound uses the first eight.
+(defconst- MIXER-CHANNELS 16)
+
+(defvar- mixer-open:bool false)
+(defvar- mixer-freq:i32 44100)
+
+; Opens the mixer for whichever of sound or music asks first.
+(defn open-mixer ():bool
+  (when (not mixer-open)
+    (when (< (SDL_InitSubSystem SDL_INIT_AUDIO) 0) (return false))
+    ; A 1024-sample slice is the largest power of two within 28ms at 44.1kHz.
+    (when (< (Mix_OpenAudioDevice 44100 AUDIO_S16SYS 2 1024 null SDL_AUDIO_ALLOW_FREQUENCY_CHANGE) 0)
+      (SDL_QuitSubSystem SDL_INIT_AUDIO)
+      (return false))
+    (let (freq:i32 0 format:ui16 0 channels:i32 0)
+      (Mix_QuerySpec &freq &format &channels)
+      (set! mixer-freq freq))
+    (Mix_AllocateChannels MIXER-CHANNELS)
+    (SDL_PauseAudio 0)
+    (set! mixer-open true))
+  true)
+
+(defn close-mixer ():void
+  (when mixer-open
+    (Mix_CloseAudio)
+    (SDL_QuitSubSystem SDL_INIT_AUDIO)
+    (set! mixer-open false)))
+
+(defvar- sound-ok:bool false)
+
+; Per sfx: its chunk once expanded, and whether its lump proved unusable.
+(defvar- chunks:(array ptr NUM-SFX))
+(defvar- unusable:(array bool NUM-SFX))
+
+(defn init-sound ():bool
+  (set! sound-ok (open-mixer))
+  sound-ok)
+
+; A linked sfx plays its link's lump, under the "DS" prefix.
+(defn- sfx-lump (sfx:i32):i32
+  (let (info &(aref sfx-info sfx)
+        s (if (!= (info 'link) -1) (info 'link) sfx))
+    (check-num-for-key (bit-or (lump-key "DS") (bit-shl (lump-key ((aref sfx-info s) 'name)) 16)))))
+
+; Resamples 8-bit unsigned mono at `rate` to the mixer's 16-bit stereo, by
+; nearest sample and then a low-pass at the source's Nyquist frequency.
+(defn- expand (data:Bytes rate:i32):ptr
+  (let (len (data 'len)
+        out-len (unsafe/cast i32 (/ (* (as i64 len) (as i64 mixer-freq)) (as i64 rate)))
+        mem (malloc (as usize (* out-len 4)))
+        out (unsafe/cast &i16 mem)
+        ratio (/ (bit-shl len 8) out-len))
+    (dotimes (i out-len)
+      (let (d (u8 data (bit-shr (* i ratio) 8))
+            s (unsafe/cast i16 (- (bit-or d (bit-shl d 8)) 32768)))
+        (set! (aref out (* i 2)) s)
+        (set! (aref out (+ (* i 2) 1)) s)))
+    (let (dt (/ 1.0 (unsafe/cast f64 mixer-freq)) ; ISSUE-037
+          rc (/ 1.0 (* 3.14 (unsafe/cast f64 rate)))
+          alpha (/ dt (+ rc dt)))
+      ; Both channels at once, hence the step back of two.
+      (let (i 2)
+        (while (< i (* out-len 2))
+          (set! (aref out i)
+                (unsafe/cast i16 (+ (* alpha (unsafe/cast f64 (aref out i)))
+                                    (* (- 1.0 alpha) (unsafe/cast f64 (aref out (- i 2)))))))
+          (inc! i))))
+    (Mix_QuickLoad_RAW (unsafe/cast &ui8 mem) (as ui32 (* out-len 4)))))
+
+; The sfx's chunk, loading it if need be; null if it can't be played.
+(defn- chunk-for (sfx:i32):ptr
+  (when (and (null? (aref chunks sfx)) (not (aref unusable sfx)))
+    (set! (aref unusable sfx) true)
+    (let (n (sfx-lump sfx))
+      (when (>= n 0)
+        (let (b (lump n))
+          ; A DMX header: format 3, rate, then the sample count.
+          (when (and (>= (b 'len) 8) (= (u8 b 0) 3) (= (u8 b 1) 0))
+            (let (rate (le-u16 b 2) len (le-i32 b 4))
+              ; DMX ignores very short sounds, and skips 16 bytes at each end.
+              (when (and (<= len (- (b 'len) 8)) (> len 48))
+                (set! (aref chunks sfx) (expand (sub b 24 (- len 32)) rate))
+                (set! (aref unusable sfx) false))))))))
+  (aref chunks sfx))
+
+; Volume 0..127 and separation 0..254 (128 is centre) to per-side gains.
+(defn update-sound-params (handle:i32 volume:i32 sep:i32):void
+  (when sound-ok
+    (let (left (/ (* (- 254 sep) volume) 127)
+          right (/ (* sep volume) 127))
+      (Mix_SetPanning handle (unsafe/cast ui8 (imid 0 left 255)) (unsafe/cast ui8 (imid 0 right 255))))))
+
+(defn- imid (lo:i32 x:i32 hi:i32):i32 (if (< x lo) lo (if (> x hi) hi x))) ; ISSUE-035
+
+; Plays `sfx` on mixer channel `channel`; the handle, or -1.
+(defn start-sound-on (sfx:i32 channel:i32 volume:i32 sep:i32):i32
+  (if (or (not sound-ok) (< channel 0) (>= channel MIXER-CHANNELS))
+    -1
+    (let (c (chunk-for sfx))
+      (if (null? c)
+        -1
+        (do (Mix_PlayChannelTimed channel c 0 -1)
+            (update-sound-params channel volume sep)
+            channel)))))
+
+(defn stop-sound-on (handle:i32):void
+  (when sound-ok (Mix_HaltChannel handle)))
+
+(defn sound-playing? (handle:i32):bool
+  (and sound-ok (!= (Mix_Playing handle) 0)))
