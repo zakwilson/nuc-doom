@@ -1,0 +1,576 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Specials (p_spec.c, p_switch.c, p_telept.c): animated flats and walls,
+; what crossing, shooting or using a line does, damaging floors, switches,
+; and teleporters.
+
+(ns doom.play.spec)
+
+(import-use nucleus.strview)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.system)
+(import-use doom.table)
+(import-use doom.wad)
+(import-use doom.world)
+(import-use doom.state)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.sound)
+(import-use doom.game)
+(import-use doom.render.data)
+(import-use doom.play.thinkers)
+(import-use doom.play.map)
+(import-use doom.play.mobj)
+(import-use doom.play.inter)
+(import-use doom.play.movers)
+(import-use doom.play.lights)
+
+;; Finding neighbours.
+
+; The sector across a two-sided line from `sec`, or null.
+(defn next-sector (line:&Line sec:&Sector):?&Sector
+  (cond (= (bit-and (line 'flags) ML-TWOSIDED) 0) null
+    (= (unsafe/cast ptr (line 'front-sector)) (unsafe/cast ptr sec)) (line 'back-sector)
+    true (line 'front-sector)))
+
+(defn find-lowest-floor-surrounding (sec:&Sector):Fixed
+  (let (floor (sec 'floor-height))
+    (dotimes (i (sec 'line-count))
+      (when-some (other (next-sector (sector-line sec i) sec))
+        (when (< (other 'floor-height) floor) (set! floor (other 'floor-height)))))
+    floor))
+
+(defn find-highest-floor-surrounding (sec:&Sector):Fixed
+  (let (floor:Fixed (Fixed (* -500 FRAC-UNIT))) ; ISSUE-025
+    (dotimes (i (sec 'line-count))
+      (when-some (other (next-sector (sector-line sec i) sec))
+        (when (> (other 'floor-height) floor) (set! floor (other 'floor-height)))))
+    floor))
+
+(defconst- MAX-ADJOINING-SECTORS 20)
+
+; The lowest neighbouring floor above `current`. Vanilla kept them in a
+; 20-entry array; the 22nd overran into `height`, which Chocolate Doom
+; emulates.
+(defn find-next-highest-floor (sec:&Sector current:Fixed):Fixed
+  (let (height current h:i32 0 min:?i32 none)
+    (dotimes (i (sec 'line-count))
+      (when-some (other (next-sector (sector-line sec i) sec))
+        (when (> (other 'floor-height) height)
+          (cond (= h (+ MAX-ADJOINING-SECTORS 1)) (set! height (other 'floor-height))
+            (= h (+ MAX-ADJOINING-SECTORS 2))
+            (fatal "Sector with more than 22 adjoining sectors. Vanilla will crash here"))
+          (match min
+            ((some m) (when (< ((other 'floor-height) 'v) m) (set! min (some ((other 'floor-height) 'v)))))
+            (none (set! min (some ((other 'floor-height) 'v)))))
+          (inc! h))))
+    (match min ((some m) (Fixed m)) (none current))))
+
+(defn find-lowest-ceiling-surrounding (sec:&Sector):Fixed
+  (let (height FIXED-MAX)
+    (dotimes (i (sec 'line-count))
+      (when-some (other (next-sector (sector-line sec i) sec))
+        (when (< (other 'ceiling-height) height) (set! height (other 'ceiling-height)))))
+    height))
+
+(defn find-highest-ceiling-surrounding (sec:&Sector):Fixed
+  (let (height:Fixed (Fixed 0)) ; ISSUE-025
+    (dotimes (i (sec 'line-count))
+      (when-some (other (next-sector (sector-line sec i) sec))
+        (when (> (other 'ceiling-height) height) (set! height (other 'ceiling-height)))))
+    height))
+
+; The next sector after `start` with the line's tag, or -1.
+(defn find-sector-from-line-tag (line:&Line start:i32):i32
+  (let (i (+ start 1) n (table-len sectors))
+    (while (and (< i n) (!= ((sectors i) 'tag) (line 'tag))) (inc! i))
+    (if (< i n) i -1)))
+
+(defn find-min-surrounding-light (sec:&Sector max:i32):i32
+  (let (min max)
+    (dotimes (i (sec 'line-count))
+      (when-some (check (next-sector (sector-line sec i) sec))
+        (when (< (check 'light-level) min) (set! min (check 'light-level)))))
+    min))
+
+;; Animated flats and textures.
+
+(defstruct Anim is-texture:bool pic-num:i32 base-pic:i32 num-pics:i32 speed:i32)
+
+(defvar- anims:(array Anim 32))
+(defvar- num-anims:i32 0)
+
+; Skipped when the IWAD lacks the start frame (shareware lacks some).
+(defn- add-anim (is-texture:bool end-name:StrView start-name:StrView speed:i32):void
+  (when (if is-texture
+          (= (check-texture-num-for-key (lump-key start-name)) -1)
+          (= (check-num-for-name start-name) -1))
+    (return))
+  (let (a &(aref anims num-anims))
+    (set! (a 'is-texture) is-texture)
+    (if is-texture
+      (do (set! (a 'pic-num) (texture-num-for-name end-name))
+          (set! (a 'base-pic) (texture-num-for-name start-name)))
+      (do (set! (a 'pic-num) (flat-num-for-name end-name))
+          (set! (a 'base-pic) (flat-num-for-name start-name))))
+    (set! (a 'num-pics) (+ (- (a 'pic-num) (a 'base-pic)) 1))
+    (when (< (a 'num-pics) 2) (fatal "P_InitPicAnims: bad cycle"))
+    (set! (a 'speed) speed)
+    (inc! num-anims)))
+
+(defn- init-pic-anims ():void
+  (set! num-anims 0)
+  (add-anim false "NUKAGE3" "NUKAGE1" 8)
+  (add-anim false "FWATER4" "FWATER1" 8)
+  (add-anim false "SWATER4" "SWATER1" 8)
+  (add-anim false "LAVA4" "LAVA1" 8)
+  (add-anim false "BLOOD3" "BLOOD1" 8)
+  (add-anim false "RROCK08" "RROCK05" 8)
+  (add-anim false "SLIME04" "SLIME01" 8)
+  (add-anim false "SLIME08" "SLIME05" 8)
+  (add-anim false "SLIME12" "SLIME09" 8)
+  (add-anim true "BLODGR4" "BLODGR1" 8)
+  (add-anim true "SLADRIP3" "SLADRIP1" 8)
+  (add-anim true "BLODRIP4" "BLODRIP1" 8)
+  (add-anim true "FIREWALL" "FIREWALA" 8)
+  (add-anim true "GSTFONT3" "GSTFONT1" 8)
+  (add-anim true "FIRELAVA" "FIRELAV3" 8)
+  (add-anim true "FIREMAG3" "FIREMAG1" 8)
+  (add-anim true "FIREBLU2" "FIREBLU1" 8)
+  (add-anim true "ROCKRED3" "ROCKRED1" 8)
+  (add-anim true "BFALL4" "BFALL1" 8)
+  (add-anim true "SFALL4" "SFALL1" 8)
+  (add-anim true "WFALL4" "WFALL1" 8)
+  (add-anim true "DBRAIN4" "DBRAIN1" 8))
+
+;; Switches and buttons.
+
+(defconst- MAXSWITCHES 50)
+(defconst- MAXBUTTONS 16)
+(defconst- BUTTONTIME 35)
+
+(defenum ButtonWhere BW-TOP BW-MIDDLE BW-BOTTOM)
+
+(defstruct Button line:?&Line where:i32 btexture:i32 btimer:i32 soundorg:?&SoundOrg)
+
+; Pairs of off/on textures: an index's partner is index xor 1.
+(defvar- switch-list:(array i32 100))
+(defvar- num-switches:i32 0)
+(defvar- buttons:(array Button 16))
+
+(defn- add-switch (episode:i32 max-episode:i32 name1:StrView name2:StrView):void
+  (when (<= episode max-episode)
+    (set! (aref switch-list (* num-switches 2)) (texture-num-for-name name1))
+    (set! (aref switch-list (+ (* num-switches 2) 1)) (texture-num-for-name name2))
+    (inc! num-switches)))
+
+(defn- init-switch-list ():void
+  (let (e (cond (or (= game-mode REGISTERED) (= game-mode RETAIL)) 2
+            (= game-mode COMMERCIAL) 3
+            true 1))
+    (set! num-switches 0)
+    (add-switch 1 e "SW1BRCOM" "SW2BRCOM")
+    (add-switch 1 e "SW1BRN1" "SW2BRN1")
+    (add-switch 1 e "SW1BRN2" "SW2BRN2")
+    (add-switch 1 e "SW1BRNGN" "SW2BRNGN")
+    (add-switch 1 e "SW1BROWN" "SW2BROWN")
+    (add-switch 1 e "SW1COMM" "SW2COMM")
+    (add-switch 1 e "SW1COMP" "SW2COMP")
+    (add-switch 1 e "SW1DIRT" "SW2DIRT")
+    (add-switch 1 e "SW1EXIT" "SW2EXIT")
+    (add-switch 1 e "SW1GRAY" "SW2GRAY")
+    (add-switch 1 e "SW1GRAY1" "SW2GRAY1")
+    (add-switch 1 e "SW1METAL" "SW2METAL")
+    (add-switch 1 e "SW1PIPE" "SW2PIPE")
+    (add-switch 1 e "SW1SLAD" "SW2SLAD")
+    (add-switch 1 e "SW1STARG" "SW2STARG")
+    (add-switch 1 e "SW1STON1" "SW2STON1")
+    (add-switch 1 e "SW1STON2" "SW2STON2")
+    (add-switch 1 e "SW1STONE" "SW2STONE")
+    (add-switch 1 e "SW1STRTN" "SW2STRTN")
+    (add-switch 2 e "SW1BLUE" "SW2BLUE")
+    (add-switch 2 e "SW1CMT" "SW2CMT")
+    (add-switch 2 e "SW1GARG" "SW2GARG")
+    (add-switch 2 e "SW1GSTON" "SW2GSTON")
+    (add-switch 2 e "SW1HOT" "SW2HOT")
+    (add-switch 2 e "SW1LION" "SW2LION")
+    (add-switch 2 e "SW1SATYR" "SW2SATYR")
+    (add-switch 2 e "SW1SKIN" "SW2SKIN")
+    (add-switch 2 e "SW1VINE" "SW2VINE")
+    (add-switch 2 e "SW1WOOD" "SW2WOOD")
+    (add-switch 3 e "SW1PANEL" "SW2PANEL")
+    (add-switch 3 e "SW1ROCK" "SW2ROCK")
+    (add-switch 3 e "SW1MET2" "SW2MET2")
+    (add-switch 3 e "SW1WDMET" "SW2WDMET")
+    (add-switch 3 e "SW1BRIK" "SW2BRIK")
+    (add-switch 3 e "SW1MOD1" "SW2MOD1")
+    (add-switch 3 e "SW1ZIM" "SW2ZIM")
+    (add-switch 3 e "SW1STON6" "SW2STON6")
+    (add-switch 3 e "SW1TEK" "SW2TEK")
+    (add-switch 3 e "SW1MARB" "SW2MARB")
+    (add-switch 3 e "SW1SKULL" "SW2SKULL")))
+
+(defn init-specials ():void
+  (init-pic-anims)
+  (init-switch-list))
+
+(defn- start-button (line:&Line where:i32 texture:i32 time:i32):void
+  (dotimes (i MAXBUTTONS)
+    (let (b &(aref buttons i))
+      (when (and (!= (b 'btimer) 0) (= (unsafe/cast ptr (b 'line)) (unsafe/cast ptr line)))
+        (return))))
+  (dotimes (i MAXBUTTONS)
+    (let (b &(aref buttons i))
+      (when (= (b 'btimer) 0)
+        (set! (b 'line) line)
+        (set! (b 'where) where)
+        (set! (b 'btexture) texture)
+        (set! (b 'btimer) time)
+        (set! (b 'soundorg) &((unsafe/cast &Sector (line 'front-sector)) 'sound-org))
+        (return))))
+  (fatal "P_StartButton: no button slots left!"))
+
+(defn- front-side (line:&Line):&Side (line-side line 0))
+
+; Flips the line's switch texture; `use-again` turns it back after a second.
+(defn change-switch-texture (line:&Line use-again:bool):void
+  (when (not use-again) (set! (line 'special) 0))
+  (let (side (front-side line)
+        sound (if (= (line 'special) 11) SFX-SWTCHX SFX-SWTCHN)
+        i:i32 0)
+    (while (< i (* num-switches 2))
+      (let (tex (aref switch-list i)
+            other (aref switch-list (bit-xor i 1))
+            where (cond (= tex (side 'top-texture)) BW-TOP
+                    (= tex (side 'mid-texture)) BW-MIDDLE
+                    (= tex (side 'bottom-texture)) BW-BOTTOM
+                    true -1))
+        (when (>= where 0)
+          ; Vanilla plays it from the first button slot's origin, whatever
+          ; that holds.
+          (start-org-sound ((aref buttons 0) 'soundorg) sound)
+          (case where
+            BW-TOP (set! (side 'top-texture) other)
+            BW-MIDDLE (set! (side 'mid-texture) other)
+            (set! (side 'bottom-texture) other))
+          (when use-again (start-button line where tex BUTTONTIME))
+          (return)))
+      (inc! i))))
+
+;; Lines.
+
+; Runs `body`, then clears the line's special: a W1/S1/G1 line works once.
+(defmacro- once (line :rest body) `(do ~@body (set! (~line 'special) 0)))
+
+; Flips the switch when `action` did something.
+(defmacro- switched (line use-again action)
+  `(when ~action (change-switch-texture ~line ~use-again)))
+
+(defn- projectile? (type:i32):bool
+  (or (= type MT-ROCKET) (= type MT-PLASMA) (= type MT-BFG)
+      (= type MT-TROOPSHOT) (= type MT-HEADSHOT) (= type MT-BRUISERSHOT)))
+
+; `thing` walked over `line` from `side`.
+(defn cross-special-line (line:&Line side:i32 thing:&Mobj):void
+  (let (monster (null? (thing 'player)))
+    ; Doom 1.2 let no thing trigger the later line types, and any thing the rest.
+    (if (<= game-version EXE-DOOM-1-2)
+      (when (and (> (line 'special) 98) (!= (line 'special) 104)) (return))
+      (when (and monster (projectile? (thing 'type))) (return)))
+    (when monster
+      ; Monsters may only teleport, open plain doors and ride lifts.
+      (case (line 'special)
+        (:or 39 97 125 126 4 10 88) (do)
+        (return)))
+    (case (line 'special)
+      ;; W1: once only.
+      2 (once line (do-door line VLD-OPEN))
+      3 (once line (do-door line VLD-CLOSE))
+      4 (once line (do-door line VLD-NORMAL))
+      5 (once line (do-floor line FL-RAISE))
+      6 (once line (do-ceiling line CEIL-FAST-CRUSH-AND-RAISE))
+      8 (once line (build-stairs line STAIRS-BUILD8))
+      10 (once line (do-plat line PLAT-DOWN-WAIT-UP-STAY 0))
+      12 (once line (light-turn-on line 0))
+      13 (once line (light-turn-on line 255))
+      16 (once line (do-door line VLD-CLOSE30-THEN-OPEN))
+      17 (once line (start-light-strobing line))
+      19 (once line (do-floor line FL-LOWER))
+      22 (once line (do-plat line PLAT-RAISE-TO-NEAREST-AND-CHANGE 0))
+      25 (once line (do-ceiling line CEIL-CRUSH-AND-RAISE))
+      30 (once line (do-floor line FL-RAISE-TO-TEXTURE))
+      35 (once line (light-turn-on line 35))
+      36 (once line (do-floor line FL-TURBO-LOWER))
+      37 (once line (do-floor line FL-LOWER-AND-CHANGE))
+      38 (once line (do-floor line FL-LOWER-TO-LOWEST))
+      39 (once line (teleport line side thing))
+      40 (once line (do-ceiling line CEIL-RAISE-TO-HIGHEST) (do-floor line FL-LOWER-TO-LOWEST))
+      44 (once line (do-ceiling line CEIL-LOWER-AND-CRUSH))
+      52 (exit-level)
+      53 (once line (do-plat line PLAT-PERPETUAL-RAISE 0))
+      54 (once line (stop-plat line))
+      56 (once line (do-floor line FL-RAISE-CRUSH))
+      57 (once line (ceiling-crush-stop line))
+      58 (once line (do-floor line FL-RAISE-24))
+      59 (once line (do-floor line FL-RAISE-24-AND-CHANGE))
+      104 (once line (turn-tag-lights-off line))
+      108 (once line (do-door line VLD-BLAZE-RAISE))
+      109 (once line (do-door line VLD-BLAZE-OPEN))
+      100 (once line (build-stairs line STAIRS-TURBO16))
+      110 (once line (do-door line VLD-BLAZE-CLOSE))
+      119 (once line (do-floor line FL-RAISE-TO-NEAREST))
+      121 (once line (do-plat line PLAT-BLAZE-DWUS 0))
+      124 (secret-exit-level)
+      125 (when monster (once line (teleport line side thing)))
+      130 (once line (do-floor line FL-RAISE-TURBO))
+      141 (once line (do-ceiling line CEIL-SILENT-CRUSH-AND-RAISE))
+      ;; WR: every time.
+      72 (do-ceiling line CEIL-LOWER-AND-CRUSH)
+      73 (do-ceiling line CEIL-CRUSH-AND-RAISE)
+      74 (ceiling-crush-stop line)
+      75 (do-door line VLD-CLOSE)
+      76 (do-door line VLD-CLOSE30-THEN-OPEN)
+      77 (do-ceiling line CEIL-FAST-CRUSH-AND-RAISE)
+      79 (light-turn-on line 35)
+      80 (light-turn-on line 0)
+      81 (light-turn-on line 255)
+      82 (do-floor line FL-LOWER-TO-LOWEST)
+      83 (do-floor line FL-LOWER)
+      84 (do-floor line FL-LOWER-AND-CHANGE)
+      86 (do-door line VLD-OPEN)
+      87 (do-plat line PLAT-PERPETUAL-RAISE 0)
+      88 (do-plat line PLAT-DOWN-WAIT-UP-STAY 0)
+      89 (stop-plat line)
+      90 (do-door line VLD-NORMAL)
+      91 (do-floor line FL-RAISE)
+      92 (do-floor line FL-RAISE-24)
+      93 (do-floor line FL-RAISE-24-AND-CHANGE)
+      94 (do-floor line FL-RAISE-CRUSH)
+      95 (do-plat line PLAT-RAISE-TO-NEAREST-AND-CHANGE 0)
+      96 (do-floor line FL-RAISE-TO-TEXTURE)
+      97 (teleport line side thing)
+      98 (do-floor line FL-TURBO-LOWER)
+      105 (do-door line VLD-BLAZE-RAISE)
+      106 (do-door line VLD-BLAZE-OPEN)
+      107 (do-door line VLD-BLAZE-CLOSE)
+      120 (do-plat line PLAT-BLAZE-DWUS 0)
+      126 (when monster (teleport line side thing))
+      128 (do-floor line FL-RAISE-TO-NEAREST)
+      129 (do-floor line FL-RAISE-TURBO)
+      (do))))
+
+; `thing` shot `line`.
+(defn shoot-special-line (thing:&Mobj line:&Line):void
+  (when (and (null? (thing 'player)) (!= (line 'special) 46)) (return))
+  (case (line 'special)
+    24 (do (do-floor line FL-RAISE) (change-switch-texture line false))
+    46 (do (do-door line VLD-OPEN) (change-switch-texture line true))
+    47 (do (do-plat line PLAT-RAISE-TO-NEAREST-AND-CHANGE 0) (change-switch-texture line false))
+    (do)))
+
+; `thing` pressed use on `line`'s `side`; false if nothing could happen.
+(defn use-special-line (thing:&Mobj line:&Line side:i32):bool
+  ; Only the front works (124's back is a vanilla oddity that does nothing).
+  (when (and (!= side 0) (!= (line 'special) 124)) (return false))
+  (when (null? (thing 'player))
+    (when (!= (bit-and (line 'flags) ML-SECRET) 0) (return false))
+    ; Monsters only open plain doors.
+    (case (line 'special)
+      (:or 1 32 33 34) (do)
+      (return false)))
+  (case (line 'special)
+    (:or 1 26 27 28 31 32 33 34 117 118) (vertical-door-use line thing)
+    ;; Switches, once.
+    7 (switched line false (build-stairs line STAIRS-BUILD8))
+    9 (switched line false (do-donut line))
+    11 (do (change-switch-texture line false) (exit-level))
+    14 (switched line false (do-plat line PLAT-RAISE-AND-CHANGE 32))
+    15 (switched line false (do-plat line PLAT-RAISE-AND-CHANGE 24))
+    18 (switched line false (do-floor line FL-RAISE-TO-NEAREST))
+    20 (switched line false (do-plat line PLAT-RAISE-TO-NEAREST-AND-CHANGE 0))
+    21 (switched line false (do-plat line PLAT-DOWN-WAIT-UP-STAY 0))
+    23 (switched line false (do-floor line FL-LOWER-TO-LOWEST))
+    29 (switched line false (do-door line VLD-NORMAL))
+    41 (switched line false (do-ceiling line CEIL-LOWER-TO-FLOOR))
+    71 (switched line false (do-floor line FL-TURBO-LOWER))
+    49 (switched line false (do-ceiling line CEIL-CRUSH-AND-RAISE))
+    50 (switched line false (do-door line VLD-CLOSE))
+    51 (do (change-switch-texture line false) (secret-exit-level))
+    55 (switched line false (do-floor line FL-RAISE-CRUSH))
+    101 (switched line false (do-floor line FL-RAISE))
+    102 (switched line false (do-floor line FL-LOWER))
+    103 (switched line false (do-door line VLD-OPEN))
+    111 (switched line false (do-door line VLD-BLAZE-RAISE))
+    112 (switched line false (do-door line VLD-BLAZE-OPEN))
+    113 (switched line false (do-door line VLD-BLAZE-CLOSE))
+    122 (switched line false (do-plat line PLAT-BLAZE-DWUS 0))
+    127 (switched line false (build-stairs line STAIRS-TURBO16))
+    131 (switched line false (do-floor line FL-RAISE-TURBO))
+    (:or 133 135 137) (switched line false (do-locked-door line VLD-BLAZE-OPEN thing))
+    140 (switched line false (do-floor line FL-RAISE-512))
+    ;; Buttons, again and again.
+    42 (switched line true (do-door line VLD-CLOSE))
+    43 (switched line true (do-ceiling line CEIL-LOWER-TO-FLOOR))
+    45 (switched line true (do-floor line FL-LOWER))
+    60 (switched line true (do-floor line FL-LOWER-TO-LOWEST))
+    61 (switched line true (do-door line VLD-OPEN))
+    62 (switched line true (do-plat line PLAT-DOWN-WAIT-UP-STAY 1))
+    63 (switched line true (do-door line VLD-NORMAL))
+    64 (switched line true (do-floor line FL-RAISE))
+    66 (switched line true (do-plat line PLAT-RAISE-AND-CHANGE 24))
+    67 (switched line true (do-plat line PLAT-RAISE-AND-CHANGE 32))
+    65 (switched line true (do-floor line FL-RAISE-CRUSH))
+    68 (switched line true (do-plat line PLAT-RAISE-TO-NEAREST-AND-CHANGE 0))
+    69 (switched line true (do-floor line FL-RAISE-TO-NEAREST))
+    70 (switched line true (do-floor line FL-TURBO-LOWER))
+    114 (switched line true (do-door line VLD-BLAZE-RAISE))
+    115 (switched line true (do-door line VLD-BLAZE-OPEN))
+    116 (switched line true (do-door line VLD-BLAZE-CLOSE))
+    123 (switched line true (do-plat line PLAT-BLAZE-DWUS 0))
+    132 (switched line true (do-floor line FL-RAISE-TURBO))
+    (:or 99 134 136) (switched line true (do-locked-door line VLD-BLAZE-OPEN thing))
+    138 (do (light-turn-on line 255) (change-switch-texture line true))
+    139 (do (light-turn-on line 35) (change-switch-texture line true))
+    (do))
+  true)
+
+;; Teleporters.
+
+; To the teleport destination thing in a sector tagged like the line.
+(defn teleport (line:&Line side:i32 thing:&Mobj):bool
+  ; Missiles don't teleport, and only from the front.
+  (when (or (!= (bit-and (thing 'flags) MF-MISSILE) 0) (= side 1)) (return false))
+  (dotimes (i (table-len sectors))
+    (when (= ((sectors i) 'tag) (line 'tag))
+      (do-mobjs m
+        (when (and (= (m 'type) MT-TELEPORTMAN) (= (sector-index (mobj-sector m)) i))
+          (let (oldx (thing 'x) oldy (thing 'y) oldz (thing 'z))
+            (when (not (teleport-move thing (m 'x) (m 'y))) (return false))
+            (set! (thing 'z) (thing 'floorz))
+            (when-some (p (thing 'player))
+              (set! (p 'viewz) (+ (thing 'z) (p 'view-height))))
+            ; Fog at both ends.
+            (start-sound (spawn-mobj oldx oldy oldz MT-TFOG) SFX-TELEPT)
+            (let (an (fine-index (m 'angle)))
+              (start-sound (spawn-mobj (+ (m 'x) (* (fine-cosine an) 20)) (+ (m 'y) (* (fine-sine an) 20))
+                                       (thing 'z) MT-TFOG)
+                           SFX-TELEPT))
+            ; Don't move for a bit.
+            (when (not (null? (thing 'player))) (set! (thing 'reaction-time) 18))
+            (set! (thing 'angle) (m 'angle))
+            (set! (thing 'momx) (Fixed 0))
+            (set! (thing 'momy) (Fixed 0))
+            (set! (thing 'momz) (Fixed 0))
+            (return true))))))
+  false)
+
+;; Every tic.
+
+; Damaging floors and secrets, for a player standing on one.
+(defn player-in-special-sector (p:&Player):void
+  (let (mo (player-mobj p) sector (mobj-sector mo)
+        hurt (fn (p:&Player damage:i32):void
+               (when (= (bit-and level-time 0x1f) 0)
+                 (damage-mobj (player-mobj p) null null damage))))
+    ; Only when standing on the floor.
+    (when (!= (mo 'z) (sector 'floor-height)) (return))
+    (case (sector 'special)
+      ; Hellslime.
+      5 (when (= (aref (p 'powers) PW-IRONFEET) 0) (hurt p 10))
+      ; Nukage.
+      7 (when (= (aref (p 'powers) PW-IRONFEET) 0) (hurt p 5))
+      ; Super hellslime, which a suit only mostly protects from.
+      (:or 16 4) (when (or (= (aref (p 'powers) PW-IRONFEET) 0) (< (p-random) 5)) (hurt p 20))
+      9 (do (set! (p 'secret-count) (+ (p 'secret-count) 1))
+            (set! (sector 'special) 0))
+      ; The end of episode 1: no god mode, and the level ends at 10%.
+      11 (do (set! (p 'cheats) (bit-and (p 'cheats) (bit-not CF-GODMODE)))
+             (hurt p 20)
+             (when (<= (p 'health) 10) (exit-level)))
+      (fatal "P_PlayerInSpecialSector: unknown special"))))
+
+; Doom 1.2's array held two more.
+(defvar- line-specials:(array ?&Line 66))
+(defn- max-line-anims ():i32 (if (<= game-version EXE-DOOM-1-2) 66 64))
+(defvar- num-line-specials:i32 0)
+
+; Animates flats and walls, scrolls the scrolling walls, and pops buttons
+; back out.
+(defn update-specials ():void
+  (dotimes (k num-anims)
+    (let (a &(aref anims k))
+      (let (i (a 'base-pic))
+        (while (< i (+ (a 'base-pic) (a 'num-pics)))
+          (let (pic (+ (a 'base-pic) (% (+ (/ level-time (a 'speed)) i) (a 'num-pics))))
+            (if (a 'is-texture)
+              (set! (texture-translation i) pic)
+              (set! (flat-translation i) pic)))
+          (inc! i)))))
+  (dotimes (i num-line-specials)
+    (when-some (line (aref line-specials i))
+      (when (= (line 'special) 48)
+        (let (side (front-side line))
+          (set! (side 'texture-offset) (+ (side 'texture-offset) FIXED-ONE))))))
+  (dotimes (i MAXBUTTONS)
+    (let (b &(aref buttons i))
+      (when (!= (b 'btimer) 0)
+        (set! (b 'btimer) (- (b 'btimer) 1))
+        (when (= (b 'btimer) 0)
+          (let (side (front-side (unsafe/cast &Line (b 'line))))
+            (case (b 'where)
+              BW-TOP (set! (side 'top-texture) (b 'btexture))
+              BW-MIDDLE (set! (side 'mid-texture) (b 'btexture))
+              BW-BOTTOM (set! (side 'bottom-texture) (b 'btexture))
+              (do)))
+          ; Vanilla passes the address of the soundorg field itself, so the
+          ; "origin" x is the next button's timer and y is padding.
+          (start-sound-at (Fixed (if (< (+ i 1) MAXBUTTONS) ((aref buttons (+ i 1)) 'btimer) 0))
+                          (Fixed 0) SFX-SWTCHN)
+          (set! (b 'line) null)
+          (set! (b 'where) 0)
+          (set! (b 'btexture) 0)
+          (set! (b 'soundorg) null))))))
+
+; After a level's things are spawned: the sector and line effects.
+(defn spawn-specials ():void
+  (dotimes (i (table-len sectors))
+    (let (sector (sectors i))
+      (case (sector 'special)
+        1 (spawn-light-flash sector)
+        2 (spawn-strobe-flash sector FASTDARK false)
+        3 (spawn-strobe-flash sector SLOWDARK false)
+        ; Strobing and damaging both.
+        4 (do (spawn-strobe-flash sector FASTDARK false)
+              (set! (sector 'special) 4))
+        8 (spawn-glowing-light sector)
+        9 (inc! total-secret)
+        10 (spawn-door-close-in-30 sector)
+        12 (spawn-strobe-flash sector SLOWDARK true)
+        13 (spawn-strobe-flash sector FASTDARK true)
+        14 (spawn-door-raise-in-5-mins sector)
+        ; First in the v1.4 beta.
+        17 (when (> game-version EXE-DOOM-1-2) (spawn-fire-flicker sector))
+        (do))))
+  (set! num-line-specials 0)
+  (dotimes (i (table-len lines))
+    (let (line (lines i))
+      (when (= (line 'special) 48)
+        (when (>= num-line-specials (max-line-anims))
+          (fatal (string-as-view &(str "P_SpawnSpecials: Too many scrolling wall linedefs! (Vanilla limit is "
+                                       (max-line-anims) ")"))))
+        (set! (aref line-specials num-line-specials) line)
+        (inc! num-line-specials))))
+  (dotimes (i MAXCEILINGS) (set! (aref active-ceilings i) null))
+  (dotimes (i MAXPLATS) (set! (aref active-plats i) null))
+  (dotimes (i MAXBUTTONS)
+    (let (b &(aref buttons i))
+      (set! (b 'line) null)
+      (set! (b 'where) 0)
+      (set! (b 'btexture) 0)
+      (set! (b 'btimer) 0)
+      (set! (b 'soundorg) null))))

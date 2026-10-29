@@ -9,8 +9,10 @@ port is secondary. The full brief is in `PROMPT.md`, and current status is in
 
 - `/home/zak/code/chocolate-doom`: the C original. **Read-only.** The game is in
   `src/doom/`, platform and shared code in `src/*.c`. `src/chocolate-doom` is a
-  built reference binary, and `src/DOOM1.WAD` is the shareware v1.9 IWAD (the
-  only IWAD available).
+  built reference binary, and `src/DOOM1.WAD` is the shareware IWAD (the
+  only IWAD available). Its demo lumps are in the pre-1.4 format (first byte
+  3, no version byte), so Chocolate Doom sets `gameversion = exe_doom_1_2`
+  for it, and every `gameversion` branch in the playsim takes its 1.2 side.
 - `/home/zak/code/nucleus`: the language, on branch `doom-bugfixes`. You may fix
   compiler **bugs** there (`PROMPT.md` §7, "Fixing the compiler"), following
   that repo's own `CLAUDE.md`. **Never run `make` in that tree.** Its binaries

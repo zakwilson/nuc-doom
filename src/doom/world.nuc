@@ -27,6 +27,16 @@
 (defconst ONFLOORZ -2147483648)
 (defconst ONCEILINGZ 2147483647)
 (defconst VIEWHEIGHT (* 41 FRAC-UNIT))
+; The playsim modules import each other, and a computed constant doesn't
+; resolve across an import cycle, so their shared ones live here. ISSUE-024
+(defconst MAPBLOCKSIZE (* MAPBLOCKUNITS FRAC-UNIT))
+(defconst MELEERANGE (* 64 FRAC-UNIT))
+(defconst MISSILERANGE (* 32 64 FRAC-UNIT))
+(defconst MAXMOVE (* 30 FRAC-UNIT))
+(defconst GRAVITY FRAC-UNIT)
+(defconst FLOATSPEED (* 4 FRAC-UNIT))
+(defconst WEAPONBOTTOM (* 128 FRAC-UNIT))
+(defconst WEAPONTOP (* 32 FRAC-UNIT))
 
 ; Sprite frame flags (p_pspr.h).
 (defconst FF-FULLBRIGHT 0x8000)
@@ -90,7 +100,51 @@
 
 (defunion Thinker
   cap                      ; the list head
-  (mobj m:&Mobj))
+  (mobj m:&Mobj)
+  (door d:&Door)
+  (floor f:&FloorMove)
+  (ceiling c:&Ceiling)
+  (plat p:&Plat)
+  (fire-flicker f:&FireFlicker)
+  (light-flash l:&LightFlash)
+  (strobe s:&Strobe)
+  (glow g:&Glow))
+
+;; Sector effects (p_spec.h). Each embeds its ThinkerNode like a Mobj does.
+
+(defstruct Door
+  th:ThinkerNode type:i32 sector:&Sector
+  top-height:Fixed speed:Fixed
+  ; 1 up, 0 waiting at the top, -1 down, 2 waiting to raise.
+  direction:i32
+  top-wait:i32 top-countdown:i32)
+
+; crush is an int: stairs leave it at 10, which crushes but isn't `true`.
+(defstruct FloorMove
+  th:ThinkerNode type:i32 crush:i32 sector:&Sector
+  direction:i32 new-special:i32 texture:i32
+  dest-height:Fixed speed:Fixed)
+
+(defstruct Ceiling
+  th:ThinkerNode type:i32 sector:&Sector
+  bottom-height:Fixed top-height:Fixed speed:Fixed
+  crush:bool
+  ; 0 is in stasis.
+  direction:i32
+  tag:i32 old-direction:i32)
+
+(defstruct Plat
+  th:ThinkerNode sector:&Sector
+  speed:Fixed low:Fixed high:Fixed
+  wait:i32 count:i32 status:i32 old-status:i32
+  crush:bool tag:i32 type:i32)
+
+(defstruct FireFlicker th:ThinkerNode sector:&Sector count:i32 max-light:i32 min-light:i32)
+(defstruct LightFlash th:ThinkerNode sector:&Sector count:i32 max-light:i32 min-light:i32
+  max-time:i32 min-time:i32)
+(defstruct Strobe th:ThinkerNode sector:&Sector count:i32 min-light:i32 max-light:i32
+  dark-time:i32 bright-time:i32)
+(defstruct Glow th:ThinkerNode sector:&Sector min-light:i32 max-light:i32 direction:i32)
 
 (defenum ThinkState TH-ACTIVE TH-STASIS TH-REMOVED)
 
@@ -133,6 +187,19 @@
 
 (defstruct TicCmd forward-move:i8 side-move:i8 angle-turn:i16 chat-char:ui8 buttons:ui8 consistancy:ui8)
 
+; TicCmd buttons. With BT-SPECIAL set, the low bits are a BTS- action instead.
+(defconst BT-ATTACK 1)
+(defconst BT-USE 2)
+(defconst BT-CHANGE 4)
+(defconst BT-WEAPONMASK (+ 8 16 32))
+(defconst BT-WEAPONSHIFT 3)
+(defconst BT-SPECIAL 128)
+(defconst BT-SPECIALMASK 3)
+(defconst BTS-PAUSE 1)
+(defconst BTS-SAVEGAME 2)
+(defconst BTS-SAVEMASK (+ 4 8 16))
+(defconst BTS-SAVESHIFT 2)
+
 (defenum PsprNum PS-WEAPON PS-FLASH NUM-PSPRITES)
 
 ; state is a StateNum, S-NULL when the sprite is off.
@@ -160,6 +227,9 @@
   extra-light:i32 fixed-colormap:i32 colormap:i32
   psprites:(array PspDef 2)
   did-secret:bool)
+
+; A player in a level always has a body; the C never checks.
+(defn player-mobj (p:&Player):&Mobj (unsafe/cast &Mobj (p 'mo)))
 
 ;; The loaded level (p_setup.c).
 
@@ -189,6 +259,12 @@
 (defvar validcount:i32 1)
 
 (defn sector-line (s:&Sector i:i32):&Line (aref (s 'lines) i))
+
+; Side 0 is the front; side 1 exists only on a two-sided line.
+(defn line-side (l:&Line i:i32):&Side (sides (aref (l 'side-num) i)))
+
+; Only a thing that isn't linked into the world yet lacks a subsector.
+(defn mobj-sector (m:&Mobj):&Sector ((unsafe/cast &Subsector (m 'subsector)) 'sector))
 
 (defn sector-index (s:&Sector):i32 (index-of sectors s))
 (defn line-index (l:&Line):i32 (index-of lines l))

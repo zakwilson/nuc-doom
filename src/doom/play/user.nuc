@@ -6,10 +6,19 @@
 (ns doom.play.user)
 
 (import-use doom.math)
+(import-use doom.defs)
+(import-use doom.info)
 (import-use doom.world)
 (import-use doom.state)
+(import-use doom.geom)
+(import-use doom.play.mobj)
+(import-use doom.play.map)
+(import-use doom.play.pspr)
+(import-use doom.play.spec)
 
 (defconst- MAXBOB 0x100000)
+(defconst- INVERSECOLORMAP 32)
+(defconst- ANG5:Angle (/ ANG90 18))
 
 ; Set by the move each tic, and read by the view-height code after it.
 (defvar on-ground:bool false)
@@ -41,3 +50,125 @@
           (set! (p 'viewz) (+ (+ (mo 'z) (p 'view-height)) bob))
           (when (> (p 'viewz) ceiling)
             (set! (p 'viewz) ceiling)))))))
+
+(defn- thrust (p:&Player angle:Angle move:Fixed):void
+  (let (mo (player-mobj p) fi (fine-index angle))
+    (set! (mo 'momx) (+ (mo 'momx) (* move (fine-cosine fi))))
+    (set! (mo 'momy) (+ (mo 'momy) (* move (fine-sine fi))))))
+
+(defn- move-player (p:&Player):void
+  (let (cmd &(p 'cmd) mo (player-mobj p))
+    (set! (mo 'angle) (+ (mo 'angle) (unsafe/cast ui32 (bit-shl (as i32 (cmd 'angle-turn)) FRAC-BITS))))
+    ; Only on the ground can you push off.
+    (set! on-ground (<= (mo 'z) (mo 'floorz)))
+    (when (and (!= (cmd 'forward-move) 0) on-ground)
+      (thrust p (mo 'angle) (Fixed (* (as i32 (cmd 'forward-move)) 2048))))
+    (when (and (!= (cmd 'side-move) 0) on-ground)
+      (thrust p (- (mo 'angle) ANG90) (Fixed (* (as i32 (cmd 'side-move)) 2048))))
+    (when (and (or (!= (cmd 'forward-move) 0) (!= (cmd 'side-move) 0))
+               (= (mo 'state) S-PLAY))
+      (set-mobj-state mo S-PLAY-RUN1))))
+
+; Dead: sink to the floor and turn to face the killer.
+(defn- death-think (p:&Player):void
+  (move-psprites p)
+  (let (mo (player-mobj p))
+    (when (> ((p 'view-height) 'v) (* 6 FRAC-UNIT))
+      (set! (p 'view-height) (- (p 'view-height) FIXED-ONE)))
+    (when (< ((p 'view-height) 'v) (* 6 FRAC-UNIT))
+      (set! (p 'view-height) (fx 6)))
+    (set! (p 'delta-view-height) (Fixed 0))
+    (set! on-ground (<= (mo 'z) (mo 'floorz)))
+    (calc-height p)
+    (let (facing false)
+      (when-some (a (p 'attacker))
+        (when (not (= (unsafe/cast ptr a) (unsafe/cast ptr mo)))
+          (set! facing true)
+          (let (angle (point-to-angle2 (mo 'x) (mo 'y) (a 'x) (a 'y))
+                delta (- angle (mo 'angle)))
+            (cond (or (< delta ANG5) (> delta (- (as Angle 0) ANG5)))
+              ; Looking at the killer: fade the red.
+              (do (set! (mo 'angle) angle)
+                  (when (!= (p 'damage-count) 0)
+                    (set! (p 'damage-count) (- (p 'damage-count) 1))))
+              (< delta ANG180) (set! (mo 'angle) (+ (mo 'angle) ANG5))
+              true (set! (mo 'angle) (- (mo 'angle) ANG5))))))
+      (when (and (not facing) (!= (p 'damage-count) 0))
+        (set! (p 'damage-count) (- (p 'damage-count) 1))))
+    (when (!= (bit-and ((p 'cmd) 'buttons) BT-USE) 0)
+      (set! (p 'player-state) PST-REBORN))))
+
+(defn- count-down (p:&Player power:i32):void
+  (when (!= (aref (p 'powers) power) 0)
+    (set! (aref (p 'powers) power) (- (aref (p 'powers) power) 1))))
+
+; Invulnerability and the visor flash for their last four seconds.
+(defn- power-colormap (tics:i32 colormap:i32):i32
+  (if (or (> tics (* 4 32)) (!= (bit-and tics 8) 0)) colormap 0))
+
+(defn- change-weapon (p:&Player):void
+  (let (buttons ((p 'cmd) 'buttons)
+        newweapon:i32 (bit-shr (bit-and buttons BT-WEAPONMASK) BT-WEAPONSHIFT)
+        owned (fn (p:&Player w:i32):bool (!= (aref (p 'weapon-owned) w) 0)))
+    ; The fist key gives the chainsaw, unless berserk with the saw out.
+    (when (and (= newweapon WP-FIST) (owned p WP-CHAINSAW)
+               (not (and (= (p 'ready-weapon) WP-CHAINSAW) (!= (aref (p 'powers) PW-STRENGTH) 0))))
+      (set! newweapon WP-CHAINSAW))
+    (when (and (= game-mode COMMERCIAL) (= newweapon WP-SHOTGUN) (owned p WP-SUPERSHOTGUN)
+               (!= (p 'ready-weapon) WP-SUPERSHOTGUN))
+      (set! newweapon WP-SUPERSHOTGUN))
+    ; Shareware has no plasma gun or BFG to switch to.
+    (when (and (owned p newweapon) (!= newweapon (p 'ready-weapon))
+               (or (and (!= newweapon WP-PLASMA) (!= newweapon WP-BFG)) (!= game-mode SHAREWARE)))
+      (set! (p 'pending-weapon) newweapon))))
+
+(defn player-think (p:&Player):void
+  (let (mo (player-mobj p) cmd &(p 'cmd))
+    (if (!= (bit-and (p 'cheats) CF-NOCLIP) 0)
+      (set! (mo 'flags) (bit-or (mo 'flags) MF-NOCLIP))
+      (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-NOCLIP))))
+    ; The chainsaw drags you forward.
+    (when (!= (bit-and (mo 'flags) MF-JUSTATTACKED) 0)
+      (set! (cmd 'angle-turn) 0)
+      (set! (cmd 'forward-move) (/ 0xc800 512))
+      (set! (cmd 'side-move) 0)
+      (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-JUSTATTACKED))))
+    (when (= (p 'player-state) PST-DEAD)
+      (death-think p)
+      (return))
+    ; Frozen for a moment after a teleport.
+    (if (!= (mo 'reaction-time) 0)
+      (set! (mo 'reaction-time) (- (mo 'reaction-time) 1))
+      (move-player p))
+    (calc-height p)
+    (when (!= ((mobj-sector mo) 'special) 0)
+      (player-in-special-sector p))
+    ; Pause and save are handled elsewhere.
+    (when (!= (bit-and (cmd 'buttons) BT-SPECIAL) 0)
+      (set! (cmd 'buttons) 0))
+    (when (!= (bit-and (cmd 'buttons) BT-CHANGE) 0)
+      (change-weapon p))
+    (if (!= (bit-and (cmd 'buttons) BT-USE) 0)
+      (when (= (p 'use-down) 0)
+        (use-lines p)
+        (set! (p 'use-down) 1))
+      (set! (p 'use-down) 0))
+    (move-psprites p)
+    ; Berserk counts up, the rest down.
+    (when (!= (aref (p 'powers) PW-STRENGTH) 0)
+      (set! (aref (p 'powers) PW-STRENGTH) (+ (aref (p 'powers) PW-STRENGTH) 1)))
+    (count-down p PW-INVULNERABILITY)
+    (when (!= (aref (p 'powers) PW-INVISIBILITY) 0)
+      (count-down p PW-INVISIBILITY)
+      (when (= (aref (p 'powers) PW-INVISIBILITY) 0)
+        (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-SHADOW)))))
+    (count-down p PW-INFRARED)
+    (count-down p PW-IRONFEET)
+    (when (!= (p 'damage-count) 0) (set! (p 'damage-count) (- (p 'damage-count) 1)))
+    (when (!= (p 'bonus-count) 0) (set! (p 'bonus-count) (- (p 'bonus-count) 1)))
+    (set! (p 'fixed-colormap)
+          (cond (!= (aref (p 'powers) PW-INVULNERABILITY) 0)
+            (power-colormap (aref (p 'powers) PW-INVULNERABILITY) INVERSECOLORMAP)
+            (!= (aref (p 'powers) PW-INFRARED) 0)
+            (power-colormap (aref (p 'powers) PW-INFRARED) 1)
+            true 0))))

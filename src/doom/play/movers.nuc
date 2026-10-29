@@ -1,0 +1,704 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Moving sectors (p_floor.c, p_doors.c, p_plats.c, p_ceilng.c, and the donut
+; from p_spec.c): each is a thinker that moves one floor or ceiling a step
+; per tic until it arrives.
+
+(ns doom.play.movers)
+
+(import-use nucleus.create)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.system)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.sound)
+(import-use doom.render.data)
+(import-use doom.play.thinkers)
+(import-use doom.play.map)
+(import-use doom.play.spec)
+
+(defenum PlaneResult RES-OK RES-CRUSHED RES-PASTDEST)
+
+(defenum DoorType VLD-NORMAL VLD-CLOSE30-THEN-OPEN VLD-CLOSE VLD-OPEN VLD-RAISE-IN-5-MINS
+  VLD-BLAZE-RAISE VLD-BLAZE-OPEN VLD-BLAZE-CLOSE)
+(defenum FloorType FL-LOWER FL-LOWER-TO-LOWEST FL-TURBO-LOWER FL-RAISE FL-RAISE-TO-NEAREST
+  FL-RAISE-TO-TEXTURE FL-LOWER-AND-CHANGE FL-RAISE-24 FL-RAISE-24-AND-CHANGE FL-RAISE-CRUSH
+  FL-RAISE-TURBO FL-DONUT-RAISE FL-RAISE-512)
+(defenum StairType STAIRS-BUILD8 STAIRS-TURBO16)
+(defenum CeilingType CEIL-LOWER-TO-FLOOR CEIL-RAISE-TO-HIGHEST CEIL-LOWER-AND-CRUSH
+  CEIL-CRUSH-AND-RAISE CEIL-FAST-CRUSH-AND-RAISE CEIL-SILENT-CRUSH-AND-RAISE)
+(defenum PlatStatus PLAT-UP PLAT-DOWN PLAT-WAITING PLAT-IN-STASIS)
+(defenum PlatType PLAT-PERPETUAL-RAISE PLAT-DOWN-WAIT-UP-STAY PLAT-RAISE-AND-CHANGE
+  PLAT-RAISE-TO-NEAREST-AND-CHANGE PLAT-BLAZE-DWUS)
+
+(defconst- FLOORSPEED FRAC-UNIT)
+(defconst- CEILSPEED FRAC-UNIT)
+(defconst- VDOORSPEED (* 2 FRAC-UNIT))
+(defconst- VDOORWAIT 150)
+(defconst- PLATSPEED FRAC-UNIT)
+(defconst- PLATWAIT 3)
+(defconst MAXPLATS 30)
+(defconst MAXCEILINGS 30)
+(defconst- STAIRS-UNINITIALIZED-CRUSH 10)
+
+;; Moving a plane.
+
+(defn- plane (s:&Sector ceiling:bool):Fixed (if ceiling (s 'ceiling-height) (s 'floor-height)))
+
+(defn- set-plane (s:&Sector ceiling:bool h:Fixed):void
+  (if ceiling (set! (s 'ceiling-height) h) (set! (s 'floor-height) h)))
+
+; One step of a floor or ceiling toward `dest`. A step that would squash
+; something is undone, unless crushing, and a ceiling going up never stops.
+(defn move-plane (sector:&Sector speed:Fixed dest:Fixed crush:i32 ceiling:bool direction:i32):i32
+  (when (and (!= direction 1) (!= direction -1)) (return RES-OK))
+  (let (last (plane sector ceiling)
+        crushing (!= crush 0)
+        down (= direction -1))
+    (if (if down (< (- last speed) dest) (> (+ last speed) dest))
+      (do (set-plane sector ceiling dest)
+          (when (change-sector sector crushing)
+            (set-plane sector ceiling last)
+            (change-sector sector crushing))
+          RES-PASTDEST)
+      (do (set-plane sector ceiling (if down (- last speed) (+ last speed)))
+          (cond (not (change-sector sector crushing)) RES-OK
+            (and ceiling (not down)) RES-OK
+            ; Only `true` keeps crushing; the stairs' 10 doesn't.
+            (and (= crush 1) (or ceiling (not down))) RES-CRUSHED
+            true (do (set-plane sector ceiling last)
+                     (change-sector sector crushing)
+                     RES-CRUSHED))))))
+
+; Calls `body` with each sector index tagged like `line`, as the C's
+; P_FindSectorFromLineTag loops do; a body may move `secnum` on.
+(defmacro- each-tagged-sector (line secnum :rest body)
+  `(let (~secnum (find-sector-from-line-tag ~line -1))
+     (while (>= ~secnum 0)
+       ~@body
+       (set! ~secnum (find-sector-from-line-tag ~line ~secnum)))))
+
+(defn- busy? (sec:&Sector):bool (not (null? (sec 'special-data))))
+
+(defn- finish (sec:&Sector th:&ThinkerNode):void
+  (set! (sec 'special-data) null)
+  (remove-thinker th))
+
+;; Doors.
+
+(defn- door-sound (door:&Door sfx:i32):void (start-sector-sound (door 'sector) sfx))
+
+(defn- lowest-ceiling-less-4 (sec:&Sector):Fixed
+  (- (find-lowest-ceiling-surrounding sec) (Fixed (* 4 FRAC-UNIT))))
+
+(defn vertical-door (door:&Door):void
+  (let (type (door 'type) sec (door 'sector))
+    (case (door 'direction)
+      0 (do (set! (door 'top-countdown) (- (door 'top-countdown) 1))
+            (when (= (door 'top-countdown) 0)
+              (case type
+                VLD-BLAZE-RAISE (do (set! (door 'direction) -1) (door-sound door SFX-BDCLS))
+                VLD-NORMAL (do (set! (door 'direction) -1) (door-sound door SFX-DORCLS))
+                VLD-CLOSE30-THEN-OPEN (do (set! (door 'direction) 1) (door-sound door SFX-DOROPN))
+                (do))))
+      2 (do (set! (door 'top-countdown) (- (door 'top-countdown) 1))
+            (when (and (= (door 'top-countdown) 0) (= type VLD-RAISE-IN-5-MINS))
+              (set! (door 'direction) 1)
+              (set! (door 'type) VLD-NORMAL)
+              (door-sound door SFX-DOROPN)))
+      -1 (let (res (move-plane sec (door 'speed) (sec 'floor-height) 0 true -1))
+           (cond (= res RES-PASTDEST)
+             (case type
+               (:or VLD-BLAZE-RAISE VLD-BLAZE-CLOSE) (do (finish sec &(door 'th))
+                                                         (door-sound door SFX-BDCLS))
+               (:or VLD-NORMAL VLD-CLOSE) (finish sec &(door 'th))
+               VLD-CLOSE30-THEN-OPEN (do (set! (door 'direction) 0)
+                                         (set! (door 'top-countdown) (* TIC-RATE 30)))
+               (do))
+             ; Something's in the way: back up, unless told to close.
+             (= res RES-CRUSHED)
+             (case type
+               (:or VLD-BLAZE-CLOSE VLD-CLOSE) (do)
+               (do (set! (door 'direction) 1) (door-sound door SFX-DOROPN)))))
+      1 (let (res (move-plane sec (door 'speed) (door 'top-height) 0 true 1))
+          (when (= res RES-PASTDEST)
+            (case type
+              (:or VLD-BLAZE-RAISE VLD-NORMAL) (do (set! (door 'direction) 0)
+                                                   (set! (door 'top-countdown) (door 'top-wait)))
+              (:or VLD-CLOSE30-THEN-OPEN VLD-BLAZE-OPEN VLD-OPEN) (finish sec &(door 'th))
+              (do))))
+      (do))))
+
+(defn- new-door (sec:&Sector):&Door
+  (let (door (new Door level-arena))
+    (add-thinker &(door 'th) (Thinker-door door))
+    (set! (sec 'special-data) &(door 'th))
+    (set! (door 'sector) sec)
+    door))
+
+(defn do-door (line:&Line type:i32):bool
+  (let (rtn false)
+    (each-tagged-sector line secnum
+      (let (sec (sectors secnum))
+        (when (not (busy? sec))
+          (set! rtn true)
+          (let (door (new-door sec))
+            (set! (door 'type) type)
+            (set! (door 'top-wait) VDOORWAIT)
+            (set! (door 'speed) (Fixed VDOORSPEED))
+            (case type
+              VLD-BLAZE-CLOSE (do (set! (door 'top-height) (lowest-ceiling-less-4 sec))
+                                  (set! (door 'direction) -1)
+                                  (set! (door 'speed) (Fixed (* VDOORSPEED 4)))
+                                  (door-sound door SFX-BDCLS))
+              VLD-CLOSE (do (set! (door 'top-height) (lowest-ceiling-less-4 sec))
+                            (set! (door 'direction) -1)
+                            (door-sound door SFX-DORCLS))
+              VLD-CLOSE30-THEN-OPEN (do (set! (door 'top-height) (sec 'ceiling-height))
+                                        (set! (door 'direction) -1)
+                                        (door-sound door SFX-DORCLS))
+              (:or VLD-BLAZE-RAISE VLD-BLAZE-OPEN)
+              (do (set! (door 'direction) 1)
+                  (set! (door 'top-height) (lowest-ceiling-less-4 sec))
+                  (set! (door 'speed) (Fixed (* VDOORSPEED 4)))
+                  (when (!= (door 'top-height) (sec 'ceiling-height)) (door-sound door SFX-BDOPN)))
+              (:or VLD-NORMAL VLD-OPEN)
+              (do (set! (door 'direction) 1)
+                  (set! (door 'top-height) (lowest-ceiling-less-4 sec))
+                  (when (!= (door 'top-height) (sec 'ceiling-height)) (door-sound door SFX-DOROPN)))
+              (do))))))
+    rtn))
+
+(defn- has-key? (p:&Player card:i32 skull:i32):bool
+  (or (aref (p 'cards) card) (aref (p 'cards) skull)))
+
+; Whether `p` holds the key `special` needs; says so if not.
+(defn- check-key (p:&Player special:i32 objectp:bool):bool
+  (let (needs (case special
+                (:or 26 32 99 133) 0
+                (:or 27 34 136 137) 1
+                (:or 28 33 134 135) 2
+                -1)
+        ok (case needs
+             0 (has-key? p IT-BLUE-CARD IT-BLUE-SKULL)
+             1 (has-key? p IT-YELLOW-CARD IT-YELLOW-SKULL)
+             2 (has-key? p IT-RED-CARD IT-RED-SKULL)
+             true))
+    (when (not ok)
+      (set! (p 'message)
+            (case needs
+              0 (if objectp "You need a blue key to activate this object" "You need a blue key to open this door")
+              1 (if objectp "You need a yellow key to activate this object" "You need a yellow key to open this door")
+              (if objectp "You need a red key to activate this object" "You need a red key to open this door")))
+      (start-sound null SFX-OOF))
+    ok))
+
+(defn do-locked-door (line:&Line type:i32 thing:&Mobj):bool
+  (if-some (p (thing 'player))
+    (and (check-key p (line 'special) true) (do-door line type))
+    false))
+
+; Vanilla reads a door's `direction` from whatever thinker is on the sector,
+; at the same offset. For each other kind, the field that lands there.
+(defn- punned-direction (th:&ThinkerNode):i32
+  (match (th 'self)
+    ((door d) (d 'direction))
+    ((plat p) (p 'count))
+    ((floor f) (f 'texture))
+    ((ceiling c) ((c 'speed) 'v))
+    (_ 0)))
+
+(defn- set-punned-direction (th:&ThinkerNode v:i32):void
+  (match (th 'self)
+    ((door d) (set! (d 'direction) v))
+    ((plat p) (set! (p 'count) v))
+    ((floor f) (set! (f 'texture) v))
+    ((ceiling c) (set! (c 'speed) (Fixed v)))
+    (_ (do))))
+
+; A door opened by using it (DR and D1 lines).
+(defn vertical-door-use (line:&Line thing:&Mobj):void
+  (when (or (= (line 'special) 26) (= (line 'special) 27) (= (line 'special) 28)
+            (= (line 'special) 32) (= (line 'special) 33) (= (line 'special) 34))
+    (if-some (p (thing 'player))
+      (when (not (check-key p (line 'special) false)) (return))
+      (return)))
+  (when (= (aref (line 'side-num) 1) -1)
+    (fatal "EV_VerticalDoor: DR special type on 1-sided linedef"))
+  (let (sec ((line-side line 1) 'sector)
+        special (line 'special))
+    (when-some (th (sec 'special-data))
+      (case special
+        (:or 1 26 27 28 117)
+        (do (if (= (punned-direction th) -1)
+              ; Going down: go back up.
+              (set-punned-direction th 1)
+              (do (when (null? (thing 'player)) (return))
+                  (let (active (= (th 'state) TH-ACTIVE))
+                    (match (th 'self)
+                      ((door d) (if active (set! (d 'direction) -1) (set-punned-direction th -1)))
+                      ; A plat on a door line waits forever instead.
+                      ((plat p) (if active (set! (p 'wait) -1) (set-punned-direction th -1)))
+                      (_ (set-punned-direction th -1))))))
+            (return))
+        (do)))
+    (door-sound-at sec (if (or (= special 117) (= special 118)) SFX-BDOPN SFX-DOROPN))
+    (let (door (new-door sec))
+      (set! (door 'direction) 1)
+      (set! (door 'speed) (Fixed VDOORSPEED))
+      (set! (door 'top-wait) VDOORWAIT)
+      (case special
+        (:or 1 26 27 28) (set! (door 'type) VLD-NORMAL)
+        (:or 31 32 33 34) (do (set! (door 'type) VLD-OPEN)
+                              (set! (line 'special) 0))
+        117 (do (set! (door 'type) VLD-BLAZE-RAISE)
+                (set! (door 'speed) (Fixed (* VDOORSPEED 4))))
+        118 (do (set! (door 'type) VLD-BLAZE-OPEN)
+                (set! (line 'special) 0)
+                (set! (door 'speed) (Fixed (* VDOORSPEED 4))))
+        (do))
+      (set! (door 'top-height) (lowest-ceiling-less-4 sec)))))
+
+(defn- door-sound-at (sec:&Sector sfx:i32):void (start-sector-sound sec sfx))
+
+(defn spawn-door-close-in-30 (sec:&Sector):void
+  (let (door (new-door sec))
+    (set! (sec 'special) 0)
+    (set! (door 'direction) 0)
+    (set! (door 'type) VLD-NORMAL)
+    (set! (door 'speed) (Fixed VDOORSPEED))
+    (set! (door 'top-countdown) (* 30 TIC-RATE))))
+
+(defn spawn-door-raise-in-5-mins (sec:&Sector):void
+  (let (door (new-door sec))
+    (set! (sec 'special) 0)
+    (set! (door 'direction) 2)
+    (set! (door 'type) VLD-RAISE-IN-5-MINS)
+    (set! (door 'speed) (Fixed VDOORSPEED))
+    (set! (door 'top-height) (lowest-ceiling-less-4 sec))
+    (set! (door 'top-wait) VDOORWAIT)
+    (set! (door 'top-countdown) (* 5 60 TIC-RATE))))
+
+;; Platforms (lifts).
+
+(defvar active-plats:(array ?&Plat 30))
+
+(defn- plat-sound (plat:&Plat sfx:i32):void (start-sector-sound (plat 'sector) sfx))
+
+(defn- add-active-plat (plat:&Plat):void
+  (dotimes (i MAXPLATS)
+    (when (null? (aref active-plats i))
+      (set! (aref active-plats i) plat)
+      (return)))
+  (fatal "P_AddActivePlat: no more plats!"))
+
+(defn- same-plat? (a:?&Plat b:&Plat):bool (= (unsafe/cast ptr a) (unsafe/cast ptr b)))
+
+(defn- remove-active-plat (plat:&Plat):void
+  (dotimes (i MAXPLATS)
+    (when (same-plat? (aref active-plats i) plat)
+      (finish (plat 'sector) &(plat 'th))
+      (set! (aref active-plats i) null)
+      (return)))
+  (fatal "P_RemoveActivePlat: can't find plat!"))
+
+(defn plat-raise (plat:&Plat):void
+  (let (type (plat 'type) sec (plat 'sector))
+    (case (plat 'status)
+      PLAT-UP
+      (let (res (move-plane sec (plat 'speed) (plat 'high) (if (plat 'crush) 1 0) false 1))
+        (when (and (or (= type PLAT-RAISE-AND-CHANGE) (= type PLAT-RAISE-TO-NEAREST-AND-CHANGE))
+                   (= (bit-and level-time 7) 0))
+          (plat-sound plat SFX-STNMOV))
+        (cond (and (= res RES-CRUSHED) (not (plat 'crush)))
+          (do (set! (plat 'count) (plat 'wait))
+              (set! (plat 'status) PLAT-DOWN)
+              (plat-sound plat SFX-PSTART))
+          (= res RES-PASTDEST)
+          (do (set! (plat 'count) (plat 'wait))
+              (set! (plat 'status) PLAT-WAITING)
+              (plat-sound plat SFX-PSTOP)
+              (case type
+                (:or PLAT-BLAZE-DWUS PLAT-DOWN-WAIT-UP-STAY PLAT-RAISE-AND-CHANGE
+                     PLAT-RAISE-TO-NEAREST-AND-CHANGE) (remove-active-plat plat)
+                (do)))))
+      PLAT-DOWN
+      (when (= (move-plane sec (plat 'speed) (plat 'low) 0 false -1) RES-PASTDEST)
+        (set! (plat 'count) (plat 'wait))
+        (set! (plat 'status) PLAT-WAITING)
+        (plat-sound plat SFX-PSTOP))
+      PLAT-WAITING
+      (do (set! (plat 'count) (- (plat 'count) 1))
+          (when (= (plat 'count) 0)
+            (set! (plat 'status) (if (= (sec 'floor-height) (plat 'low)) PLAT-UP PLAT-DOWN))
+            (plat-sound plat SFX-PSTART)))
+      (do))))
+
+(defn- activate-in-stasis (tag:i32):void
+  (dotimes (i MAXPLATS)
+    (when-some (p (aref active-plats i))
+      (when (and (= (p 'tag) tag) (= (p 'status) PLAT-IN-STASIS))
+        (set! (p 'status) (p 'old-status))
+        (set! (&(p 'th) 'state) TH-ACTIVE)))))
+
+(defn stop-plat (line:&Line):void
+  (dotimes (j MAXPLATS)
+    (when-some (p (aref active-plats j))
+      (when (and (!= (p 'status) PLAT-IN-STASIS) (= (p 'tag) (line 'tag)))
+        (set! (p 'old-status) (p 'status))
+        (set! (p 'status) PLAT-IN-STASIS)
+        (set! (&(p 'th) 'state) TH-STASIS)))))
+
+(defn- lowest-floor-or-own (sec:&Sector):Fixed
+  (let (low (find-lowest-floor-surrounding sec))
+    (if (> low (sec 'floor-height)) (sec 'floor-height) low)))
+
+(defn do-plat (line:&Line type:i32 amount:i32):bool
+  (let (rtn false)
+    (when (= type PLAT-PERPETUAL-RAISE) (activate-in-stasis (line 'tag)))
+    (each-tagged-sector line secnum
+      (let (sec (sectors secnum))
+        (when (not (busy? sec))
+          (set! rtn true)
+          (let (plat (new Plat level-arena))
+            (add-thinker &(plat 'th) (Thinker-plat plat))
+            (set! (plat 'type) type)
+            (set! (plat 'sector) sec)
+            (set! (sec 'special-data) &(plat 'th))
+            (set! (plat 'crush) false)
+            (set! (plat 'tag) (line 'tag))
+            (case type
+              PLAT-RAISE-TO-NEAREST-AND-CHANGE
+              (do (set! (plat 'speed) (Fixed (/ PLATSPEED 2)))
+                  (set! (sec 'floor-pic) (((line-side line 0) 'sector) 'floor-pic))
+                  (set! (plat 'high) (find-next-highest-floor sec (sec 'floor-height)))
+                  (set! (plat 'wait) 0)
+                  (set! (plat 'status) PLAT-UP)
+                  ; No more damage, if it was a nukage floor.
+                  (set! (sec 'special) 0)
+                  (start-sector-sound sec SFX-STNMOV))
+              PLAT-RAISE-AND-CHANGE
+              (do (set! (plat 'speed) (Fixed (/ PLATSPEED 2)))
+                  (set! (sec 'floor-pic) (((line-side line 0) 'sector) 'floor-pic))
+                  (set! (plat 'high) (+ (sec 'floor-height) (fx amount)))
+                  (set! (plat 'wait) 0)
+                  (set! (plat 'status) PLAT-UP)
+                  (start-sector-sound sec SFX-STNMOV))
+              (:or PLAT-DOWN-WAIT-UP-STAY PLAT-BLAZE-DWUS)
+              (do (set! (plat 'speed) (Fixed (* PLATSPEED (if (= type PLAT-BLAZE-DWUS) 8 4))))
+                  (set! (plat 'low) (lowest-floor-or-own sec))
+                  (set! (plat 'high) (sec 'floor-height))
+                  (set! (plat 'wait) (* TIC-RATE PLATWAIT))
+                  (set! (plat 'status) PLAT-DOWN)
+                  (start-sector-sound sec SFX-PSTART))
+              PLAT-PERPETUAL-RAISE
+              (do (set! (plat 'speed) (Fixed PLATSPEED))
+                  (set! (plat 'low) (lowest-floor-or-own sec))
+                  (let (high (find-highest-floor-surrounding sec))
+                    (set! (plat 'high) (if (< high (sec 'floor-height)) (sec 'floor-height) high)))
+                  (set! (plat 'wait) (* TIC-RATE PLATWAIT))
+                  (set! (plat 'status) (bit-and (p-random) 1))
+                  (start-sector-sound sec SFX-PSTART))
+              (do))
+            (add-active-plat plat)))))
+    rtn))
+
+;; Ceilings (crushers).
+
+(defvar active-ceilings:(array ?&Ceiling 30))
+
+(defn- ceiling-sound (c:&Ceiling sfx:i32):void (start-sector-sound (c 'sector) sfx))
+
+(defn- add-active-ceiling (c:&Ceiling):void
+  (dotimes (i MAXCEILINGS)
+    (when (null? (aref active-ceilings i))
+      (set! (aref active-ceilings i) c)
+      (return))))
+
+(defn- remove-active-ceiling (c:&Ceiling):void
+  (dotimes (i MAXCEILINGS)
+    (when (= (unsafe/cast ptr (aref active-ceilings i)) (unsafe/cast ptr c))
+      (finish (c 'sector) &(c 'th))
+      (set! (aref active-ceilings i) null)
+      (return))))
+
+(defn move-ceiling (c:&Ceiling):void
+  (let (type (c 'type) sec (c 'sector)
+        ; Grinding every eighth tic, unless silent.
+        grind (fn (c:&Ceiling):void
+                (when (and (= (bit-and level-time 7) 0) (!= (c 'type) CEIL-SILENT-CRUSH-AND-RAISE))
+                  (ceiling-sound c SFX-STNMOV))))
+    (case (c 'direction)
+      1 (let (res (move-plane sec (c 'speed) (c 'top-height) 0 true 1))
+          (grind c)
+          (when (= res RES-PASTDEST)
+            (case type
+              CEIL-RAISE-TO-HIGHEST (remove-active-ceiling c)
+              CEIL-SILENT-CRUSH-AND-RAISE (do (ceiling-sound c SFX-PSTOP)
+                                              (set! (c 'direction) -1))
+              (:or CEIL-FAST-CRUSH-AND-RAISE CEIL-CRUSH-AND-RAISE) (set! (c 'direction) -1)
+              (do))))
+      -1 (let (res (move-plane sec (c 'speed) (c 'bottom-height) (if (c 'crush) 1 0) true -1))
+           (grind c)
+           (cond (= res RES-PASTDEST)
+             (case type
+               CEIL-SILENT-CRUSH-AND-RAISE (do (ceiling-sound c SFX-PSTOP)
+                                               (set! (c 'speed) (Fixed CEILSPEED))
+                                               (set! (c 'direction) 1))
+               CEIL-CRUSH-AND-RAISE (do (set! (c 'speed) (Fixed CEILSPEED))
+                                        (set! (c 'direction) 1))
+               CEIL-FAST-CRUSH-AND-RAISE (set! (c 'direction) 1)
+               (:or CEIL-LOWER-AND-CRUSH CEIL-LOWER-TO-FLOOR) (remove-active-ceiling c)
+               (do))
+             ; Slow down while crushing something.
+             (= res RES-CRUSHED)
+             (case type
+               (:or CEIL-SILENT-CRUSH-AND-RAISE CEIL-CRUSH-AND-RAISE CEIL-LOWER-AND-CRUSH)
+               (set! (c 'speed) (Fixed (/ CEILSPEED 8)))
+               (do))))
+      (do))))
+
+(defn- activate-in-stasis-ceiling (line:&Line):void
+  (dotimes (i MAXCEILINGS)
+    (when-some (c (aref active-ceilings i))
+      (when (and (= (c 'tag) (line 'tag)) (= (c 'direction) 0))
+        (set! (c 'direction) (c 'old-direction))
+        (set! (&(c 'th) 'state) TH-ACTIVE)))))
+
+(defn ceiling-crush-stop (line:&Line):bool
+  (let (rtn false)
+    (dotimes (i MAXCEILINGS)
+      (when-some (c (aref active-ceilings i))
+        (when (and (= (c 'tag) (line 'tag)) (!= (c 'direction) 0))
+          (set! (c 'old-direction) (c 'direction))
+          (set! (&(c 'th) 'state) TH-STASIS)
+          (set! (c 'direction) 0)
+          (set! rtn true))))
+    rtn))
+
+(defn do-ceiling (line:&Line type:i32):bool
+  (let (rtn false)
+    (when (or (= type CEIL-FAST-CRUSH-AND-RAISE) (= type CEIL-SILENT-CRUSH-AND-RAISE)
+              (= type CEIL-CRUSH-AND-RAISE))
+      (activate-in-stasis-ceiling line))
+    (each-tagged-sector line secnum
+      (let (sec (sectors secnum))
+        (when (not (busy? sec))
+          (set! rtn true)
+          (let (c (new Ceiling level-arena))
+            (add-thinker &(c 'th) (Thinker-ceiling c))
+            (set! (sec 'special-data) &(c 'th))
+            (set! (c 'sector) sec)
+            (set! (c 'crush) false)
+            (case type
+              CEIL-FAST-CRUSH-AND-RAISE
+              (do (set! (c 'crush) true)
+                  (set! (c 'top-height) (sec 'ceiling-height))
+                  (set! (c 'bottom-height) (+ (sec 'floor-height) (Fixed (* 8 FRAC-UNIT))))
+                  (set! (c 'direction) -1)
+                  (set! (c 'speed) (Fixed (* CEILSPEED 2))))
+              (:or CEIL-SILENT-CRUSH-AND-RAISE CEIL-CRUSH-AND-RAISE CEIL-LOWER-AND-CRUSH CEIL-LOWER-TO-FLOOR)
+              (do (when (or (= type CEIL-SILENT-CRUSH-AND-RAISE) (= type CEIL-CRUSH-AND-RAISE))
+                    (set! (c 'crush) true)
+                    (set! (c 'top-height) (sec 'ceiling-height)))
+                  (set! (c 'bottom-height) (if (= type CEIL-LOWER-TO-FLOOR)
+                                             (sec 'floor-height)
+                                             (+ (sec 'floor-height) (Fixed (* 8 FRAC-UNIT)))))
+                  (set! (c 'direction) -1)
+                  (set! (c 'speed) (Fixed CEILSPEED)))
+              CEIL-RAISE-TO-HIGHEST
+              (do (set! (c 'top-height) (find-highest-ceiling-surrounding sec))
+                  (set! (c 'direction) 1)
+                  (set! (c 'speed) (Fixed CEILSPEED)))
+              (do))
+            (set! (c 'tag) (sec 'tag))
+            (set! (c 'type) type)
+            (add-active-ceiling c)))))
+    rtn))
+
+;; Floors, stairs and donuts.
+
+(defn move-floor (floor:&FloorMove):void
+  (let (sec (floor 'sector)
+        res (move-plane sec (floor 'speed) (floor 'dest-height) (floor 'crush) false (floor 'direction)))
+    (when (= (bit-and level-time 7) 0) (start-sector-sound sec SFX-STNMOV))
+    (when (= res RES-PASTDEST)
+      (set! (sec 'special-data) null)
+      ; The changers take on the look of where they end up.
+      (when (or (and (= (floor 'direction) 1) (= (floor 'type) FL-DONUT-RAISE))
+                (and (= (floor 'direction) -1) (= (floor 'type) FL-LOWER-AND-CHANGE)))
+        (set! (sec 'special) (floor 'new-special))
+        (set! (sec 'floor-pic) (floor 'texture)))
+      (remove-thinker &(floor 'th))
+      (start-sector-sound sec SFX-PSTOP))))
+
+(defn- new-floor (sec:&Sector):&FloorMove
+  (let (floor (new FloorMove level-arena))
+    (add-thinker &(floor 'th) (Thinker-floor floor))
+    (set! (sec 'special-data) &(floor 'th))
+    (set! (floor 'sector) sec)
+    floor))
+
+(defn- side-of (secnum:i32 i:i32 s:i32):&Side
+  (line-side (sector-line (sectors secnum) i) s))
+
+(defn- two-sided? (secnum:i32 i:i32):bool
+  (!= (bit-and ((sector-line (sectors secnum) i) 'flags) ML-TWOSIDED) 0))
+
+; The shortest lower texture around the sector.
+(defn- shortest-lower-texture (secnum:i32):i32
+  (let (sec (sectors secnum) minsize:i32 2147483647)
+    (dotimes (i (sec 'line-count))
+      (when (two-sided? secnum i)
+        (dotimes (s 2)
+          (let (tex ((side-of secnum i s) 'bottom-texture))
+            (when (>= tex 0)
+              (let (h ((texture-height tex) 'v))
+                (when (< h minsize) (set! minsize h))))))))
+    minsize))
+
+; Finds the texture and special of the neighbour at the destination height.
+; Vanilla's loop reassigns `sec` to each neighbour it checks, so its bound
+; is the last neighbour's line count.
+(defn- lower-and-change-model (floor:&FloorMove secnum:i32):void
+  (let (sec (sectors secnum) i:i32 0 going true)
+    (while (and going (< i (sec 'line-count))) ; ISSUE-026
+      (when (>= i ((sectors secnum) 'line-count))
+        (fatal "EV_DoFloor: lowerAndChange read past the sector's lines"))
+      (when (two-sided? secnum i)
+        (let (front-is-us (= (sector-index ((side-of secnum i 0) 'sector)) secnum)
+              other ((side-of secnum i (if front-is-us 1 0)) 'sector))
+          (set! sec other)
+          (when (= (other 'floor-height) (floor 'dest-height))
+            (set! (floor 'texture) (other 'floor-pic))
+            (set! (floor 'new-special) (other 'special))
+            (set! going false))))
+      (inc! i))))
+
+(defn do-floor (line:&Line type:i32):bool
+  (let (rtn false)
+    (each-tagged-sector line secnum
+      (let (sec (sectors secnum))
+        (when (not (busy? sec))
+          (set! rtn true)
+          (let (floor (new-floor sec))
+            (set! (floor 'type) type)
+            (set! (floor 'crush) 0)
+            (set! (floor 'speed) (Fixed FLOORSPEED))
+            (set! (floor 'direction) (case type
+                                       (:or FL-LOWER FL-LOWER-TO-LOWEST FL-TURBO-LOWER FL-LOWER-AND-CHANGE) -1
+                                       1))
+            (case type
+              FL-LOWER (set! (floor 'dest-height) (find-highest-floor-surrounding sec))
+              FL-LOWER-TO-LOWEST (set! (floor 'dest-height) (find-lowest-floor-surrounding sec))
+              FL-TURBO-LOWER
+              (do (set! (floor 'speed) (Fixed (* FLOORSPEED 4)))
+                  (set! (floor 'dest-height) (find-highest-floor-surrounding sec))
+                  (when (or (<= game-version EXE-DOOM-1-2) (!= (floor 'dest-height) (sec 'floor-height)))
+                    (set! (floor 'dest-height) (+ (floor 'dest-height) (Fixed (* 8 FRAC-UNIT))))))
+              (:or FL-RAISE-CRUSH FL-RAISE)
+              (let (dest (find-lowest-ceiling-surrounding sec))
+                (when (= type FL-RAISE-CRUSH) (set! (floor 'crush) 1))
+                (when (> dest (sec 'ceiling-height)) (set! dest (sec 'ceiling-height)))
+                (set! (floor 'dest-height)
+                      (if (= type FL-RAISE-CRUSH) (- dest (Fixed (* 8 FRAC-UNIT))) dest)))
+              FL-RAISE-TURBO
+              (do (set! (floor 'speed) (Fixed (* FLOORSPEED 4)))
+                  (set! (floor 'dest-height) (find-next-highest-floor sec (sec 'floor-height))))
+              FL-RAISE-TO-NEAREST
+              (set! (floor 'dest-height) (find-next-highest-floor sec (sec 'floor-height)))
+              FL-RAISE-24 (set! (floor 'dest-height) (+ (sec 'floor-height) (fx 24)))
+              FL-RAISE-512 (set! (floor 'dest-height) (+ (sec 'floor-height) (fx 512)))
+              FL-RAISE-24-AND-CHANGE
+              (let (front (unsafe/cast &Sector (line 'front-sector)))
+                (set! (floor 'dest-height) (+ (sec 'floor-height) (fx 24)))
+                (set! (sec 'floor-pic) (front 'floor-pic))
+                (set! (sec 'special) (front 'special)))
+              FL-RAISE-TO-TEXTURE
+              (set! (floor 'dest-height) (+ (sec 'floor-height) (Fixed (shortest-lower-texture secnum))))
+              FL-LOWER-AND-CHANGE
+              (do (set! (floor 'dest-height) (find-lowest-floor-surrounding sec))
+                  (set! (floor 'texture) (sec 'floor-pic))
+                  (lower-and-change-model floor secnum))
+              (do))))))
+    rtn))
+
+(defn build-stairs (line:&Line type:i32):bool
+  (let (rtn false
+        speed:Fixed (Fixed (if (= type STAIRS-BUILD8) (/ FLOORSPEED 4) (* FLOORSPEED 4))) ; ISSUE-025
+        stairsize (fx (if (= type STAIRS-BUILD8) 8 16))
+        step (fn (sec:&Sector height:Fixed speed:Fixed):void
+               (let (floor (new-floor sec))
+                 (set! (floor 'direction) 1)
+                 (set! (floor 'speed) speed)
+                 (set! (floor 'dest-height) height)
+                 (set! (floor 'type) FL-LOWER)
+                 (set! (floor 'crush) STAIRS-UNINITIALIZED-CRUSH))))
+    (each-tagged-sector line secnum
+      (let (sec (sectors secnum))
+        (when (not (busy? sec))
+          (set! rtn true)
+          (let (height (+ (sec 'floor-height) stairsize)
+                texture (sec 'floor-pic)
+                ok true)
+            (step sec height speed)
+            ; Follow two-sided lines out of the step into the next one of
+            ; the same flat.
+            (while ok ; ISSUE-026
+              (set! ok false)
+              (let (i:i32 0)
+                (while (and (not ok) (< i (sec 'line-count))) ; ISSUE-026
+                  (let (ln (sector-line sec i))
+                    (when (and (!= (bit-and (ln 'flags) ML-TWOSIDED) 0)
+                               (= (sector-index (unsafe/cast &Sector (ln 'front-sector))) secnum))
+                      (let (tsec (unsafe/cast &Sector (ln 'back-sector)))
+                        (when (= (tsec 'floor-pic) texture)
+                          (set! height (+ height stairsize))
+                          (when (not (busy? tsec))
+                            (set! sec tsec)
+                            (set! secnum (sector-index tsec))
+                            (step sec height speed)
+                            (set! ok true))))))
+                  (inc! i))))))))
+    rtn))
+
+(defn do-donut (line:&Line):bool
+  (let (rtn false)
+    (each-tagged-sector line secnum
+      (let (s1 (sectors secnum))
+        (when (not (busy? s1))
+          (set! rtn true)
+          (if-some (s2 (next-sector (sector-line s1 0) s1))
+            (let (i:i32 0 going true)
+              (while (and going (< i (s2 'line-count))) ; ISSUE-026
+                (let (s3 ((sector-line s2 i) 'back-sector))
+                  (when (not (= (unsafe/cast ptr s3) (unsafe/cast ptr s1)))
+                    ; A one-sided ring line: vanilla reads past the end of
+                    ; the sector; Chocolate Doom supplies these values.
+                    ; Typed so the literal branch joins by value. ISSUE-025
+                    (let (s3-height:Fixed (if-some (s s3) (s 'floor-height) (Fixed 0))
+                          s3-pic (if-some (s s3) (s 'floor-pic) 0x16)
+                          ring (new-floor s2))
+                      (set! (ring 'type) FL-DONUT-RAISE)
+                      (set! (ring 'crush) 0)
+                      (set! (ring 'direction) 1)
+                      (set! (ring 'speed) (Fixed (/ FLOORSPEED 2)))
+                      (set! (ring 'texture) s3-pic)
+                      (set! (ring 'new-special) 0)
+                      (set! (ring 'dest-height) s3-height)
+                      (let (pillar (new-floor s1))
+                        (set! (pillar 'type) FL-LOWER)
+                        (set! (pillar 'crush) 0)
+                        (set! (pillar 'direction) -1)
+                        (set! (pillar 'speed) (Fixed (/ FLOORSPEED 2)))
+                        (set! (pillar 'dest-height) s3-height))
+                      (set! going false))))
+                (inc! i)))
+            ; No second sidedef: Chocolate Doom stops looking.
+            (set! secnum 2147483646)))))
+    rtn))

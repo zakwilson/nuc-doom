@@ -1,0 +1,75 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Sound effects (s_sound.c). Until there is a mixer this only decides whether
+; a sound would be heard, because an audible sound draws m-random for its
+; pitch and the tic hash records that index even under -nosound.
+
+(ns doom.sound)
+
+(import-use doom.math)
+(import-use doom.random)
+(import-use doom.sounds)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.system)
+(import-use doom.geom)
+
+(defconst- S-CLIPPING-DIST (* 1200 FRAC-UNIT))
+(defconst- S-CLOSE-DIST (* 200 FRAC-UNIT))
+(defconst- S-ATTENUATOR (bit-shr (- S-CLIPPING-DIST S-CLOSE-DIST) FRAC-BITS))
+
+; The menu's 0..15 volume times 8, as S_Init is given it.
+(defvar sfx-volume:i32 64)
+
+; The volume a sound from (x, y) reaches the listener with; 0 is inaudible.
+(defn- volume-at (listener:&Mobj x:Fixed y:Fixed volume:i32):i32
+  (let (adx (fx-abs (- (listener 'x) x))
+        ady (fx-abs (- (listener 'y) y))
+        dist (- (+ adx ady) (fx-shr (if (< adx ady) adx ady) 1)))
+    (cond (and (!= game-map 8) (> (dist 'v) S-CLIPPING-DIST)) 0
+      (< (dist 'v) S-CLOSE-DIST) volume
+      (= game-map 8)
+      (let (d (if (> (dist 'v) S-CLIPPING-DIST) S-CLIPPING-DIST (dist 'v)))
+        (+ 15 (/ (* (- volume 15) (bit-shr (- S-CLIPPING-DIST d) FRAC-BITS)) S-ATTENUATOR)))
+      true (/ (* volume (bit-shr (- S-CLIPPING-DIST (dist 'v)) FRAC-BITS)) S-ATTENUATOR))))
+
+; A sound from a point; `from-listener` when the listener itself made it.
+(defn- start (from-listener:bool x:Fixed y:Fixed sfx:i32):void
+  (when (or (< sfx 1) (> sfx NUM-SFX)) (fatal "Bad sfx #"))
+  (let (info &(aref sfx-info sfx)
+        volume:i32 sfx-volume
+        audible true)
+    (when (!= (info 'link) -1)
+      (set! volume (+ volume (info 'volume)))
+      (when (< volume 1) (set! audible false))
+      (when (> volume sfx-volume) (set! volume sfx-volume)))
+    (when (and audible (not from-listener))
+      (when-some (listener ((player console-player) 'mo))
+        (when (<= (volume-at listener x y volume) 0) (set! audible false))))
+    (when audible
+      ; The pitch variation; the draw is what matters here.
+      (cond (and (>= sfx SFX-SAWUP) (<= sfx SFX-SAWHIT)) (m-random)
+        (and (!= sfx SFX-ITEMUP) (!= sfx SFX-TINK)) (m-random)
+        true 0))))
+
+; A sound from a thing, or from nowhere (full volume) when `origin` is null.
+(defn start-sound (origin:?&Mobj sfx:i32):void
+  (if-some (o origin)
+    (let (listener ((player console-player) 'mo))
+      (start (= (unsafe/cast ptr o) (unsafe/cast ptr listener)) (o 'x) (o 'y) sfx))
+    (start true (Fixed 0) (Fixed 0) sfx)))
+
+; A sound from a sector's sound origin, or from nowhere when `org` is null.
+(defn start-org-sound (org:?&SoundOrg sfx:i32):void
+  (if-some (o org)
+    (start false (o 'x) (o 'y) sfx)
+    (start true (Fixed 0) (Fixed 0) sfx)))
+
+(defn start-sector-sound (sec:&Sector sfx:i32):void
+  (start-org-sound &(sec 'sound-org) sfx))
+
+; A sound from a bare point, for the vanilla bug that reads one out of
+; memory that isn't an origin at all.
+(defn start-sound-at (x:Fixed y:Fixed sfx:i32):void
+  (start false x y sfx))

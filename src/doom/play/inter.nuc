@@ -1,0 +1,329 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Interactions (p_inter.c): picking things up, taking damage, dying.
+
+(ns doom.play.inter)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.geom)
+(import-use doom.sound)
+(import-use doom.system)
+(import-use doom.play.mobj)
+(import-use doom.play.pspr)
+
+(defconst BONUSADD 6)
+(defconst MAXHEALTH 100)
+(defconst BASETHRESHOLD 100)
+
+; Dehacked's defaults, which the shareware IWAD never changes.
+(defconst- MAX-HEALTH-BONUS 200)
+(defconst- MAX-ARMOR-BONUS 200)
+(defconst- SOULSPHERE-HEALTH 100)
+(defconst- MAX-SOULSPHERE 200)
+(defconst- MEGASPHERE-HEALTH 200)
+
+(defconst- CLIP-AMMO (array i32 10 4 20 1))
+
+(defn- owns? (p:&Player w:i32):bool (!= (aref (p 'weapon-owned) w) 0))
+
+; `num` clips' worth, or half a clip for 0 (a dropped clip).
+(defn give-ammo (p:&Player ammo:i32 num:i32):bool
+  (when (= ammo AM-NOAMMO) (return false))
+  (when (or (< ammo 0) (>= ammo NUM-AMMO)) (fatal "P_GiveAmmo: bad type"))
+  (when (= (aref (p 'ammo) ammo) (aref (p 'max-ammo) ammo)) (return false))
+  (let (n (if (!= num 0) (* num (aref CLIP-AMMO ammo)) (/ (aref CLIP-AMMO ammo) 2))
+        old (aref (p 'ammo) ammo)
+        ready (p 'ready-weapon))
+    (when (or (= game-skill SK-BABY) (= game-skill SK-NIGHTMARE)) (set! n (bit-shl n 1)))
+    (set! (aref (p 'ammo) ammo) (+ old n))
+    (when (> (aref (p 'ammo) ammo) (aref (p 'max-ammo) ammo))
+      (set! (aref (p 'ammo) ammo) (aref (p 'max-ammo) ammo)))
+    ; Switch to a weapon that now has ammo, but only out of nothing.
+    (when (= old 0)
+      (case ammo
+        AM-CLIP (when (= ready WP-FIST)
+                  (set! (p 'pending-weapon) (if (owns? p WP-CHAINGUN) WP-CHAINGUN WP-PISTOL)))
+        AM-SHELL (when (and (or (= ready WP-FIST) (= ready WP-PISTOL)) (owns? p WP-SHOTGUN))
+                   (set! (p 'pending-weapon) WP-SHOTGUN))
+        AM-CELL (when (and (or (= ready WP-FIST) (= ready WP-PISTOL)) (owns? p WP-PLASMA))
+                  (set! (p 'pending-weapon) WP-PLASMA))
+        AM-MISL (when (and (= ready WP-FIST) (owns? p WP-MISSILE))
+                  (set! (p 'pending-weapon) WP-MISSILE))
+        (do)))
+    true))
+
+(defn give-weapon (p:&Player weapon:i32 dropped:bool):bool
+  (let (ammo ((aref weapon-info weapon) 'ammo))
+    (if (and netgame (!= deathmatch 2) (not dropped))
+      ; Cooperative weapons stay for the other players.
+      (do (when (!= (aref (p 'weapon-owned) weapon) 0) (return false))
+          (set! (p 'bonus-count) (+ (p 'bonus-count) BONUSADD))
+          (set! (aref (p 'weapon-owned) weapon) 1)
+          (give-ammo p ammo (if (!= deathmatch 0) 5 2))
+          (set! (p 'pending-weapon) weapon)
+          (when (console-player? p) (start-sound null SFX-WPNUP))
+          false)
+      (let (gave-ammo (and (!= ammo AM-NOAMMO) (give-ammo p ammo (if dropped 1 2)))
+            gave-weapon (= (aref (p 'weapon-owned) weapon) 0))
+        (when gave-weapon
+          (set! (aref (p 'weapon-owned) weapon) 1)
+          (set! (p 'pending-weapon) weapon))
+        (or gave-weapon gave-ammo)))))
+
+(defn- set-health (p:&Player h:i32):void
+  (set! (p 'health) h)
+  (when-some (mo (p 'mo)) (set! (mo 'health) h)))
+
+(defn give-body (p:&Player num:i32):bool
+  (if (>= (p 'health) MAXHEALTH)
+    false
+    (do (set-health p (if (> (+ (p 'health) num) MAXHEALTH) MAXHEALTH (+ (p 'health) num)))
+        true)))
+
+(defn give-armor (p:&Player armor-type:i32):bool
+  (let (hits (* armor-type 100))
+    (if (>= (p 'armor-points) hits)
+      false
+      (do (set! (p 'armor-type) armor-type)
+          (set! (p 'armor-points) hits)
+          true))))
+
+(defn- give-card (p:&Player card:i32):void
+  (when (not (aref (p 'cards) card))
+    (set! (p 'bonus-count) BONUSADD)
+    (set! (aref (p 'cards) card) true)))
+
+(defn give-power (p:&Player power:i32):bool
+  (case power
+    PW-INVULNERABILITY (do (set! (aref (p 'powers) power) INVULN-TICS) true)
+    PW-INVISIBILITY (do (set! (aref (p 'powers) power) INVIS-TICS)
+                        (when-some (mo (p 'mo))
+                          (set! (mo 'flags) (bit-or (mo 'flags) MF-SHADOW)))
+                        true)
+    PW-INFRARED (do (set! (aref (p 'powers) power) INFRA-TICS) true)
+    PW-IRONFEET (do (set! (aref (p 'powers) power) IRON-TICS) true)
+    PW-STRENGTH (do (give-body p 100)
+                    (set! (aref (p 'powers) power) 1)
+                    true)
+    (if (!= (aref (p 'powers) power) 0)
+      false
+      (do (set! (aref (p 'powers) power) 1) true))))
+
+; A key: the message only the first time. In a netgame keys stay put for the
+; other players, so the caller returns without removing it.
+(defn- pick-key (p:&Player card:i32 msg:CStr):bool
+  (when (not (aref (p 'cards) card)) (set! (p 'message) msg))
+  (give-card p card)
+  (not netgame))
+
+; Doom 1.2 played the plain pickup sound for powerups too.
+(defn- power-sound ():i32 (if (> game-version EXE-DOOM-1-2) SFX-GETPOW SFX-ITEMUP))
+
+(defn- took (p:&Player ok:bool msg:CStr snd:i32):i32
+  (if ok (do (set! (p 'message) msg) snd) -1))
+
+; Gives `special` to `p` and returns the pickup sound, or -1 if `p` can't use
+; it now and it stays where it is.
+(defn- pick-up (p:&Player special:&Mobj):i32
+  (let (dropped (!= (bit-and (special 'flags) MF-DROPPED) 0))
+    (case (special 'sprite)
+      SPR-ARM1 (took p (give-armor p 1) "Picked up the armor." SFX-ITEMUP)
+      SPR-ARM2 (took p (give-armor p 2) "Picked up the MegaArmor!" SFX-ITEMUP)
+      SPR-BON1 (do (set-health p (if (>= (p 'health) MAX-HEALTH-BONUS) MAX-HEALTH-BONUS (+ (p 'health) 1)))
+                   (took p true "Picked up a health bonus." SFX-ITEMUP))
+      SPR-BON2 (do (set! (p 'armor-points) (+ (p 'armor-points) 1))
+                   (when (and (> (p 'armor-points) MAX-ARMOR-BONUS) (> game-version EXE-DOOM-1-2))
+                     (set! (p 'armor-points) MAX-ARMOR-BONUS))
+                   (when (= (p 'armor-type) 0) (set! (p 'armor-type) 1))
+                   (took p true "Picked up an armor bonus." SFX-ITEMUP))
+      SPR-SOUL (do (set-health p (if (> (+ (p 'health) SOULSPHERE-HEALTH) MAX-SOULSPHERE)
+                                   MAX-SOULSPHERE (+ (p 'health) SOULSPHERE-HEALTH)))
+                   (took p true "Supercharge!" (power-sound)))
+      SPR-MEGA (if (!= game-mode COMMERCIAL)
+                 -1
+                 (do (set-health p MEGASPHERE-HEALTH)
+                     (give-armor p 2)
+                     (took p true "MegaSphere!" (power-sound))))
+      SPR-BKEY (if (pick-key p IT-BLUE-CARD "Picked up a blue keycard.") SFX-ITEMUP -1)
+      SPR-YKEY (if (pick-key p IT-YELLOW-CARD "Picked up a yellow keycard.") SFX-ITEMUP -1)
+      SPR-RKEY (if (pick-key p IT-RED-CARD "Picked up a red keycard.") SFX-ITEMUP -1)
+      SPR-BSKU (if (pick-key p IT-BLUE-SKULL "Picked up a blue skull key.") SFX-ITEMUP -1)
+      SPR-YSKU (if (pick-key p IT-YELLOW-SKULL "Picked up a yellow skull key.") SFX-ITEMUP -1)
+      SPR-RSKU (if (pick-key p IT-RED-SKULL "Picked up a red skull key.") SFX-ITEMUP -1)
+      SPR-STIM (took p (give-body p 10) "Picked up a stimpack." SFX-ITEMUP)
+      ; The health test comes after the medikit is taken, so vanilla never
+      ; says you REALLY needed it.
+      SPR-MEDI (if (give-body p 25)
+                 (took p true (if (< (p 'health) 25) "Picked up a medikit that you REALLY need!"
+                              "Picked up a medikit.") SFX-ITEMUP)
+                 -1)
+      SPR-PINV (took p (give-power p PW-INVULNERABILITY) "Invulnerability!" (power-sound))
+      SPR-PSTR (if (give-power p PW-STRENGTH)
+                 (do (when (!= (p 'ready-weapon) WP-FIST) (set! (p 'pending-weapon) WP-FIST))
+                     (took p true "Berserk!" (power-sound)))
+                 -1)
+      SPR-PINS (took p (give-power p PW-INVISIBILITY) "Partial Invisibility" (power-sound))
+      SPR-SUIT (took p (give-power p PW-IRONFEET) "Radiation Shielding Suit" (power-sound))
+      SPR-PMAP (took p (give-power p PW-ALLMAP) "Computer Area Map" (power-sound))
+      SPR-PVIS (took p (give-power p PW-INFRARED) "Light Amplification Visor" (power-sound))
+      SPR-CLIP (took p (give-ammo p AM-CLIP (if dropped 0 1)) "Picked up a clip." SFX-ITEMUP)
+      SPR-AMMO (took p (give-ammo p AM-CLIP 5) "Picked up a box of bullets." SFX-ITEMUP)
+      SPR-ROCK (took p (give-ammo p AM-MISL 1) "Picked up a rocket." SFX-ITEMUP)
+      SPR-BROK (took p (give-ammo p AM-MISL 5) "Picked up a box of rockets." SFX-ITEMUP)
+      SPR-CELL (took p (give-ammo p AM-CELL 1) "Picked up an energy cell." SFX-ITEMUP)
+      SPR-CELP (took p (give-ammo p AM-CELL 5) "Picked up an energy cell pack." SFX-ITEMUP)
+      SPR-SHEL (took p (give-ammo p AM-SHELL 1) "Picked up 4 shotgun shells." SFX-ITEMUP)
+      SPR-SBOX (took p (give-ammo p AM-SHELL 5) "Picked up a box of shotgun shells." SFX-ITEMUP)
+      SPR-BPAK (do (when (not (p 'backpack))
+                     (dotimes (i NUM-AMMO)
+                       (set! (aref (p 'max-ammo) i) (* 2 (aref (p 'max-ammo) i))))
+                     (set! (p 'backpack) true))
+                   (dotimes (i NUM-AMMO) (give-ammo p i 1))
+                   (took p true "Picked up a backpack full of ammo!" SFX-ITEMUP))
+      SPR-BFUG (took p (give-weapon p WP-BFG false) "You got the BFG9000!  Oh, yes." SFX-WPNUP)
+      SPR-MGUN (took p (give-weapon p WP-CHAINGUN dropped) "You got the chaingun!" SFX-WPNUP)
+      SPR-CSAW (took p (give-weapon p WP-CHAINSAW false) "A chainsaw!  Find some meat!" SFX-WPNUP)
+      SPR-LAUN (took p (give-weapon p WP-MISSILE false) "You got the rocket launcher!" SFX-WPNUP)
+      SPR-PLAS (took p (give-weapon p WP-PLASMA false) "You got the plasma gun!" SFX-WPNUP)
+      SPR-SHOT (took p (give-weapon p WP-SHOTGUN dropped) "You got the shotgun!" SFX-WPNUP)
+      SPR-SGN2 (took p (give-weapon p WP-SUPERSHOTGUN dropped) "You got the super shotgun!" SFX-WPNUP)
+      (do (fatal "P_SpecialThing: Unknown gettable thing") -1))))
+
+(defn touch-special-thing (special:&Mobj toucher:&Mobj):void
+  (let (delta (- (special 'z) (toucher 'z)))
+    ; Out of reach above or below.
+    (when (or (> delta (toucher 'height)) (< (delta 'v) (* -8 FRAC-UNIT))) (return))
+    (when (<= (toucher 'health) 0) (return))
+    (when-some (p (toucher 'player))
+      (let (sound (pick-up p special))
+        (when (>= sound 0)
+          (when (!= (bit-and (special 'flags) MF-COUNTITEM) 0)
+            (set! (p 'item-count) (+ (p 'item-count) 1)))
+          (remove-mobj special)
+          (set! (p 'bonus-count) (+ (p 'bonus-count) BONUSADD))
+          (when (console-player? p) (start-sound null sound)))))))
+
+(defn kill-mobj (source:?&Mobj target:&Mobj):void
+  (set! (target 'flags) (bit-and (target 'flags) (bit-not (bit-or MF-SHOOTABLE (bit-or MF-FLOAT MF-SKULLFLY)))))
+  (when (!= (target 'type) MT-SKULL)
+    (set! (target 'flags) (bit-and (target 'flags) (bit-not MF-NOGRAVITY))))
+  (set! (target 'flags) (bit-or (target 'flags) (bit-or MF-CORPSE MF-DROPOFF)))
+  (set! (target 'height) (fx-shr (target 'height) 2))
+  (let (credited false)
+    (when-some (s source)
+      (when-some (sp (s 'player))
+        (set! credited true)
+        (when (!= (bit-and (target 'flags) MF-COUNTKILL) 0)
+          (set! (sp 'kill-count) (+ (sp 'kill-count) 1)))
+        (when-some (tp (target 'player))
+          (let (n (player-num tp))
+            (set! (aref (sp 'frags) n) (+ (aref (sp 'frags) n) 1))))))
+    ; Monsters killed by other monsters, or by crushers, count for player 1.
+    (when (and (not credited) (not netgame) (!= (bit-and (target 'flags) MF-COUNTKILL) 0))
+      (let (p0 (player 0)) (set! (p0 'kill-count) (+ (p0 'kill-count) 1)))))
+  (when-some (tp (target 'player))
+    (when (null? source)
+      ; A suicide counts against yourself.
+      (let (n (player-num tp))
+        (set! (aref (tp 'frags) n) (+ (aref (tp 'frags) n) 1))))
+    (set! (target 'flags) (bit-and (target 'flags) (bit-not MF-SOLID)))
+    (set! (tp 'player-state) PST-DEAD)
+    (drop-weapon tp)
+    (when (and (console-player? tp) automap-active)
+      (set! automap-active false)))
+  (let (info (mobj-info-of target))
+    (set-mobj-state target (if (and (< (target 'health) (- 0 (info 'spawn-health)))
+                                    (!= (info 'xdeath-state) S-NULL))
+                             (info 'xdeath-state)
+                             (info 'death-state))))
+  (set! (target 'tics) (- (target 'tics) (bit-and (p-random) 3)))
+  (when (< (target 'tics) 1) (set! (target 'tics) 1))
+  ; Zombies drop their guns.
+  (let (item (case (target 'type)
+               (:or MT-WOLFSS MT-POSSESSED) MT-CLIP
+               MT-SHOTGUY MT-SHOTGUN
+               MT-CHAINGUY MT-CHAINGUN
+               -1))
+    (when (>= item 0)
+      (let (mo (spawn-mobj (target 'x) (target 'y) (Fixed ONFLOORZ) item))
+        (set! (mo 'flags) (bit-or (mo 'flags) MF-DROPPED))))))
+
+; `inflictor` is what hit (a missile, or null for a crusher or slime);
+; `source` is who to blame and fight back against.
+(defn damage-mobj (target:&Mobj inflictor:?&Mobj source:?&Mobj damage:i32):void
+  (when (= (bit-and (target 'flags) MF-SHOOTABLE) 0) (return))
+  (when (<= (target 'health) 0) (return))
+  (when (!= (bit-and (target 'flags) MF-SKULLFLY) 0)
+    (set! (target 'momx) (Fixed 0))
+    (set! (target 'momy) (Fixed 0))
+    (set! (target 'momz) (Fixed 0)))
+  (let (info (mobj-info-of target)
+        pl (target 'player))
+    (when (and (not (null? pl)) (= game-skill SK-BABY))
+      (set! damage (bit-shr damage 1)))
+    ; Knockback, except from your own chainsaw.
+    (when-some (inf inflictor)
+      (when (and (= (bit-and (target 'flags) MF-NOCLIP) 0)
+                 (if-some (s source)
+                   (if-some (sp (s 'player)) (!= (sp 'ready-weapon) WP-CHAINSAW) true)
+                   true))
+        (let (ang (point-to-angle2 (inf 'x) (inf 'y) (target 'x) (target 'y))
+              ; Overflows for a telefrag's 10000, as in the C.
+              thrust:Fixed (Fixed (/ (* (* damage (bit-shr FRAC-UNIT 3)) 100) (info 'mass)))) ; ISSUE-025
+          ; Sometimes a killing blow from below sends the body over backwards.
+          (when (and (< damage 40) (> damage (target 'health))
+                     (> ((- (target 'z) (inf 'z)) 'v) (* 64 FRAC-UNIT))
+                     (!= (bit-and (p-random) 1) 0))
+            (set! ang (+ ang ANG180))
+            (set! thrust (* thrust 4)))
+          (let (fi (fine-index ang))
+            (set! (target 'momx) (+ (target 'momx) (* thrust (fine-cosine fi))))
+            (set! (target 'momy) (+ (target 'momy) (* thrust (fine-sine fi))))))))
+    (when-some (p pl)
+      ; End-of-episode sector 11 can't kill you.
+      (when (and (= (((unsafe/cast &Subsector (target 'subsector)) 'sector) 'special) 11)
+                 (>= damage (target 'health)))
+        (set! damage (- (target 'health) 1)))
+      (when (and (< damage 1000)
+                 (or (!= (bit-and (p 'cheats) CF-GODMODE) 0)
+                     (!= (aref (p 'powers) PW-INVULNERABILITY) 0)))
+        (return))
+      (when (!= (p 'armor-type) 0)
+        (let (saved (if (= (p 'armor-type) 1) (/ damage 3) (/ damage 2)))
+          (when (<= (p 'armor-points) saved)
+            (set! saved (p 'armor-points))
+            (set! (p 'armor-type) 0))
+          (set! (p 'armor-points) (- (p 'armor-points) saved))
+          (set! damage (- damage saved))))
+      (set! (p 'health) (if (< (- (p 'health) damage) 0) 0 (- (p 'health) damage)))
+      (set! (p 'attacker) source)
+      (set! (p 'damage-count) (+ (p 'damage-count) damage))
+      (when (> (p 'damage-count) 100) (set! (p 'damage-count) 100)))
+    (set! (target 'health) (- (target 'health) damage))
+    (when (<= (target 'health) 0)
+      (kill-mobj source target)
+      (return))
+    (when (and (< (p-random) (info 'pain-chance))
+               (= (bit-and (target 'flags) MF-SKULLFLY) 0))
+      (set! (target 'flags) (bit-or (target 'flags) MF-JUSTHIT))
+      (set-mobj-state target (info 'pain-state)))
+    (set! (target 'reaction-time) 0)
+    ; Turn on the attacker, unless chasing someone already; an arch-vile is
+    ; never a target, and never stops to retarget.
+    (when-some (s source)
+      (when (and (or (= (target 'threshold) 0) (= (target 'type) MT-VILE))
+                 ; Before 1.5 a thing could make itself its own target.
+                 (or (not (= (unsafe/cast ptr s) (unsafe/cast ptr target))) (< game-version EXE-DOOM-1-5))
+                 (!= (s 'type) MT-VILE))
+        (set! (target 'target) s)
+        (set! (target 'threshold) BASETHRESHOLD)
+        (when (and (= (target 'state) (info 'spawn-state))
+                   (!= (info 'see-state) S-NULL))
+          (set-mobj-state target (info 'see-state)))))))

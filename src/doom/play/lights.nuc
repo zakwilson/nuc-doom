@@ -1,0 +1,128 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Lighting effects (p_lights.c): flickers, flashes, strobes and glows, and
+; the lines that switch lights.
+
+(ns doom.play.lights)
+
+(import-use nucleus.create)
+(import-use doom.random)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.play.thinkers)
+(import-use doom.play.spec)
+
+(defconst- GLOWSPEED 8)
+(defconst STROBEBRIGHT 5)
+(defconst FASTDARK 15)
+(defconst SLOWDARK 35)
+
+(defn fire-flicker (flick:&FireFlicker):void
+  (set! (flick 'count) (- (flick 'count) 1))
+  (when (= (flick 'count) 0)
+    (let (amount (* (bit-and (p-random) 3) 16) sec (flick 'sector))
+      (set! (sec 'light-level) (if (< (- (sec 'light-level) amount) (flick 'min-light))
+                                 (flick 'min-light)
+                                 (- (flick 'max-light) amount)))
+      (set! (flick 'count) 4))))
+
+(defn spawn-fire-flicker (sec:&Sector):void
+  (set! (sec 'special) 0)
+  (let (flick (new FireFlicker level-arena))
+    (add-thinker &(flick 'th) (Thinker-fire-flicker flick))
+    (set! (flick 'sector) sec)
+    (set! (flick 'max-light) (sec 'light-level))
+    (set! (flick 'min-light) (+ (find-min-surrounding-light sec (sec 'light-level)) 16))
+    (set! (flick 'count) 4)))
+
+(defn light-flash (flash:&LightFlash):void
+  (set! (flash 'count) (- (flash 'count) 1))
+  (when (= (flash 'count) 0)
+    (let (sec (flash 'sector))
+      (if (= (sec 'light-level) (flash 'max-light))
+        (do (set! (sec 'light-level) (flash 'min-light))
+            (set! (flash 'count) (+ (bit-and (p-random) (flash 'min-time)) 1)))
+        (do (set! (sec 'light-level) (flash 'max-light))
+            (set! (flash 'count) (+ (bit-and (p-random) (flash 'max-time)) 1)))))))
+
+(defn spawn-light-flash (sec:&Sector):void
+  (set! (sec 'special) 0)
+  (let (flash (new LightFlash level-arena))
+    (add-thinker &(flash 'th) (Thinker-light-flash flash))
+    (set! (flash 'sector) sec)
+    (set! (flash 'max-light) (sec 'light-level))
+    (set! (flash 'min-light) (find-min-surrounding-light sec (sec 'light-level)))
+    (set! (flash 'max-time) 64)
+    (set! (flash 'min-time) 7)
+    (set! (flash 'count) (+ (bit-and (p-random) (flash 'max-time)) 1))))
+
+(defn strobe-flash (flash:&Strobe):void
+  (set! (flash 'count) (- (flash 'count) 1))
+  (when (= (flash 'count) 0)
+    (let (sec (flash 'sector))
+      (if (= (sec 'light-level) (flash 'min-light))
+        (do (set! (sec 'light-level) (flash 'max-light))
+            (set! (flash 'count) (flash 'bright-time)))
+        (do (set! (sec 'light-level) (flash 'min-light))
+            (set! (flash 'count) (flash 'dark-time)))))))
+
+(defn spawn-strobe-flash (sec:&Sector dark-time:i32 in-sync:bool):void
+  (let (flash (new Strobe level-arena))
+    (add-thinker &(flash 'th) (Thinker-strobe flash))
+    (set! (flash 'sector) sec)
+    (set! (flash 'dark-time) dark-time)
+    (set! (flash 'bright-time) STROBEBRIGHT)
+    (set! (flash 'max-light) (sec 'light-level))
+    (set! (flash 'min-light) (find-min-surrounding-light sec (sec 'light-level)))
+    (when (= (flash 'min-light) (flash 'max-light)) (set! (flash 'min-light) 0))
+    (set! (sec 'special) 0)
+    (set! (flash 'count) (if in-sync 1 (+ (bit-and (p-random) 7) 1)))))
+
+(defn start-light-strobing (line:&Line):void
+  (let (secnum (find-sector-from-line-tag line -1))
+    (while (>= secnum 0)
+      (let (sec (sectors secnum))
+        (when (null? (sec 'special-data))
+          (spawn-strobe-flash sec SLOWDARK false)))
+      (set! secnum (find-sector-from-line-tag line secnum)))))
+
+(defn turn-tag-lights-off (line:&Line):void
+  (dotimes (j (table-len sectors))
+    (let (sec (sectors j))
+      (when (= (sec 'tag) (line 'tag))
+        (set! (sec 'light-level) (find-min-surrounding-light sec (sec 'light-level)))))))
+
+; 0 means the brightest neighbour of the first tagged sector; vanilla keeps
+; that level for the rest.
+(defn light-turn-on (line:&Line bright:i32):void
+  (dotimes (i (table-len sectors))
+    (let (sec (sectors i))
+      (when (= (sec 'tag) (line 'tag))
+        (when (= bright 0)
+          (dotimes (j (sec 'line-count))
+            (when-some (temp (next-sector (sector-line sec j) sec))
+              (when (> (temp 'light-level) bright) (set! bright (temp 'light-level))))))
+        (set! (sec 'light-level) bright)))))
+
+(defn glow (g:&Glow):void
+  (let (sec (g 'sector))
+    (case (g 'direction)
+      -1 (do (set! (sec 'light-level) (- (sec 'light-level) GLOWSPEED))
+             (when (<= (sec 'light-level) (g 'min-light))
+               (set! (sec 'light-level) (+ (sec 'light-level) GLOWSPEED))
+               (set! (g 'direction) 1)))
+      1 (do (set! (sec 'light-level) (+ (sec 'light-level) GLOWSPEED))
+            (when (>= (sec 'light-level) (g 'max-light))
+              (set! (sec 'light-level) (- (sec 'light-level) GLOWSPEED))
+              (set! (g 'direction) -1)))
+      (do))))
+
+(defn spawn-glowing-light (sec:&Sector):void
+  (let (g (new Glow level-arena))
+    (add-thinker &(g 'th) (Thinker-glow g))
+    (set! (g 'sector) sec)
+    (set! (g 'min-light) (find-min-surrounding-light sec (sec 'light-level)))
+    (set! (g 'max-light) (sec 'light-level))
+    (set! (g 'direction) -1)
+    (set! (sec 'special) 0)))

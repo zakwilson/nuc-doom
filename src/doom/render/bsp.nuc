@@ -84,7 +84,7 @@
               (set! (s 'first) first))))
       (when (and (not done) (> last (s 'last)))
         (let (next start crunched false)
-          (while (and (not crunched) (>= last (- ((seg-range (+ next 1)) 'first) 1)))
+          (while (and (not crunched) (>= last (- ((seg-range (+ next 1)) 'first) 1))) ; ISSUE-026
             (store-wall-range (+ ((seg-range next) 'last) 1) (- ((seg-range (+ next 1)) 'first) 1))
             (inc! next)
             (when (<= last ((seg-range next) 'last))
@@ -115,7 +115,7 @@
           (store-wall-range first (- (s 'first) 1))))
       (when (and (not done) (> last (s 'last)))
         (let (stop false)
-          (while (and (not stop) (>= last (- ((seg-range (+ start 1)) 'first) 1)))
+          (while (and (not stop) (>= last (- ((seg-range (+ start 1)) 'first) 1))) ; ISSUE-026
             (store-wall-range (+ ((seg-range start) 'last) 1) (- ((seg-range (+ start 1)) 'first) 1))
             (inc! start)
             (when (<= last ((seg-range start) 'last)) (set! stop true)))

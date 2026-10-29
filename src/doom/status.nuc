@@ -1,0 +1,17 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The status bar (st_stuff.c). Until it is drawn (milestone 5), only what the
+; game's timeline depends on: its ticker draws one m-random per level tic for
+; the face's glances.
+
+(ns doom.status)
+
+(import-use doom.random)
+
+(defvar- random-number:i32 0)
+
+(defn status-start ():void (do))
+
+(defn status-ticker ():void
+  (set! random-number (m-random)))

@@ -18,19 +18,17 @@
 (import-use doom.game)
 (import-use doom.render.main)
 (import-use doom.render.draw)
-(import-use doom.math)
-(import-use doom.world)
-(import-use doom.play.user)
+(import-use doom.sys.timer)
+(import-use doom.tichash)
+(import-use doom.wipe)
+(import-use doom.play.spec)
 
-(defvar gametic:i32 0)
+
 ; One tic per frame, as fast as possible: for -framedump and -timedemo.
 (defvar single-tics:bool false)
 (defvar quit-requested:bool false)
 
 (defvar page-name:StrView "TITLEPIC")
-
-(defn get-time ():i32
-  (unsafe/cast i32 (/ (* (as ui64 (SDL_GetTicks)) TIC-RATE) 1000)))
 
 (defn- add-wad-files ():!void
   (let (p (check-parm-with-args "-iwad" 1)
@@ -55,19 +53,12 @@
       (when (= ((unsafe/cast ptr:SDL_CommonEvent buf) 'type) SDL_QUIT)
         (set! quit-requested true)))))
 
-; Until the playsim exists, a level tic only settles the view height.
-(defn- level-ticker ():void
-  (dotimes (i MAX-PLAYERS)
-    (when (aref player-in-game i)
-      (let (p (player i))
-        (when-some (mo (p 'mo))
-          (set! on-ground (<= (mo 'z) (mo 'floorz)))
-          (calc-height p)))))
-  (inc! level-time))
-
-(defn- ticker ():void
-  (when (= game-state GS-LEVEL) (level-ticker))
-  (inc! gametic))
+; One game tic, as d_net.c's RunTic and TryRunTics do it.
+(defn- run-tic ():!void
+  (try (game-ticker))
+  (tichash-write)
+  (inc! game-tic)
+  (ok))
 
 (defn- arg-int (i:i32):i32
   (let (s (arg i) n:i32 0)
@@ -89,28 +80,43 @@
     (try (draw-patch 0 0 (try (patch-named page-name)))))
   (set! old-game-state game-state)
   (finish-update)
-  (try (framedump-check gametic))
+  (try (framedump-check game-tic))
+  ; A new game state melts in; the melt's offsets are drawn before the
+  ; next tic.
+  (when (!= game-state wipe-game-state)
+    (wipe-init-melt))
+  (set! wipe-game-state game-state)
   (ok))
 
 (defn doom-main ():!void
   (try (add-wad-files))
+  (detect-game-version)
   (set-palette (try (lump-named "PLAYPAL")))
   (try (init-renderer 9 0))
+  (init-specials)
   (set! (aref player-in-game 0) true)
   (let (p (check-parm-with-args "-warp" 2))
     (when (!= p 0)
       (try (init-new SK-MEDIUM (arg-int (+ p 1)) (arg-int (+ p 2))))))
+  (let (p (check-parm-with-args "-playdemo" 1))
+    (when (!= p 0) (defer-play-demo (arg (+ p 1)))))
+  (let (p (check-parm-with-args "-timedemo" 1))
+    (when (!= p 0)
+      (time-demo (arg (+ p 1)))
+      (set! single-tics true)))
   (framedump-init)
-  (set! single-tics (parm-exists? "-framedump"))
+  (when (parm-exists? "-framedump") (set! single-tics true))
   (try (init-graphics))
+  ; D_DoomLoop runs one tic before the first frame.
+  (try (run-tic))
   (let (last (get-time))
     (while (not quit-requested)
       (pump-events)
       (if single-tics
-        (ticker)
+        (try (run-tic))
         (let (now (get-time))
           (while (< last now)
-            (ticker)
+            (try (run-tic))
             (inc! last))))
       (try (display))
       (when (not single-tics) (SDL_Delay 1))))

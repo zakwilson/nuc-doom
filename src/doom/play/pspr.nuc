@@ -1,23 +1,323 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 ;
-; Weapon sprites (p_pspr.c).
+; Weapons (p_pspr.c, d_items.c): the player's weapon and muzzle-flash
+; sprites run their own little state machines, whose actions fire the guns.
 
 (ns doom.play.pspr)
 
 (import-use doom.math)
+(import-use doom.defs)
 (import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
 (import-use doom.world)
+(import-use doom.state)
+(import-use doom.geom)
+(import-use doom.sound)
+(import-use doom.play.mobj)
+(import-use doom.play.map)
+(import-use doom.play.inter)
+(import-use doom.play.enemy)
 
-(defconst WEAPONBOTTOM (* 128 FRAC-UNIT))
-(defconst WEAPONTOP (* 32 FRAC-UNIT))
+(defconst- LOWERSPEED (* 6 FRAC-UNIT))
+(defconst- RAISESPEED (* 6 FRAC-UNIT))
+(defconst- BFG-CELLS-PER-SHOT 40)
 
-; Until the weapon actions exist, the pistol is shown raised and ready, as it
-; is from the 17th tic of a level on.
+(defstruct WeaponInfo ammo:i32 up-state:i32 down-state:i32 ready-state:i32 atk-state:i32 flash-state:i32)
+
+(defconst weapon-info
+  (array WeaponInfo
+    (WeaponInfo AM-NOAMMO S-PUNCHUP S-PUNCHDOWN S-PUNCH S-PUNCH1 S-NULL)
+    (WeaponInfo AM-CLIP S-PISTOLUP S-PISTOLDOWN S-PISTOL S-PISTOL1 S-PISTOLFLASH)
+    (WeaponInfo AM-SHELL S-SGUNUP S-SGUNDOWN S-SGUN S-SGUN1 S-SGUNFLASH1)
+    (WeaponInfo AM-CLIP S-CHAINUP S-CHAINDOWN S-CHAIN S-CHAIN1 S-CHAINFLASH1)
+    (WeaponInfo AM-MISL S-MISSILEUP S-MISSILEDOWN S-MISSILE S-MISSILE1 S-MISSILEFLASH1)
+    (WeaponInfo AM-CELL S-PLASMAUP S-PLASMADOWN S-PLASMA S-PLASMA1 S-PLASMAFLASH1)
+    (WeaponInfo AM-CELL S-BFGUP S-BFGDOWN S-BFG S-BFG1 S-BFGFLASH1)
+    (WeaponInfo AM-NOAMMO S-SAWUP S-SAWDOWN S-SAW S-SAW1 S-NULL)
+    (WeaponInfo AM-SHELL S-DSGUNUP S-DSGUNDOWN S-DSGUN S-DSGUN1 S-DSGUNFLASH1)))
+
+(defn- ready-info (p:&Player):&WeaponInfo &(aref weapon-info (p 'ready-weapon)))
+
+(defn- psprite (p:&Player position:i32):&PspDef &(aref (p 'psprites) position))
+
+; Enters `stnum` on one of the player's sprites, running actions and going
+; on through zero-tic states, as set-mobj-state does for things.
+(defn set-psprite (p:&Player position:i32 stnum:i32):void
+  (let (psp (psprite p position) st stnum going true)
+    (while going
+      (if (= st S-NULL)
+        (do (set! (psp 'state) S-NULL)
+            (set! going false))
+        (let (s &(aref states st))
+          (set! (psp 'state) st)
+          (set! (psp 'tics) (s 'tics))
+          ; misc1/misc2 place the sprite, for the few states that move it.
+          (when (!= (s 'misc1) 0)
+            (set! (psp 'sx) (fx (s 'misc1)))
+            (set! (psp 'sy) (fx (s 'misc2))))
+          (when (!= (s 'action) A-NULL)
+            (psp-action (s 'action) p psp))
+          (if (= (psp 'state) S-NULL)
+            (set! going false)
+            (do (set! st ((aref states (psp 'state)) 'next-state))
+                (when (!= (psp 'tics) 0) (set! going false)))))))))
+
+(defn- bring-up-weapon (p:&Player):void
+  (when (= (p 'pending-weapon) WP-NOCHANGE)
+    (set! (p 'pending-weapon) (p 'ready-weapon)))
+  (when (= (p 'pending-weapon) WP-CHAINSAW)
+    (start-sound (p 'mo) SFX-SAWUP))
+  (let (new-state ((aref weapon-info (p 'pending-weapon)) 'up-state))
+    (set! (p 'pending-weapon) WP-NOCHANGE)
+    (set! ((psprite p PS-WEAPON) 'sy) (Fixed WEAPONBOTTOM))
+    (set-psprite p PS-WEAPON new-state)))
+
+(defn- has-ammo? (p:&Player ammo:i32 n:i32):bool (> (aref (p 'ammo) ammo) n))
+(defn- owns? (p:&Player w:i32):bool (!= (aref (p 'weapon-owned) w) 0))
+
+; False, and the weapon starts going down for the best one that has ammo,
+; when there isn't enough for a shot.
+(defn- check-ammo (p:&Player):bool
+  (let (ammo ((ready-info p) 'ammo)
+        count (cond (= (p 'ready-weapon) WP-BFG) BFG-CELLS-PER-SHOT
+                (= (p 'ready-weapon) WP-SUPERSHOTGUN) 2
+                true 1))
+    (if (or (= ammo AM-NOAMMO) (>= (aref (p 'ammo) ammo) count))
+      true
+      (do (set! (p 'pending-weapon)
+                (cond (and (owns? p WP-PLASMA) (has-ammo? p AM-CELL 0) (!= game-mode SHAREWARE)) WP-PLASMA
+                  (and (owns? p WP-SUPERSHOTGUN) (has-ammo? p AM-SHELL 2) (= game-mode COMMERCIAL)) WP-SUPERSHOTGUN
+                  (and (owns? p WP-CHAINGUN) (has-ammo? p AM-CLIP 0)) WP-CHAINGUN
+                  (and (owns? p WP-SHOTGUN) (has-ammo? p AM-SHELL 0)) WP-SHOTGUN
+                  (has-ammo? p AM-CLIP 0) WP-PISTOL
+                  (owns? p WP-CHAINSAW) WP-CHAINSAW
+                  (and (owns? p WP-MISSILE) (has-ammo? p AM-MISL 0)) WP-MISSILE
+                  (and (owns? p WP-BFG) (has-ammo? p AM-CELL 40) (!= game-mode SHAREWARE)) WP-BFG
+                  true WP-FIST))
+          (set-psprite p PS-WEAPON ((ready-info p) 'down-state))
+          false))))
+
+(defn- fire-weapon (p:&Player):void
+  (when (check-ammo p)
+    (let (mo (player-mobj p))
+      (set-mobj-state mo S-PLAY-ATK1)
+      (set-psprite p PS-WEAPON ((ready-info p) 'atk-state))
+      (noise-alert mo mo))))
+
+(defn drop-weapon (p:&Player):void
+  (set-psprite p PS-WEAPON ((ready-info p) 'down-state)))
+
+(defn- weapon-ready (p:&Player psp:&PspDef):void
+  (let (mo (player-mobj p))
+    ; The attack frames are done.
+    (when (or (= (mo 'state) S-PLAY-ATK1) (= (mo 'state) S-PLAY-ATK2))
+      (set-mobj-state mo S-PLAY))
+    (when (and (= (p 'ready-weapon) WP-CHAINSAW) (= (psp 'state) S-SAW))
+      (start-sound mo SFX-SAWIDL))
+    (when (or (!= (p 'pending-weapon) WP-NOCHANGE) (= (p 'health) 0))
+      (set-psprite p PS-WEAPON ((ready-info p) 'down-state))
+      (return))
+    (if (!= (bit-and ((p 'cmd) 'buttons) BT-ATTACK) 0)
+      ; Rockets and the BFG need the button released between shots.
+      (when (or (= (p 'attack-down) 0)
+                (and (!= (p 'ready-weapon) WP-MISSILE) (!= (p 'ready-weapon) WP-BFG)))
+        (set! (p 'attack-down) 1)
+        (fire-weapon p)
+        (return))
+      (set! (p 'attack-down) 0))
+    ; Bob the weapon with the player's walk.
+    (let (angle (bit-and (* 128 level-time) FINE-MASK))
+      (set! (psp 'sx) (+ FIXED-ONE (* (p 'bob) (fine-cosine angle))))
+      (set! (psp 'sy) (+ (Fixed WEAPONTOP) (* (p 'bob) (fine-sine (bit-and angle (- (/ FINE-ANGLES 2) 1)))))))))
+
+(defn- refire (p:&Player):void
+  (if (and (!= (bit-and ((p 'cmd) 'buttons) BT-ATTACK) 0)
+           (= (p 'pending-weapon) WP-NOCHANGE)
+           (!= (p 'health) 0))
+    (do (set! (p 'refire) (+ (p 'refire) 1))
+        (fire-weapon p))
+    (do (set! (p 'refire) 0)
+        (check-ammo p))))
+
+(defn- lower (p:&Player psp:&PspDef):void
+  (set! (psp 'sy) (+ (psp 'sy) (Fixed LOWERSPEED)))
+  (when (< ((psp 'sy) 'v) WEAPONBOTTOM) (return))
+  (cond (= (p 'player-state) PST-DEAD) (set! (psp 'sy) (Fixed WEAPONBOTTOM))
+    ; Dead and gone: no weapon at all.
+    (= (p 'health) 0) (set-psprite p PS-WEAPON S-NULL)
+    true (do (set! (p 'ready-weapon) (p 'pending-weapon))
+             (bring-up-weapon p))))
+
+(defn- raise (p:&Player psp:&PspDef):void
+  (set! (psp 'sy) (- (psp 'sy) (Fixed RAISESPEED)))
+  (when (<= ((psp 'sy) 'v) WEAPONTOP)
+    (set! (psp 'sy) (Fixed WEAPONTOP))
+    (set-psprite p PS-WEAPON ((ready-info p) 'ready-state))))
+
+(defn- gun-flash (p:&Player):void
+  (set-mobj-state (player-mobj p) S-PLAY-ATK2)
+  (set-psprite p PS-FLASH ((ready-info p) 'flash-state)))
+
+(defn- punch (p:&Player):void
+  (let (mo (player-mobj p)
+        damage (* (bit-shl (+ (% (p-random) 10) 1) 1)
+                  (if (!= (aref (p 'powers) PW-STRENGTH) 0) 10 1))
+        angle (+ (mo 'angle) (unsafe/cast ui32 (bit-shl (p-sub-random) 18)))
+        slope (aim-line-attack mo angle (Fixed MELEERANGE)))
+    (line-attack mo angle (Fixed MELEERANGE) slope damage)
+    (when-some (t line-target)
+      (start-sound mo SFX-PUNCH)
+      (set! (mo 'angle) (point-to-angle2 (mo 'x) (mo 'y) (t 'x) (t 'y))))))
+
+(defn- saw (p:&Player):void
+  (let (mo (player-mobj p)
+        damage (* 2 (+ (% (p-random) 10) 1))
+        angle (+ (mo 'angle) (unsafe/cast ui32 (bit-shl (p-sub-random) 18)))
+        ; One past melee range, so the puff doesn't think it's a punch.
+        range:Fixed (Fixed (+ MELEERANGE 1)) ; ISSUE-025
+        slope (aim-line-attack mo angle range))
+    (line-attack mo angle range slope damage)
+    (if-some (t line-target)
+      (do (start-sound mo SFX-SAWHIT)
+          ; Pull toward the target, a step at a time.
+          (let (an (point-to-angle2 (mo 'x) (mo 'y) (t 'x) (t 'y))
+                d:Angle (- an (mo 'angle))
+                step:Angle (/ ANG90 20)
+                snap:Angle (/ ANG90 21))
+            (if (> d ANG180)
+              (if (< (unsafe/cast i32 d) (- 0 (/ ANG90 20)))
+                (set! (mo 'angle) (+ an snap))
+                (set! (mo 'angle) (- (mo 'angle) step)))
+              (if (> d step)
+                (set! (mo 'angle) (- an snap))
+                (set! (mo 'angle) (+ (mo 'angle) step)))))
+          (set! (mo 'flags) (bit-or (mo 'flags) MF-JUSTATTACKED)))
+      (start-sound mo SFX-SAWFUL))))
+
+(defn- decrease-ammo (p:&Player amount:i32):void
+  (let (ammo ((ready-info p) 'ammo))
+    (set! (aref (p 'ammo) ammo) (- (aref (p 'ammo) ammo) amount))))
+
+(defvar- bullet-slope:Fixed (Fixed 0))
+
+; Auto-aim: straight ahead, else a little to either side.
+(defn- set-bullet-slope (mo:&Mobj):void
+  (let (an (mo 'angle) range:Fixed (Fixed (* 16 64 FRAC-UNIT))) ; ISSUE-025
+    (set! bullet-slope (aim-line-attack mo an range))
+    (when (null? line-target)
+      (set! an (+ an (bit-shl (as ui32 1) 26))) ; ISSUE-017
+      (set! bullet-slope (aim-line-attack mo an range))
+      (when (null? line-target)
+        (set! an (- an (bit-shl (as ui32 2) 26))) ; ISSUE-017
+        (set! bullet-slope (aim-line-attack mo an range))))))
+
+(defn- gun-shot (mo:&Mobj accurate:bool):void
+  (let (damage (* 5 (+ (% (p-random) 3) 1))
+        angle (mo 'angle))
+    (when (not accurate)
+      (set! angle (+ angle (unsafe/cast ui32 (bit-shl (p-sub-random) 18)))))
+    (line-attack mo angle (Fixed MISSILERANGE) bullet-slope damage)))
+
+(defn- fire-shotgun (p:&Player):void
+  (let (mo (player-mobj p))
+    (start-sound mo SFX-SHOTGN)
+    (set-mobj-state mo S-PLAY-ATK2)
+    (decrease-ammo p 1)
+    (set-psprite p PS-FLASH ((ready-info p) 'flash-state))
+    (set-bullet-slope mo)
+    (dotimes (i 7) (gun-shot mo false))))
+
+(defn- fire-shotgun2 (p:&Player):void
+  (let (mo (player-mobj p))
+    (start-sound mo SFX-DSHTGN)
+    (set-mobj-state mo S-PLAY-ATK2)
+    (decrease-ammo p 2)
+    (set-psprite p PS-FLASH ((ready-info p) 'flash-state))
+    (set-bullet-slope mo)
+    (dotimes (i 20)
+      (let (damage (* 5 (+ (% (p-random) 3) 1))
+            angle (+ (mo 'angle) (unsafe/cast ui32 (bit-shl (p-sub-random) ANGLE-TO-FINE-SHIFT))))
+        (line-attack mo angle (Fixed MISSILERANGE)
+                     (+ bullet-slope (Fixed (bit-shl (p-sub-random) 5))) damage)))))
+
+(defn- fire-cgun (p:&Player psp:&PspDef):void
+  (start-sound (p 'mo) SFX-PISTOL)
+  (when (!= (aref (p 'ammo) ((ready-info p) 'ammo)) 0)
+    ; The two firing frames light the two flash frames.
+    (fire-bullet p (+ ((ready-info p) 'flash-state) (- (psp 'state) S-CHAIN1)))))
+
+; The first shot of a burst is accurate.
+(defn- fire-bullet (p:&Player flash-state:i32):void
+  (let (mo (player-mobj p))
+    (set-mobj-state mo S-PLAY-ATK2)
+    (decrease-ammo p 1)
+    (set-psprite p PS-FLASH flash-state)
+    (set-bullet-slope mo)
+    (gun-shot mo (= (p 'refire) 0))))
+
+(defn- fire-missile (p:&Player type:i32 ammo:i32):void
+  (decrease-ammo p ammo)
+  (spawn-player-missile (player-mobj p) type))
+
+(defn- fire-plasma (p:&Player):void
+  (decrease-ammo p 1)
+  (set-psprite p PS-FLASH (+ ((ready-info p) 'flash-state) (bit-and (p-random) 1)))
+  (spawn-player-missile (player-mobj p) MT-PLASMA))
+
+; The BFG ball's death: 40 tracers fanned out from where its shooter faces.
+(defn bfg-spray (mo:&Mobj):void
+  (let (shooter (unsafe/cast &Mobj (mo 'target)))
+    (dotimes (i 40)
+      (let (an (+ (- (mo 'angle) ANG45) (* (as ui32 (/ ANG90 40)) (unsafe/cast ui32 i)))) ; ISSUE-017
+        (aim-line-attack shooter an (Fixed (* 16 64 FRAC-UNIT)))
+        (when-some (t line-target)
+          (spawn-mobj (t 'x) (t 'y) (+ (t 'z) (fx-shr (t 'height) 2)) MT-EXTRABFG)
+          (let (damage:i32 0)
+            (dotimes (j 15) (set! damage (+ damage (+ (bit-and (p-random) 7) 1))))
+            (damage-mobj t shooter shooter damage)))))))
+
+(defn- psp-action (action:i32 p:&Player psp:&PspDef):void
+  (case action
+    A-LIGHT0 (set! (p 'extra-light) 0)
+    A-LIGHT1 (set! (p 'extra-light) 1)
+    A-LIGHT2 (set! (p 'extra-light) 2)
+    A-WEAPONREADY (weapon-ready p psp)
+    A-LOWER (lower p psp)
+    A-RAISE (raise p psp)
+    A-PUNCH (punch p)
+    A-REFIRE (refire p)
+    A-CHECKRELOAD (check-ammo p)
+    A-FIREPISTOL (do (start-sound (p 'mo) SFX-PISTOL)
+                     (fire-bullet p ((ready-info p) 'flash-state)))
+    A-FIRESHOTGUN (fire-shotgun p)
+    A-FIRESHOTGUN2 (fire-shotgun2 p)
+    A-OPENSHOTGUN2 (start-sound (p 'mo) SFX-DBOPN)
+    A-LOADSHOTGUN2 (start-sound (p 'mo) SFX-DBLOAD)
+    A-CLOSESHOTGUN2 (do (start-sound (p 'mo) SFX-DBCLS) (refire p))
+    A-FIRECGUN (fire-cgun p psp)
+    A-GUNFLASH (gun-flash p)
+    A-FIREMISSILE (fire-missile p MT-ROCKET 1)
+    A-SAW (saw p)
+    A-FIREPLASMA (fire-plasma p)
+    A-BFGSOUND (start-sound (p 'mo) SFX-BFG)
+    A-FIREBFG (fire-missile p MT-BFG BFG-CELLS-PER-SHOT)
+    (do)))
+
 (defn setup-psprites (p:&Player):void
   (dotimes (i NUM-PSPRITES)
-    (set! (&(aref (p 'psprites) i) 'state) S-NULL))
-  (let (w &(aref (p 'psprites) PS-WEAPON))
-    (set! (w 'state) S-PISTOL)
-    (set! (w 'sx) FIXED-ONE)
-    (set! (w 'sy) (Fixed WEAPONTOP))))
+    (set! ((psprite p i) 'state) S-NULL))
+  (set! (p 'pending-weapon) (p 'ready-weapon))
+  (bring-up-weapon p))
+
+(defn move-psprites (p:&Player):void
+  (dotimes (i NUM-PSPRITES)
+    (let (psp (psprite p i))
+      (when (and (!= (psp 'state) S-NULL) (!= (psp 'tics) -1))
+        (set! (psp 'tics) (- (psp 'tics) 1))
+        (when (= (psp 'tics) 0)
+          (set-psprite p i ((aref states (psp 'state)) 'next-state))))))
+  (let (w (psprite p PS-WEAPON) f (psprite p PS-FLASH))
+    (set! (f 'sx) (w 'sx))
+    (set! (f 'sy) (w 'sy))))

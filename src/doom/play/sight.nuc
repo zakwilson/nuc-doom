@@ -1,0 +1,121 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Line of sight (p_sight.c): the REJECT table first, then a walk down the BSP
+; along the line between the two things, narrowing the visible slope window
+; at each two-sided line it crosses.
+
+(ns doom.play.sight)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.play.maputl)
+
+(defvar- sight-zstart:Fixed (Fixed 0))
+(defvar- top-slope:Fixed (Fixed 0))
+(defvar- bottom-slope:Fixed (Fixed 0))
+(defvar- strace:Divline (Divline (Fixed 0) (Fixed 0) (Fixed 0) (Fixed 0)))
+(defvar- t2x:Fixed (Fixed 0))
+(defvar- t2y:Fixed (Fixed 0))
+
+; 0 front, 1 back, 2 on the line.
+(defn- divline-side (x:Fixed y:Fixed node:&Divline):i32
+  (let (ndx ((node 'dx) 'v) ndy ((node 'dy) 'v))
+    (cond (= ndx 0)
+      (cond (= x (node 'x)) 2
+        (<= x (node 'x)) (if (> ndy 0) 1 0)
+        true (if (< ndy 0) 1 0))
+      (= ndy 0)
+      ; Vanilla compares x with the line's y here; sight depends on it.
+      (cond (= (x 'v) ((node 'y) 'v)) 2
+        (<= y (node 'y)) (if (< ndx 0) 1 0)
+        true (if (> ndx 0) 1 0))
+      true
+      (let (dx ((- x (node 'x)) 'v) dy ((- y (node 'y)) 'v)
+            left (* (bit-shr ndy FRAC-BITS) (bit-shr dx FRAC-BITS))
+            right (* (bit-shr dy FRAC-BITS) (bit-shr ndx FRAC-BITS)))
+        (cond (< right left) 0
+          (= left right) 2
+          true 1)))))
+
+(defn- cross-subsector (num:i32):bool
+  (let (sub (subsectors num) count (sub 'num-lines) i:i32 0 result true)
+    (while (and result (< i count))
+      (let (seg (segs (+ (sub 'first-line) i)) line (seg 'line-def))
+        (when (!= (line 'validcount) validcount)
+          (set! (line 'validcount) validcount)
+          (let (v1 (line 'v1) v2 (line 'v2))
+            (when (!= (divline-side (v1 'x) (v1 'y) &strace) (divline-side (v2 'x) (v2 'y) &strace))
+              (let (divl:Divline (Divline (v1 'x) (v1 'y) (- (v2 'x) (v1 'x)) (- (v2 'y) (v1 'y))))
+                (when (!= (divline-side (strace 'x) (strace 'y) &divl) (divline-side t2x t2y &divl))
+                  (if (or (null? (line 'back-sector)) (= (bit-and (line 'flags) ML-TWOSIDED) 0))
+                    (set! result false)
+                    (let (front (seg 'front-sector) back (unsafe/cast &Sector (seg 'back-sector)))
+                      (when (or (!= (front 'floor-height) (back 'floor-height))
+                                (!= (front 'ceiling-height) (back 'ceiling-height)))
+                        (let (opentop (if (< (front 'ceiling-height) (back 'ceiling-height))
+                                        (front 'ceiling-height) (back 'ceiling-height))
+                              openbottom (if (> (front 'floor-height) (back 'floor-height))
+                                           (front 'floor-height) (back 'floor-height)))
+                          (if (>= openbottom opentop)
+                            (set! result false)
+                            (let (frac (intercept-vector &strace &divl))
+                              (when (!= (front 'floor-height) (back 'floor-height))
+                                (let (slope (/ (- openbottom sight-zstart) frac))
+                                  (when (> slope bottom-slope) (set! bottom-slope slope))))
+                              (when (!= (front 'ceiling-height) (back 'ceiling-height))
+                                (let (slope (/ (- opentop sight-zstart) frac))
+                                  (when (< slope top-slope) (set! top-slope slope))))
+                              (when (<= top-slope bottom-slope) (set! result false)))))))))))))
+        (inc! i)))
+    result))
+
+(defn- node-divline (n:&Node):Divline (Divline (n 'x) (n 'y) (n 'dx) (n 'dy)))
+
+(defn- cross-bsp-node (bspnum:i32):bool
+  (if (!= (bit-and bspnum NF-SUBSECTOR) 0)
+    (cross-subsector (if (= bspnum -1) 0 (bit-and bspnum (bit-not NF-SUBSECTOR))))
+    (let (bsp (nodes bspnum)
+          dl (node-divline bsp)
+          s (divline-side (strace 'x) (strace 'y) &dl)
+          side (if (= s 2) 0 s))
+      (cond (not (cross-bsp-node (aref (bsp 'children) side))) false
+        (= side (divline-side t2x t2y &dl)) true
+        true (cross-bsp-node (aref (bsp 'children) (bit-xor side 1)))))))
+
+; Doom 1.2 walked the blockmap instead of the BSP; demos from it need the
+; same answers. Early-out has already stopped at any one-sided line.
+(defn- sight-traverse (in:&Intercept):bool
+  (let (li (unsafe/cast &Line (in 'line))
+        front (unsafe/cast &Sector (li 'front-sector))
+        back (unsafe/cast &Sector (li 'back-sector)))
+    (line-opening li)
+    (when (>= open-bottom open-top) (return false))
+    (when (!= (front 'floor-height) (back 'floor-height))
+      (let (slope (/ (- open-bottom sight-zstart) (in 'frac)))
+        (when (> slope bottom-slope) (set! bottom-slope slope))))
+    (when (!= (front 'ceiling-height) (back 'ceiling-height))
+      (let (slope (/ (- open-top sight-zstart) (in 'frac)))
+        (when (< slope top-slope) (set! top-slope slope))))
+    (> top-slope bottom-slope)))
+
+(defn check-sight (t1:&Mobj t2:&Mobj):bool
+  (let (s1 (index-of sectors ((unsafe/cast &Subsector (t1 'subsector)) 'sector))
+        s2 (index-of sectors ((unsafe/cast &Subsector (t2 'subsector)) 'sector))
+        pnum (+ (* s1 (table-len sectors)) s2))
+    (if (!= (bit-and (as i32 @(reject-matrix (bit-shr pnum 3))) (bit-shl 1 (bit-and pnum 7))) 0)
+      false
+      (do (inc! validcount)
+          (set! sight-zstart (- (+ (t1 'z) (t1 'height)) (fx-shr (t1 'height) 2)))
+          (set! top-slope (- (+ (t2 'z) (t2 'height)) sight-zstart))
+          (set! bottom-slope (- (t2 'z) sight-zstart))
+          (when (<= game-version EXE-DOOM-1-2)
+            (return (path-traverse (t1 'x) (t1 'y) (t2 'x) (t2 'y)
+                                   (bit-or PT-EARLYOUT PT-ADDLINES) sight-traverse)))
+          (set! strace (Divline (t1 'x) (t1 'y) (- (t2 'x) (t1 'x)) (- (t2 'y) (t1 'y))))
+          (set! t2x (t2 'x))
+          (set! t2y (t2 'y))
+          (cross-bsp-node (- (table-len nodes) 1))))))

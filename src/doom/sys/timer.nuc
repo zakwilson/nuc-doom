@@ -1,0 +1,13 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The tic clock (i_timer.c).
+
+(ns doom.sys.timer)
+
+(import-use "SDL2/SDL.h")
+(import-use doom.defs)
+
+; Wall-clock time in tics since SDL started.
+(defn get-time ():i32
+  (unsafe/cast i32 (/ (* (as ui64 (SDL_GetTicks)) TIC-RATE) 1000)))

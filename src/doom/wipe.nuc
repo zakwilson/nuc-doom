@@ -1,0 +1,23 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The screen melt (f_wipe.c). Its column offsets come from m-random, and
+; demo sync sees those draws, so they are made even before the melt is drawn
+; (milestone 5).
+
+(ns doom.wipe)
+
+(import-use doom.random)
+(import-use doom.video)
+
+; How far down each column starts; a column moves once it reaches 0.
+(defvar melt-y:(array i32 320))
+
+(defn wipe-init-melt ():void
+  (set! (aref melt-y 0) (- 0 (% (m-random) 16)))
+  (let (i:i32 1)
+    (while (< i SCREEN-WIDTH)
+      (let (r (- (% (m-random) 3) 1)
+            y (+ (aref melt-y (- i 1)) r))
+        (set! (aref melt-y i) (cond (> y 0) 0 (= y -16) -15 true y)))
+      (inc! i))))

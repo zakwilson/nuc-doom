@@ -1,8 +1,8 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 ;
-; Things (p_mobj.c, and the position links from p_maputl.c): spawning, and
-; linking each thing into its sector's and blockmap cell's lists.
+; Things (p_mobj.c): the state machine, momentum and gravity, spawning and
+; removal, missiles, puffs and blood.
 
 (ns doom.play.mobj)
 
@@ -10,61 +10,236 @@
 (import-use doom.math)
 (import-use doom.defs)
 (import-use doom.info)
+(import-use doom.sounds)
 (import-use doom.table)
 (import-use doom.system)
 (import-use doom.random)
 (import-use doom.world)
 (import-use doom.state)
 (import-use doom.geom)
-(import-use doom.play.tick)
+(import-use doom.sound)
+(import-use doom.render.main)
+(import-use doom.play.thinkers)
+(import-use doom.play.maputl)
+(import-use doom.play.map)
 (import-use doom.play.setup)
 (import-use doom.play.pspr)
+(import-use doom.play.enemy)
 (import-use doom.game)
+(import-use doom.status)
+
+(defconst- STOPSPEED 0x1000)
+(defconst- FRICTION 0xe800)
+(defconst- ITEMQUESIZE 128)
 
 (defn mobj-info-of (m:&Mobj):&MobjInfo &(aref mobj-info (m 'type)))
 
-(defn- block-of (x:Fixed y:Fixed):i32
-  (let (bx (bit-shr ((- x bmap-org-x) 'v) MAPBLOCKSHIFT)
-        by (bit-shr ((- y bmap-org-y) 'v) MAPBLOCKSHIFT))
-    (if (and (>= bx 0) (< bx bmap-width) (>= by 0) (< by bmap-height))
-      (+ (* by bmap-width) bx)
-      -1)))
+(defn removed? (m:&Mobj):bool (= ((m 'th) 'state) TH-REMOVED))
 
-; Unlinks a thing from its sector and blockmap lists, before it moves.
-(defn unset-thing-position (thing:&Mobj):void
-  (when (= (bit-and (thing 'flags) MF-NOSECTOR) 0)
-    (when-some (n (thing 'snext)) (set! (n 'sprev) (thing 'sprev)))
-    (if-some (p (thing 'sprev))
-      (set! (p 'snext) (thing 'snext))
-      (when-some (ss (thing 'subsector))
-        (set! ((ss 'sector) 'thing-list) (thing 'snext)))))
-  (when (= (bit-and (thing 'flags) MF-NOBLOCKMAP) 0)
-    (when-some (n (thing 'bnext)) (set! (n 'bprev) (thing 'bprev)))
-    (if-some (p (thing 'bprev))
-      (set! (p 'bnext) (thing 'bnext))
-      (let (b (block-of (thing 'x) (thing 'y)))
-        (when (>= b 0) (set! ((blocklinks b) 'head) (thing 'bnext))))))) ; ISSUE-013
+; Enters `state`, running its action, and goes on through zero-tic states.
+; False if the thing removed itself (S_NULL).
+(defn set-mobj-state (mobj:&Mobj state:i32):bool
+  (let (st state alive true going true cycles:i32 0)
+    (while going
+      (if (= st S-NULL)
+        (do (set! (mobj 'state) S-NULL)
+            (remove-mobj mobj)
+            (set! alive false)
+            (set! going false))
+        (let (s &(aref states st))
+          (set! (mobj 'state) st)
+          (set! (mobj 'tics) (s 'tics))
+          (set! (mobj 'sprite) (s 'sprite))
+          (set! (mobj 'frame) (s 'frame))
+          (when (!= (s 'action) A-NULL) (mobj-action (s 'action) mobj))
+          (set! st (s 'next-state))
+          (inc! cycles)
+          (when (> cycles 1000000) (fatal "P_SetMobjState: Infinite state cycle detected!"))
+          (when (!= (mobj 'tics) 0) (set! going false)))))
+    alive))
 
-; Links a thing in at its current position, at the head of each list.
-(defn set-thing-position (thing:&Mobj):void
-  (let (ss (point-in-subsector (thing 'x) (thing 'y)))
-    (set! (thing 'subsector) ss)
-    (when (= (bit-and (thing 'flags) MF-NOSECTOR) 0)
-      (let (sec (ss 'sector))
-        (set! (thing 'sprev) null)
-        (set! (thing 'snext) (sec 'thing-list))
-        (when-some (h (sec 'thing-list)) (set! (h 'sprev) thing))
-        (set! (sec 'thing-list) thing)))
-    (when (= (bit-and (thing 'flags) MF-NOBLOCKMAP) 0)
-      (let (b (block-of (thing 'x) (thing 'y)))
-        (if (>= b 0)
-          (let (link (blocklinks b)) ; ISSUE-013
-            (set! (thing 'bprev) null)
-            (set! (thing 'bnext) (link 'head))
-            (when-some (h (link 'head)) (set! (h 'bprev) thing))
-            (set! (link 'head) thing))
-          (do (set! (thing 'bnext) null)
-              (set! (thing 'bprev) null)))))))
+(defn explode-missile (mo:&Mobj):void
+  (set! (mo 'momx) (Fixed 0))
+  (set! (mo 'momy) (Fixed 0))
+  (set! (mo 'momz) (Fixed 0))
+  (set-mobj-state mo ((mobj-info-of mo) 'death-state))
+  (set! (mo 'tics) (- (mo 'tics) (bit-and (p-random) 3)))
+  (when (< (mo 'tics) 1) (set! (mo 'tics) 1))
+  (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-MISSILE)))
+  (when (!= ((mobj-info-of mo) 'death-sound) 0)
+    (start-sound mo ((mobj-info-of mo) 'death-sound))))
+
+(defn- clamp-move (v:Fixed):Fixed
+  (cond (> (v 'v) MAXMOVE) (Fixed MAXMOVE)
+    (< (v 'v) (- 0 MAXMOVE)) (Fixed (- 0 MAXMOVE))
+    true v))
+
+(defn- sky-ceiling-line? ():bool
+  (if-some (cl ceiling-line)
+    (if-some (back (cl 'back-sector))
+      (= (back 'ceiling-pic) sky-flat-num)
+      false)
+    false))
+
+(defn- xy-movement (mo:&Mobj):void
+  (if (and (= ((mo 'momx) 'v) 0) (= ((mo 'momy) 'v) 0))
+    ; A lost soul that stopped charging.
+    (when (!= (bit-and (mo 'flags) MF-SKULLFLY) 0)
+      (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-SKULLFLY)))
+      (set! (mo 'momz) (Fixed 0))
+      (set-mobj-state mo ((mobj-info-of mo) 'spawn-state)))
+    (let (pl (mo 'player) gone false)
+      (set! (mo 'momx) (clamp-move (mo 'momx)))
+      (set! (mo 'momy) (clamp-move (mo 'momy)))
+      ; Long moves go in halves so they can't skip through thin walls.
+      (let (xmove (mo 'momx) ymove (mo 'momy) going true)
+        (while going
+          (let (ptryx:Fixed (Fixed 0) ptryy:Fixed (Fixed 0))
+            (if (or (> (xmove 'v) (/ MAXMOVE 2)) (> (ymove 'v) (/ MAXMOVE 2)))
+              (do (set! ptryx (+ (mo 'x) (/ xmove 2)))
+                  (set! ptryy (+ (mo 'y) (/ ymove 2)))
+                  (set! xmove (fx-shr xmove 1))
+                  (set! ymove (fx-shr ymove 1)))
+              (do (set! ptryx (+ (mo 'x) xmove))
+                  (set! ptryy (+ (mo 'y) ymove))
+                  (set! xmove (Fixed 0))
+                  (set! ymove (Fixed 0))))
+            (when (not (try-move mo ptryx ptryy))
+              (cond (not (null? (mo 'player))) (slide-move mo)
+                (!= (bit-and (mo 'flags) MF-MISSILE) 0)
+                (do (if (sky-ceiling-line?)
+                      ; Missiles vanish into the sky.
+                      (remove-mobj mo)
+                      (explode-missile mo))
+                    (set! gone true)
+                    (set! going false))
+                true (do (set! (mo 'momx) (Fixed 0))
+                         (set! (mo 'momy) (Fixed 0))))))
+          (when (and (= (xmove 'v) 0) (= (ymove 'v) 0)) (set! going false))))
+      (when (not gone)
+        (friction mo pl)))))
+
+(defn- friction (mo:&Mobj pl:?&Player):void
+  (let (stop false)
+    (when-some (p pl)
+      (when (!= (bit-and (p 'cheats) CF-NOMOMENTUM) 0)
+        (set! (mo 'momx) (Fixed 0))
+        (set! (mo 'momy) (Fixed 0))
+        (set! stop true)))
+    (cond stop (do)
+      ; No friction for missiles, charging skulls, or in the air.
+      (!= (bit-and (mo 'flags) (bit-or MF-MISSILE MF-SKULLFLY)) 0) (do)
+      (> (mo 'z) (mo 'floorz)) (do)
+      ; A corpse sliding off a step keeps going.
+      (and (!= (bit-and (mo 'flags) MF-CORPSE) 0)
+           (or (> ((mo 'momx) 'v) (/ FRAC-UNIT 4)) (< ((mo 'momx) 'v) (/ FRAC-UNIT -4))
+               (> ((mo 'momy) 'v) (/ FRAC-UNIT 4)) (< ((mo 'momy) 'v) (/ FRAC-UNIT -4)))
+           (!= (mo 'floorz) (((unsafe/cast &Subsector (mo 'subsector)) 'sector) 'floor-height))) (do)
+      (and (> ((mo 'momx) 'v) (- 0 STOPSPEED)) (< ((mo 'momx) 'v) STOPSPEED)
+           (> ((mo 'momy) 'v) (- 0 STOPSPEED)) (< ((mo 'momy) 'v) STOPSPEED)
+           (if-some (p pl)
+             (and (= ((p 'cmd) 'forward-move) 0) (= ((p 'cmd) 'side-move) 0))
+             true))
+      (do (when-some (p pl)
+            (when-some (pmo (p 'mo))
+              ; Stop the running animation.
+              (let (d (- (pmo 'state) S-PLAY-RUN1))
+                (when (and (>= d 0) (< d 4)) (set-mobj-state pmo S-PLAY)))))
+          (set! (mo 'momx) (Fixed 0))
+          (set! (mo 'momy) (Fixed 0)))
+      true
+      (do (set! (mo 'momx) (* (mo 'momx) (Fixed FRICTION)))
+          (set! (mo 'momy) (* (mo 'momy) (Fixed FRICTION)))))))
+
+(defn- z-movement (mo:&Mobj):void
+  ; Stepping up: squat the view and let it rise back.
+  (when-some (p (mo 'player))
+    (when (< (mo 'z) (mo 'floorz))
+      (set! (p 'view-height) (- (p 'view-height) (- (mo 'floorz) (mo 'z))))
+      (set! (p 'delta-view-height) (fx-shr (- (Fixed VIEWHEIGHT) (p 'view-height)) 3))))
+  (set! (mo 'z) (+ (mo 'z) (mo 'momz)))
+  ; Floaters drift toward their target's height.
+  (when (and (!= (bit-and (mo 'flags) MF-FLOAT) 0)
+             (= (bit-and (mo 'flags) (bit-or MF-SKULLFLY MF-INFLOAT)) 0))
+    (when-some (t (mo 'target))
+      (let (dist (approx-distance (- (mo 'x) (t 'x)) (- (mo 'y) (t 'y)))
+            delta (- (+ (t 'z) (fx-shr (mo 'height) 1)) (mo 'z)))
+        (cond (and (< (delta 'v) 0) (< dist (fx-neg (* delta 3))))
+          (set! (mo 'z) (- (mo 'z) (Fixed FLOATSPEED)))
+          (and (> (delta 'v) 0) (< dist (* delta 3)))
+          (set! (mo 'z) (+ (mo 'z) (Fixed FLOATSPEED)))))))
+  (let (exploded false)
+    (if (<= (mo 'z) (mo 'floorz))
+      (do (when (< ((mo 'momz) 'v) 0)
+            (when-some (p (mo 'player))
+              (when (< ((mo 'momz) 'v) (* GRAVITY -8))
+                ; A hard landing.
+                (set! (p 'delta-view-height) (fx-shr (mo 'momz) 3))
+                (start-sound mo SFX-OOF)))
+            (set! (mo 'momz) (Fixed 0)))
+          (set! (mo 'z) (mo 'floorz))
+          ; Before Ultimate Doom a lost soul's bounce comes after the momz
+          ; reset above, so it doesn't bounce.
+          (when (!= (bit-and (mo 'flags) MF-SKULLFLY) 0)
+            (set! (mo 'momz) (fx-neg (mo 'momz))))
+          (when (and (!= (bit-and (mo 'flags) MF-MISSILE) 0)
+                     (= (bit-and (mo 'flags) MF-NOCLIP) 0))
+            (explode-missile mo)
+            (set! exploded true)))
+      (when (= (bit-and (mo 'flags) MF-NOGRAVITY) 0)
+        (if (= ((mo 'momz) 'v) 0)
+          (set! (mo 'momz) (Fixed (* GRAVITY -2)))
+          (set! (mo 'momz) (- (mo 'momz) (Fixed GRAVITY))))))
+    (when (and (not exploded) (> (+ (mo 'z) (mo 'height)) (mo 'ceilingz)))
+      (when (> ((mo 'momz) 'v) 0) (set! (mo 'momz) (Fixed 0)))
+      (set! (mo 'z) (- (mo 'ceilingz) (mo 'height)))
+      (when (!= (bit-and (mo 'flags) MF-SKULLFLY) 0)
+        (set! (mo 'momz) (fx-neg (mo 'momz))))
+      (when (and (!= (bit-and (mo 'flags) MF-MISSILE) 0)
+                 (= (bit-and (mo 'flags) MF-NOCLIP) 0))
+        (explode-missile mo)))))
+
+(defn mapthing-angle (mt:&MapThing):Angle (* ANG45 (unsafe/cast ui32 (/ (mt 'angle) 45))))
+
+(defn- nightmare-respawn (mobj:&Mobj):void
+  (let (sp &(mobj 'spawn-point)
+        x (fx (sp 'x)) y (fx (sp 'y)))
+    (when (check-position mobj x y)
+      (let (fog1 (spawn-mobj (mobj 'x) (mobj 'y)
+                             (((unsafe/cast &Subsector (mobj 'subsector)) 'sector) 'floor-height) MT-TFOG))
+        (start-sound fog1 SFX-TELEPT))
+      (let (fog2 (spawn-mobj x y (((point-in-subsector x y) 'sector) 'floor-height) MT-TFOG))
+        (start-sound fog2 SFX-TELEPT))
+      (let (z (if (!= (bit-and ((mobj-info-of mobj) 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ)
+            mo (spawn-mobj x y (Fixed z) (mobj 'type)))
+        (set! (mo 'spawn-point) @sp)
+        (set! (mo 'angle) (mapthing-angle sp))
+        (when (!= (bit-and (sp 'options) MTF-AMBUSH) 0)
+          (set! (mo 'flags) (bit-or (mo 'flags) MF-AMBUSH)))
+        (set! (mo 'reaction-time) 18))
+      (remove-mobj mobj))))
+
+(defn mobj-thinker (mobj:&Mobj):void
+  (let (alive true)
+    (when (or (!= ((mobj 'momx) 'v) 0) (!= ((mobj 'momy) 'v) 0)
+              (!= (bit-and (mobj 'flags) MF-SKULLFLY) 0))
+      (xy-movement mobj)
+      (when (removed? mobj) (set! alive false)))
+    (when (and alive (or (!= (mobj 'z) (mobj 'floorz)) (!= ((mobj 'momz) 'v) 0)))
+      (z-movement mobj)
+      (when (removed? mobj) (set! alive false)))
+    (when alive
+      (if (!= (mobj 'tics) -1)
+        (do (set! (mobj 'tics) (- (mobj 'tics) 1))
+            (when (= (mobj 'tics) 0)
+              (set-mobj-state mobj ((aref states (mobj 'state)) 'next-state))))
+        ; Nightmare monsters come back.
+        (when (and (!= (bit-and (mobj 'flags) MF-COUNTKILL) 0) respawn-monsters)
+          (set! (mobj 'movecount) (+ (mobj 'movecount) 1))
+          (when (and (>= (mobj 'movecount) (* 12 TIC-RATE))
+                     (= (bit-and level-time 31) 0)
+                     (<= (p-random) 4))
+            (nightmare-respawn mobj)))))))
 
 (defn spawn-mobj (x:Fixed y:Fixed z:Fixed type:i32):&Mobj
   (let (m (new Mobj level-arena)
@@ -94,7 +269,48 @@
     (add-thinker &(m 'th) (Thinker-mobj m))
     m))
 
-(defn- spawn-player (mt:MapThing):void
+;; Items picked up in deathmatch 2 come back; this queue remembers them.
+
+(defvar- item-respawn-que:(array MapThing 128))
+(defvar- item-respawn-time:(array i32 128))
+(defvar item-que-head:i32 0)
+(defvar item-que-tail:i32 0)
+
+(defn remove-mobj (mobj:&Mobj):void
+  (when (and (!= (bit-and (mobj 'flags) MF-SPECIAL) 0)
+             (= (bit-and (mobj 'flags) MF-DROPPED) 0)
+             (!= (mobj 'type) MT-INV) (!= (mobj 'type) MT-INS))
+    (set! (aref item-respawn-que item-que-head) (mobj 'spawn-point))
+    (set! (aref item-respawn-time item-que-head) level-time)
+    (set! item-que-head (bit-and (+ item-que-head 1) (- ITEMQUESIZE 1)))
+    (when (= item-que-head item-que-tail)
+      (set! item-que-tail (bit-and (+ item-que-tail 1) (- ITEMQUESIZE 1)))))
+  (unset-thing-position mobj)
+  (remove-thinker &(mobj 'th)))
+
+(defn- type-of-doomed-num (n:i32):i32
+  (let (i:i32 0)
+    (while (and (< i NUM-MOBJ-TYPES) (!= n ((aref mobj-info i) 'doomed-num)))
+      (inc! i))
+    i))
+
+(defn respawn-specials ():void
+  (when (and (= deathmatch 2) (!= item-que-head item-que-tail)
+             (>= (- level-time (aref item-respawn-time item-que-tail)) (* 30 TIC-RATE)))
+    (let (mt &(aref item-respawn-que item-que-tail)
+          x (fx (mt 'x)) y (fx (mt 'y))
+          fog (spawn-mobj x y (((point-in-subsector x y) 'sector) 'floor-height) MT-IFOG))
+      (start-sound fog SFX-ITMBK)
+      (let (i (type-of-doomed-num (mt 'type)))
+        (when (>= i NUM-MOBJ-TYPES)
+          (fatal "P_RespawnSpecials: Failed to find mobj type with doomednum"))
+        (let (z (if (!= (bit-and ((aref mobj-info i) 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ)
+              mo (spawn-mobj x y (Fixed z) i))
+          (set! (mo 'spawn-point) @mt)
+          (set! (mo 'angle) (mapthing-angle mt))))
+      (set! item-que-tail (bit-and (+ item-que-tail 1) (- ITEMQUESIZE 1))))))
+
+(defn spawn-player (mt:MapThing):void
   (when (and (!= (mt 'type) 0) (aref player-in-game (- (mt 'type) 1)))
     (let (pn (- (mt 'type) 1)
           p (player pn))
@@ -103,7 +319,7 @@
         ; Players 2-4 are drawn with their colour remapped.
         (when (> (mt 'type) 1)
           (set! (m 'flags) (bit-or (m 'flags) (bit-shl (- (mt 'type) 1) MF-TRANSSHIFT))))
-        (set! (m 'angle) (* ANG45 (unsafe/cast ui32 (/ (mt 'angle) 45))))
+        (set! (m 'angle) (mapthing-angle &mt))
         (set! (m 'player) p)
         (set! (m 'health) (p 'health))
         (set! (p 'mo) m)
@@ -117,34 +333,109 @@
         (set! (p 'view-height) (Fixed VIEWHEIGHT))
         (setup-psprites p)
         (when (!= deathmatch 0)
-          (dotimes (i NUM-CARDS) (set! (aref (p 'cards) i) true)))))))
+          (dotimes (i NUM-CARDS) (set! (aref (p 'cards) i) true)))
+        (when (= pn console-player)
+          (status-start))))))
 
 (defn spawn-map-thing (mt:MapThing):void
   (cond (= (mt 'type) 11) (when (< deathmatch-count 10)
-       (set! (aref deathmatch-starts deathmatch-count) mt)
-       (inc! deathmatch-count))
+                            (set! (aref deathmatch-starts deathmatch-count) mt)
+                            (inc! deathmatch-count))
     (<= (mt 'type) 0) (do)
-    (<= (mt 'type) 4) (do (set! (aref player-starts (- (mt 'type) 1)) mt) (set! (aref player-start-in-game (- (mt 'type) 1)) true) (when (= deathmatch 0) (spawn-player mt)))
+    (<= (mt 'type) 4) (do (set! (aref player-starts (- (mt 'type) 1)) mt)
+                          (set! (aref player-start-in-game (- (mt 'type) 1)) true)
+                          (when (= deathmatch 0) (spawn-player mt)))
     (and (not netgame) (!= (bit-and (mt 'options) 16) 0)) (do)
-    true (let (bit (cond (= game-skill SK-BABY) 1
-            (= game-skill SK-NIGHTMARE) 4
-            true (bit-shl 1 (bit-and (- game-skill 1) 31)))
-           i:i32 0)
-       (when (!= (bit-and (mt 'options) bit) 0)
-         (while (and (< i NUM-MOBJ-TYPES) (!= (mt 'type) ((aref mobj-info i) 'doomed-num)))
-           (inc! i))
-         (when (= i NUM-MOBJ-TYPES) (fatal "P_SpawnMapThing: Unknown type"))
-         (let (info &(aref mobj-info i))
-           (when (not (or (and (!= deathmatch 0) (!= (bit-and (info 'flags) MF-NOTDMATCH) 0))
-                          (and nomonsters (or (= i MT-SKULL) (!= (bit-and (info 'flags) MF-COUNTKILL) 0)))))
-             (let (m (spawn-mobj (fx (mt 'x)) (fx (mt 'y))
-                                 (Fixed (if (!= (bit-and (info 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ))
-                                 i))
-               (set! (m 'spawn-point) mt)
-               (when (> (m 'tics) 0)
-                 (set! (m 'tics) (+ 1 (% (p-random) (m 'tics)))))
-               (when (!= (bit-and (m 'flags) MF-COUNTKILL) 0) (inc! total-kills))
-               (when (!= (bit-and (m 'flags) MF-COUNTITEM) 0) (inc! total-items))
-               (set! (m 'angle) (* ANG45 (unsafe/cast ui32 (/ (mt 'angle) 45))))
-               (when (!= (bit-and (mt 'options) MTF-AMBUSH) 0)
-                 (set! (m 'flags) (bit-or (m 'flags) MF-AMBUSH))))))))))
+    true
+    (let (bit (cond (= game-skill SK-BABY) 1
+                (= game-skill SK-NIGHTMARE) 4
+                true (bit-shl 1 (bit-and (- game-skill 1) 31))))
+      (when (!= (bit-and (mt 'options) bit) 0)
+        (let (i (type-of-doomed-num (mt 'type)))
+          (when (= i NUM-MOBJ-TYPES) (fatal "P_SpawnMapThing: Unknown type"))
+          (let (info &(aref mobj-info i))
+            (when (not (or (and (!= deathmatch 0) (!= (bit-and (info 'flags) MF-NOTDMATCH) 0))
+                           (and nomonsters (or (= i MT-SKULL) (!= (bit-and (info 'flags) MF-COUNTKILL) 0)))))
+              (let (m (spawn-mobj (fx (mt 'x)) (fx (mt 'y))
+                                  (Fixed (if (!= (bit-and (info 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ))
+                                  i))
+                (set! (m 'spawn-point) mt)
+                (when (> (m 'tics) 0)
+                  (set! (m 'tics) (+ 1 (% (p-random) (m 'tics)))))
+                (when (!= (bit-and (m 'flags) MF-COUNTKILL) 0) (inc! total-kills))
+                (when (!= (bit-and (m 'flags) MF-COUNTITEM) 0) (inc! total-items))
+                (set! (m 'angle) (mapthing-angle &mt))
+                (when (!= (bit-and (mt 'options) MTF-AMBUSH) 0)
+                  (set! (m 'flags) (bit-or (m 'flags) MF-AMBUSH)))))))))))
+
+;; Puffs, blood and missiles.
+
+(defn spawn-puff (x:Fixed y:Fixed z:Fixed):void
+  (let (th (spawn-mobj x y (+ z (Fixed (bit-shl (p-sub-random) 10))) MT-PUFF))
+    (set! (th 'momz) FIXED-ONE)
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random) 3)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1))
+    ; No sparks for melee.
+    (when (= (attack-range 'v) MELEERANGE)
+      (set-mobj-state th S-PUFF3))))
+
+(defn spawn-blood (x:Fixed y:Fixed z:Fixed damage:i32):void
+  (let (th (spawn-mobj x y (+ z (Fixed (bit-shl (p-sub-random) 10))) MT-BLOOD))
+    (set! (th 'momz) (Fixed (* FRAC-UNIT 2)))
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random) 3)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1))
+    (cond (and (<= damage 12) (>= damage 9)) (set-mobj-state th S-BLOOD2)
+      (< damage 9) (set-mobj-state th S-BLOOD3))))
+
+; A new missile moves a little at once, so one fired point-blank still hits.
+(defn check-missile-spawn (th:&Mobj):void
+  (set! (th 'tics) (- (th 'tics) (bit-and (p-random) 3)))
+  (when (< (th 'tics) 1) (set! (th 'tics) 1))
+  (set! (th 'x) (+ (th 'x) (fx-shr (th 'momx) 1)))
+  (set! (th 'y) (+ (th 'y) (fx-shr (th 'momy) 1)))
+  (set! (th 'z) (+ (th 'z) (fx-shr (th 'momz) 1)))
+  (when (not (try-move th (th 'x) (th 'y)))
+    (explode-missile th)))
+
+(defn spawn-missile (source:&Mobj dest:&Mobj type:i32):&Mobj
+  (let (th (spawn-mobj (source 'x) (source 'y) (+ (source 'z) (Fixed (* 32 FRAC-UNIT))) type)
+        info (mobj-info-of th))
+    (when (!= (info 'see-sound) 0) (start-sound th (info 'see-sound)))
+    (set! (th 'target) source)
+    (let (an (point-to-angle2 (source 'x) (source 'y) (dest 'x) (dest 'y)))
+      ; Shooting at a spectre is inaccurate.
+      (when (!= (bit-and (dest 'flags) MF-SHADOW) 0)
+        (set! an (+ an (unsafe/cast ui32 (bit-shl (p-sub-random) 20)))))
+      (set! (th 'angle) an)
+      (set! (th 'momx) (* (Fixed (info 'speed)) (fine-cosine (fine-index an))))
+      (set! (th 'momy) (* (Fixed (info 'speed)) (fine-sine (fine-index an))))
+      (let (d (/ ((approx-distance (- (dest 'x) (source 'x)) (- (dest 'y) (source 'y))) 'v) (info 'speed))
+            dist (if (< d 1) 1 d))
+        (set! (th 'momz) (Fixed (/ ((- (dest 'z) (source 'z)) 'v) dist))))
+      (check-missile-spawn th)
+      th)))
+
+; Fires straight ahead, auto-aiming up or down at whatever is in the way, or
+; a little to either side.
+(defn spawn-player-missile (source:&Mobj type:i32):void
+  (let (an:Angle (source 'angle)
+        range:Fixed (Fixed (* 16 64 FRAC-UNIT)) ; ISSUE-025
+        slope (aim-line-attack source an range))
+    (when (null? line-target)
+      (set! an (+ an (bit-shl (as ui32 1) 26))) ; ISSUE-017
+      (set! slope (aim-line-attack source an range))
+      (when (null? line-target)
+        (set! an (- an (bit-shl (as ui32 2) 26))) ; ISSUE-017
+        (set! slope (aim-line-attack source an range)))
+      (when (null? line-target)
+        (set! an (source 'angle))
+        (set! slope (Fixed 0))))
+    (let (th (spawn-mobj (source 'x) (source 'y) (+ (source 'z) (Fixed (* 32 FRAC-UNIT))) type)
+          info (mobj-info-of th))
+      (when (!= (info 'see-sound) 0) (start-sound th (info 'see-sound)))
+      (set! (th 'target) source)
+      (set! (th 'angle) an)
+      (set! (th 'momx) (* (Fixed (info 'speed)) (fine-cosine (fine-index an))))
+      (set! (th 'momy) (* (Fixed (info 'speed)) (fine-sine (fine-index an))))
+      (set! (th 'momz) (* (Fixed (info 'speed)) slope))
+      (check-missile-spawn th))))

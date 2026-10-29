@@ -1,0 +1,14 @@
+; ISSUE-023: an untyped `let` binding that shares its name with a function
+; loses to the function when it is the let's tail. `(let (twice c) twice)`
+; types as the function `twice`, though it loads the local. A scalar return is
+; refused ("implicit return type mismatch"). A struct return dies with
+; "internal: aggregate return of a (i32):i32" at line 0.
+; Expected: prints 4 8.
+; Actual: compile error at line 11.
+; fixed-when: output-contains 4 8
+(import-use "stdio.h")
+(defn twice (x:i32):i32 (* x 2))
+(defn shadow (c:i32):i32 (let (twice c) twice))
+(defn main ():i32
+  (printf "%d %d\n" (shadow 4) (twice 4))
+  (return 0))

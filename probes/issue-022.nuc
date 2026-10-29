@@ -1,0 +1,21 @@
+; ISSUE-022: a `match` whose arms mix a struct value and a struct compound
+; literal returns zero, as ISSUE-003's `if` did before its fix. The union, enum
+; and `?&S` niche paths all do it; bound in a `let`, the match gives
+; "alloca void" IR instead.
+; Expected: union 3 7 / enum 1 7 / niche 4 7.
+; Actual: union 0 0 / enum 0 0 / niche 0 0.
+; fixed-when: output-contains union 3 7 / enum 1 7 / niche 4 7
+(import-use "stdio.h")
+(defstruct P v:i32)
+(defunion Shape (circle r:i32) (sq w:i32))
+(defenum Color RED GREEN)
+(defn u (s:Shape d:P):P (match s ((circle r) (P r)) ((sq w) d)))
+(defn e (c:i32 d:P):P (match c (RED (P 1)) (GREEN d)))
+(defn n (m:?&P d:P):P (match m ((some x) (P 4)) (none d)))
+(defn main ():int
+  (let (q:P (P 6))
+    (printf "union %d %d / enum %d %d / niche %d %d\n"
+            ((u (Shape-circle 3) (P 7)) 'v) ((u (Shape-sq 4) (P 7)) 'v)
+            ((e RED (P 7)) 'v) ((e GREEN (P 7)) 'v)
+            ((n &q (P 7)) 'v) ((n null (P 7)) 'v)))
+  (return 0))

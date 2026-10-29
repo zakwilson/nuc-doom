@@ -1,0 +1,792 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Monster behaviour (p_enemy.c): hearing, looking, chasing, the attacks, and
+; the actions every thing state can name.
+
+(ns doom.play.enemy)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.system)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.geom)
+(import-use doom.sound)
+(import-use doom.game)
+(import-use doom.play.thinkers)
+(import-use doom.play.maputl)
+(import-use doom.play.map)
+(import-use doom.play.mobj)
+(import-use doom.play.inter)
+(import-use doom.play.sight)
+(import-use doom.play.pspr)
+(import-use doom.play.movers)
+
+(defenum Dir DI-EAST DI-NORTHEAST DI-NORTH DI-NORTHWEST DI-WEST DI-SOUTHWEST DI-SOUTH DI-SOUTHEAST
+  DI-NODIR)
+
+(defconst- OPPOSITE
+  (array i32 DI-WEST DI-SOUTHWEST DI-SOUTH DI-SOUTHEAST DI-EAST DI-NORTHEAST DI-NORTH DI-NORTHWEST DI-NODIR))
+(defconst- DIAGS (array i32 DI-NORTHWEST DI-NORTHEAST DI-SOUTHWEST DI-SOUTHEAST))
+
+; One step in each direction, per unit of speed; 47000 is FRACUNIT/sqrt(2).
+(defconst- XSPEED (array i32 FRAC-UNIT 47000 0 -47000 (- 0 FRAC-UNIT) -47000 0 47000))
+(defconst- YSPEED (array i32 0 47000 FRAC-UNIT 47000 0 -47000 (- 0 FRAC-UNIT) -47000))
+
+(defn- flag? (m:&Mobj f:i32):bool (!= (bit-and (m 'flags) f) 0))
+(defn- same? (a:&Mobj b:&Mobj):bool (= (unsafe/cast ptr a) (unsafe/cast ptr b)))
+
+; Where a thing would be after one step in `dir`.
+(defn- step-x (m:&Mobj dir:i32):Fixed (+ (m 'x) (Fixed (* ((mobj-info-of m) 'speed) (aref XSPEED dir)))))
+(defn- step-y (m:&Mobj dir:i32):Fixed (+ (m 'y) (Fixed (* ((mobj-info-of m) 'speed) (aref YSPEED dir)))))
+
+;; Hearing: a noise floods out through open two-sided lines, two sound-
+;; blocking lines stopping it.
+
+(defvar- sound-target:?&Mobj null)
+
+(defn- recursive-sound (sec:&Sector soundblocks:i32):void
+  (when (and (= (sec 'validcount) validcount) (<= (sec 'sound-traversed) (+ soundblocks 1)))
+    (return))
+  (set! (sec 'validcount) validcount)
+  (set! (sec 'sound-traversed) (+ soundblocks 1))
+  (set! (sec 'sound-target) sound-target)
+  (dotimes (i (sec 'line-count))
+    (let (check (sector-line sec i))
+      (when (!= (bit-and (check 'flags) ML-TWOSIDED) 0)
+        (line-opening check)
+        ; A closed door stops it.
+        (when (> (open-range 'v) 0)
+          (let (s0 ((line-side check 0) 'sector)
+                other (if (= (unsafe/cast ptr s0) (unsafe/cast ptr sec))
+                        ((line-side check 1) 'sector)
+                        s0))
+            (if (!= (bit-and (check 'flags) ML-SOUNDBLOCK) 0)
+              (when (= soundblocks 0) (recursive-sound other 1))
+              (recursive-sound other soundblocks))))))))
+
+; `target` made a noise at `emitter`: monsters that hear it go for `target`.
+(defn noise-alert (target:&Mobj emitter:&Mobj):void
+  (set! sound-target target)
+  (inc! validcount)
+  (recursive-sound (mobj-sector emitter) 0))
+
+;; Sizing up the target.
+
+(defn- check-melee-range (actor:&Mobj):bool
+  (if-some (pl (actor 'target))
+    (let (dist (approx-distance (- (pl 'x) (actor 'x)) (- (pl 'y) (actor 'y))))
+      (and (< (dist 'v) (if (< game-version EXE-DOOM-1-5)
+                          MELEERANGE
+                          (+ (- MELEERANGE (* 20 FRAC-UNIT)) (((mobj-info-of pl) 'radius) 'v))))
+           (check-sight actor pl)))
+    false))
+
+(defn- check-missile-range (actor:&Mobj):bool
+  (let (target (unsafe/cast &Mobj (actor 'target)))
+    (when (not (check-sight actor target)) (return false))
+    (when (flag? actor MF-JUSTHIT)
+      ; Just hit: fight back now.
+      (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-JUSTHIT)))
+      (return true))
+    (when (!= (actor 'reaction-time) 0) (return false))
+    (let (d (- (approx-distance (- (actor 'x) (target 'x)) (- (actor 'y) (target 'y)))
+               (Fixed (* 64 FRAC-UNIT)))
+          type (actor 'type))
+      ; No melee attack, so fire more.
+      (when (= ((mobj-info-of actor) 'melee-state) S-NULL)
+        (set! d (- d (Fixed (* 128 FRAC-UNIT)))))
+      (let (dist (fx-int d))
+        (when (and (= type MT-VILE) (> dist (* 14 64))) (return false))
+        (when (= type MT-UNDEAD)
+          ; Close enough to punch instead.
+          (when (< dist 196) (return false))
+          (set! dist (bit-shr dist 1)))
+        (when (or (= type MT-CYBORG) (= type MT-SPIDER) (= type MT-SKULL))
+          (set! dist (bit-shr dist 1)))
+        (when (> dist 200) (set! dist 200))
+        (when (and (= type MT-CYBORG) (> dist 160)) (set! dist 160))
+        (>= (p-random) dist)))))
+
+;; Walking.
+
+; One step along movedir; a blocked monster opens doors it bumped.
+(defn- walk-step (actor:&Mobj):bool
+  (when (= (actor 'movedir) DI-NODIR) (return false))
+  (when (or (< (actor 'movedir) 0) (>= (actor 'movedir) 8)) (fatal "Weird actor->movedir!"))
+  (if (try-move actor (step-x actor (actor 'movedir)) (step-y actor (actor 'movedir)))
+    (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-INFLOAT)))
+    (do (when (and (flag? actor MF-FLOAT) float-ok)
+          ; Rise or sink toward a ledge it couldn't float over.
+          (set! (actor 'z) (if (< (actor 'z) tm-floorz)
+                             (+ (actor 'z) (Fixed FLOATSPEED))
+                             (- (actor 'z) (Fixed FLOATSPEED))))
+          (set! (actor 'flags) (bit-or (actor 'flags) MF-INFLOAT))
+          (return true))
+        (when (not (crossed-specials?)) (return false))
+        (set! (actor 'movedir) DI-NODIR)
+        (return (use-crossed-specials actor))))
+  (when (not (flag? actor MF-FLOAT))
+    (set! (actor 'z) (actor 'floorz)))
+  true)
+
+(defn- try-walk (actor:&Mobj):bool
+  (if (walk-step actor)
+    (do (set! (actor 'movecount) (bit-and (p-random) 15)) true)
+    false))
+
+(defn- try-dir (actor:&Mobj dir:i32):bool
+  (set! (actor 'movedir) dir)
+  (try-walk actor))
+
+(defn- new-chase-dir (actor:&Mobj):void
+  (let (target (if-some (t (actor 'target)) t (do (fatal "P_NewChaseDir: called with no target") actor))
+        olddir (actor 'movedir)
+        turnaround (aref OPPOSITE olddir)
+        deltax (- (target 'x) (actor 'x))
+        deltay (- (target 'y) (actor 'y))
+        d1 (cond (> (deltax 'v) (* 10 FRAC-UNIT)) DI-EAST
+             (< (deltax 'v) (* -10 FRAC-UNIT)) DI-WEST
+             true DI-NODIR)
+        d2 (cond (< (deltay 'v) (* -10 FRAC-UNIT)) DI-SOUTH
+             (> (deltay 'v) (* 10 FRAC-UNIT)) DI-NORTH
+             true DI-NODIR))
+    ; Straight at it, diagonally.
+    (when (and (!= d1 DI-NODIR) (!= d2 DI-NODIR))
+      (let (dir (aref DIAGS (+ (if (< (deltay 'v) 0) 2 0) (if (> (deltax 'v) 0) 1 0))))
+        (when (and (!= dir turnaround) (try-dir actor dir)) (return))))
+    ; Else the main axis first, sometimes the other.
+    (when (or (> (p-random) 200) (> (fx-abs deltay) (fx-abs deltax)))
+      (let (t d1) (set! d1 d2) (set! d2 t)))
+    (when (= d1 turnaround) (set! d1 DI-NODIR))
+    (when (= d2 turnaround) (set! d2 DI-NODIR))
+    (when (and (!= d1 DI-NODIR) (try-dir actor d1)) (return))
+    (when (and (!= d2 DI-NODIR) (try-dir actor d2)) (return))
+    (when (and (!= olddir DI-NODIR) (try-dir actor olddir)) (return))
+    ; Any direction but back, scanning from a random end.
+    (if (!= (bit-and (p-random) 1) 0)
+      (let (tdir DI-EAST)
+        (while (<= tdir DI-SOUTHEAST)
+          (when (and (!= tdir turnaround) (try-dir actor tdir)) (return))
+          (inc! tdir)))
+      (let (tdir DI-SOUTHEAST)
+        (while (!= tdir (- DI-EAST 1))
+          (when (and (!= tdir turnaround) (try-dir actor tdir)) (return))
+          (set! tdir (- tdir 1)))))
+    (when (and (!= turnaround DI-NODIR) (try-dir actor turnaround)) (return))
+    (set! (actor 'movedir) DI-NODIR)))
+
+; Looks at up to two players, starting after the last one looked at; with
+; `allaround` false, only ahead or within melee range behind.
+(defn- look-for-players (actor:&Mobj allaround:bool):bool
+  (let (c:i32 0 stop (bit-and (- (actor 'last-look) 1) 3))
+    (while true
+      (let (ll (actor 'last-look))
+        (when (aref player-in-game ll)
+          (when (or (= c 2) (= ll stop)) (return false))
+          (inc! c)
+          (let (p (player ll) pmo (player-mobj p))
+            (when (and (> (p 'health) 0)
+                       (check-sight actor pmo)
+                       (or allaround
+                           (let (an (- (point-to-angle2 (actor 'x) (actor 'y) (pmo 'x) (pmo 'y)) (actor 'angle)))
+                             (or (<= an ANG90) (>= an ANG270)
+                                 (<= ((approx-distance (- (pmo 'x) (actor 'x)) (- (pmo 'y) (actor 'y))) 'v)
+                                     MELEERANGE)))))
+              (set! (actor 'target) pmo)
+              (return true)))))
+      (set! (actor 'last-look) (bit-and (+ (actor 'last-look) 1) 3)))
+    false))
+
+;; The actions.
+
+(defn- fall (actor:&Mobj):void
+  (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-SOLID))))
+
+; Whether another live thing of `mo`'s type remains.
+(defn- others-alive? (mo:&Mobj):bool
+  (do-mobjs m2
+    (when (and (not (same? m2 mo)) (= (m2 'type) (mo 'type)) (> (m2 'health) 0))
+      (return true)))
+  false)
+
+; Vanilla builds a line on the stack with only the tag set.
+(defvar- junk-line:Line)
+(defn- tagged-line (tag:i32):&Line
+  (set! (junk-line 'tag) tag)
+  &junk-line)
+
+(defn- keen-die (mo:&Mobj):void
+  (fall mo)
+  (when (not (others-alive? mo))
+    (do-door (tagged-line 666) VLD-OPEN)))
+
+(defn- see-sound (actor:&Mobj s:i32):void
+  (let (sound (case s
+                (:or SFX-POSIT1 SFX-POSIT2 SFX-POSIT3) (+ SFX-POSIT1 (% (p-random) 3))
+                (:or SFX-BGSIT1 SFX-BGSIT2) (+ SFX-BGSIT1 (% (p-random) 2))
+                s))
+    ; The bosses are heard everywhere.
+    (if (or (= (actor 'type) MT-SPIDER) (= (actor 'type) MT-CYBORG))
+      (start-sound null sound)
+      (start-sound actor sound))))
+
+(defn- look (actor:&Mobj):void
+  ; Any shot will wake it up.
+  (set! (actor 'threshold) 0)
+  (let (sees false)
+    (when-some (targ ((mobj-sector actor) 'sound-target))
+      (when (flag? targ MF-SHOOTABLE)
+        (set! (actor 'target) targ)
+        ; An ambusher must see what it heard.
+        (when (or (not (flag? actor MF-AMBUSH)) (check-sight actor targ))
+          (set! sees true))))
+    (when (and (not sees) (not (look-for-players actor false))) (return))
+    (let (info (mobj-info-of actor))
+      (when (!= (info 'see-sound) 0) (see-sound actor (info 'see-sound)))
+      (set-mobj-state actor (info 'see-state)))))
+
+(defn- chase (actor:&Mobj):void
+  (let (info (mobj-info-of actor))
+    (when (!= (actor 'reaction-time) 0)
+      (set! (actor 'reaction-time) (- (actor 'reaction-time) 1)))
+    ; Stop chasing a dead target.
+    (when (!= (actor 'threshold) 0)
+      ; Doom 1.2 counted down even with its target gone.
+      (if (and (> game-version EXE-DOOM-1-2) (if-some (t (actor 'target)) (<= (t 'health) 0) true))
+        (set! (actor 'threshold) 0)
+        (set! (actor 'threshold) (- (actor 'threshold) 1))))
+    ; Turn toward the movement direction, an eighth at a time.
+    (when (< (actor 'movedir) 8)
+      (set! (actor 'angle) (bit-and (actor 'angle) (bit-shl (as ui32 7) 29)))
+      (let (delta (unsafe/cast i32 (- (actor 'angle) (unsafe/cast ui32 (bit-shl (actor 'movedir) 29)))))
+        (cond (> delta 0) (set! (actor 'angle) (- (actor 'angle) ANG45))
+          (< delta 0) (set! (actor 'angle) (+ (actor 'angle) ANG45)))))
+    (when (if-some (t (actor 'target)) (not (flag? t MF-SHOOTABLE)) true)
+      ; Look for a new target, or go back to sleep.
+      (when (not (look-for-players actor true))
+        (set-mobj-state actor (info 'spawn-state)))
+      (return))
+    ; Don't attack twice in a row.
+    (when (flag? actor MF-JUSTATTACKED)
+      (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-JUSTATTACKED)))
+      (when (and (!= game-skill SK-NIGHTMARE) (not fast-parm))
+        (new-chase-dir actor))
+      (return))
+    (when (and (!= (info 'melee-state) S-NULL) (check-melee-range actor))
+      (when (!= (info 'attack-sound) 0) (start-sound actor (info 'attack-sound)))
+      (set-mobj-state actor (info 'melee-state))
+      (return))
+    (when (and (!= (info 'missile-state) S-NULL)
+               (not (and (< game-skill SK-NIGHTMARE) (not fast-parm) (!= (actor 'movecount) 0)))
+               (check-missile-range actor))
+      (set-mobj-state actor (info 'missile-state))
+      (set! (actor 'flags) (bit-or (actor 'flags) MF-JUSTATTACKED))
+      (return))
+    ; In a netgame, look for another player to chase if this one is hidden.
+    (when (and netgame (= (actor 'threshold) 0)
+               (not (check-sight actor (unsafe/cast &Mobj (actor 'target))))
+               (look-for-players actor true))
+      (return))
+    (set! (actor 'movecount) (- (actor 'movecount) 1))
+    (when (or (< (actor 'movecount) 0) (not (walk-step actor)))
+      (new-chase-dir actor))
+    (when (and (!= (info 'active-sound) 0) (< (p-random) 3))
+      (start-sound actor (info 'active-sound)))))
+
+(defn- face-target (actor:&Mobj):void
+  (when-some (t (actor 'target))
+    (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-AMBUSH)))
+    (set! (actor 'angle) (point-to-angle2 (actor 'x) (actor 'y) (t 'x) (t 'y)))
+    ; Spectres are hard to aim at.
+    (when (flag? t MF-SHADOW)
+      (set! (actor 'angle) (+ (actor 'angle) (unsafe/cast ui32 (bit-shl (p-sub-random) 21)))))))
+
+(defn- spread (a:Angle):Angle (+ a (unsafe/cast ui32 (bit-shl (p-sub-random) 20))))
+
+(defn- zombie-damage ():i32 (* (+ (% (p-random) 5) 1) 3))
+
+(defn- pos-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (let (angle (actor 'angle)
+          slope (aim-line-attack actor angle (Fixed MISSILERANGE)))
+      (start-sound actor SFX-PISTOL)
+      (let (a (spread angle) damage (zombie-damage))
+        (line-attack actor a (Fixed MISSILERANGE) slope damage)))))
+
+(defn- spos-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (start-sound actor SFX-SHOTGN)
+    (face-target actor)
+    (let (bangle (actor 'angle)
+          slope (aim-line-attack actor bangle (Fixed MISSILERANGE)))
+      (dotimes (i 3)
+        (let (a (spread bangle) damage (zombie-damage))
+          (line-attack actor a (Fixed MISSILERANGE) slope damage))))))
+
+(defn- cpos-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (start-sound actor SFX-SHOTGN)
+    (face-target actor)
+    (let (bangle (actor 'angle)
+          slope (aim-line-attack actor bangle (Fixed MISSILERANGE))
+          a (spread bangle)
+          damage (zombie-damage))
+      (line-attack actor a (Fixed MISSILERANGE) slope damage))))
+
+; Keeps firing while the target is visible, pausing at random.
+(defn- refire (actor:&Mobj chance:i32):void
+  (face-target actor)
+  (when (>= (p-random) chance)
+    (when (if-some (t (actor 'target))
+            (or (<= (t 'health) 0) (not (check-sight actor t)))
+            true)
+      (set-mobj-state actor ((mobj-info-of actor) 'see-state)))))
+
+(defn- target-of (actor:&Mobj):&Mobj (unsafe/cast &Mobj (actor 'target)))
+
+(defn- missile-attack (actor:&Mobj type:i32):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (spawn-missile actor (target-of actor) type)))
+
+; Claws when close, else throws `missile`.
+(defn- melee-or-missile (actor:&Mobj sound:i32 dice:i32 mult:i32 missile:i32):void
+  (when (check-melee-range actor)
+    (when (!= sound 0) (start-sound actor sound))
+    (let (damage (* (+ (% (p-random) dice) 1) mult))
+      (damage-mobj (target-of actor) actor actor damage))
+    (return))
+  (spawn-missile actor (target-of actor) missile))
+
+(defn- troop-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (melee-or-missile actor SFX-CLAW 8 3 MT-TROOPSHOT)))
+
+(defn- sarg-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    ; Before 1.5 the bite was a hitscan that could miss, with no range check.
+    (when (or (< game-version EXE-DOOM-1-5) (check-melee-range actor))
+      (let (damage (* (+ (% (p-random) 10) 1) 4))
+        (if (<= game-version EXE-DOOM-1-2)
+          (line-attack actor (actor 'angle) (Fixed MELEERANGE) (Fixed 0) damage)
+          (damage-mobj (target-of actor) actor actor damage))))))
+
+(defn- head-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (melee-or-missile actor 0 6 10 MT-HEADSHOT)))
+
+(defn- bruis-attack (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (melee-or-missile actor SFX-CLAW 8 10 MT-BRUISERSHOT)))
+
+(defn- skel-missile (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    ; Spawned higher, from the shoulder launcher.
+    (set! (actor 'z) (+ (actor 'z) (Fixed (* 16 FRAC-UNIT))))
+    (let (mo (spawn-missile actor (target-of actor) MT-TRACER))
+      (set! (actor 'z) (- (actor 'z) (Fixed (* 16 FRAC-UNIT))))
+      (set! (mo 'x) (+ (mo 'x) (mo 'momx)))
+      (set! (mo 'y) (+ (mo 'y) (mo 'momy)))
+      (set! (mo 'tracer) (actor 'target)))))
+
+(defconst- TRACEANGLE 0xc000000)
+
+; A homing missile, every fourth tic: a puff of smoke, then a turn toward
+; the tracer target.
+(defn- tracer (actor:&Mobj):void
+  (when (!= (bit-and game-tic 3) 0) (return))
+  (spawn-puff (actor 'x) (actor 'y) (actor 'z))
+  (let (th (spawn-mobj (- (actor 'x) (actor 'momx)) (- (actor 'y) (actor 'momy)) (actor 'z) MT-SMOKE))
+    (set! (th 'momz) FIXED-ONE)
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random) 3)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1)))
+  (when-some (dest (actor 'tracer))
+    (when (<= (dest 'health) 0) (return))
+    (let (exact (point-to-angle2 (actor 'x) (actor 'y) (dest 'x) (dest 'y)))
+      (when (!= exact (actor 'angle))
+        (if (> (- exact (actor 'angle)) ANG180)
+          (do (set! (actor 'angle) (- (actor 'angle) TRACEANGLE))
+              (when (< (- exact (actor 'angle)) ANG180) (set! (actor 'angle) exact)))
+          (do (set! (actor 'angle) (+ (actor 'angle) TRACEANGLE))
+              (when (> (- exact (actor 'angle)) ANG180) (set! (actor 'angle) exact))))))
+    (let (fi (fine-index (actor 'angle))
+          speed ((mobj-info-of actor) 'speed))
+      (set! (actor 'momx) (* (Fixed speed) (fine-cosine fi)))
+      (set! (actor 'momy) (* (Fixed speed) (fine-sine fi)))
+      (let (d (/ ((approx-distance (- (dest 'x) (actor 'x)) (- (dest 'y) (actor 'y))) 'v) speed)
+            dist (if (< d 1) 1 d)
+            slope (/ (- (+ (dest 'z) (Fixed (* 40 FRAC-UNIT))) (actor 'z)) dist))
+        (if (< slope (actor 'momz))
+          (set! (actor 'momz) (- (actor 'momz) (Fixed (/ FRAC-UNIT 8))))
+          (set! (actor 'momz) (+ (actor 'momz) (Fixed (/ FRAC-UNIT 8)))))))))
+
+(defn- skel-whoosh (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (start-sound actor SFX-SKESWG)))
+
+(defn- skel-fist (actor:&Mobj):void
+  (when (not (null? (actor 'target)))
+    (face-target actor)
+    (when (check-melee-range actor)
+      (let (damage (* (+ (% (p-random) 10) 1) 6))
+        (start-sound actor SFX-SKEPCH)
+        (damage-mobj (target-of actor) actor actor damage)))))
+
+;; The arch-vile.
+
+; Iterator callbacks can't capture, so the search state is global as in the C.
+(defvar- corpse-hit:?&Mobj null)
+(defvar- vile-try-x:Fixed (Fixed 0))
+(defvar- vile-try-y:Fixed (Fixed 0))
+
+; False (stop) at a corpse that could be raised here.
+(defn- vile-check (thing:&Mobj):bool
+  (let (info (mobj-info-of thing)
+        maxdist (+ (info 'radius) ((aref mobj-info MT-VILE) 'radius)))
+    (cond (not (flag? thing MF-CORPSE)) true
+      (!= (thing 'tics) -1) true
+      (= (info 'raise-state) S-NULL) true
+      (or (> (fx-abs (- (thing 'x) vile-try-x)) maxdist)
+          (> (fx-abs (- (thing 'y) vile-try-y)) maxdist)) true
+      true
+      (do (set! corpse-hit thing)
+          (set! (thing 'momx) (Fixed 0))
+          (set! (thing 'momy) (Fixed 0))
+          ; Would it fit standing up?
+          (set! (thing 'height) (fx-shl (thing 'height) 2))
+          (let (check (check-position thing (thing 'x) (thing 'y)))
+            (set! (thing 'height) (fx-shr (thing 'height) 2))
+            (not check))))))
+
+(defn- vile-chase (actor:&Mobj):void
+  (when (!= (actor 'movedir) DI-NODIR)
+    (set! vile-try-x (step-x actor (actor 'movedir)))
+    (set! vile-try-y (step-y actor (actor 'movedir)))
+    (let (pad (* MAXRADIUS 2)
+          xl (bit-shr (- ((- vile-try-x bmap-org-x) 'v) pad) MAPBLOCKSHIFT)
+          xh (bit-shr (+ ((- vile-try-x bmap-org-x) 'v) pad) MAPBLOCKSHIFT)
+          yl (bit-shr (- ((- vile-try-y bmap-org-y) 'v) pad) MAPBLOCKSHIFT)
+          yh (bit-shr (+ ((- vile-try-y bmap-org-y) 'v) pad) MAPBLOCKSHIFT)
+          bx xl)
+      (while (<= bx xh)
+        (let (by yl)
+          (while (<= by yh)
+            (when (not (block-things-iterator bx by vile-check))
+              (let (corpse (unsafe/cast &Mobj corpse-hit)
+                    temp (actor 'target))
+                ; Face the corpse, not the target.
+                (set! (actor 'target) corpse)
+                (face-target actor)
+                (set! (actor 'target) temp)
+                (set-mobj-state actor S-VILE-HEAL1)
+                (start-sound corpse SFX-SLOP)
+                (let (info (mobj-info-of corpse))
+                  (set-mobj-state corpse (info 'raise-state))
+                  (set! (corpse 'height) (fx-shl (corpse 'height) 2))
+                  (set! (corpse 'flags) (info 'flags))
+                  (set! (corpse 'health) (info 'spawn-health))
+                  (set! (corpse 'target) null))
+                (return)))
+            (inc! by)))
+        (inc! bx))))
+  (chase actor))
+
+; Stands in for a missing target where the C would read through null.
+(defvar- dummy-mobj:Mobj)
+
+(defn- subst-null (m:?&Mobj):&Mobj
+  (if-some (x m) x
+    (do (set! (dummy-mobj 'x) (Fixed 0))
+        (set! (dummy-mobj 'y) (Fixed 0))
+        (set! (dummy-mobj 'z) (Fixed 0))
+        (set! (dummy-mobj 'flags) 0)
+        &dummy-mobj)))
+
+; Keeps the vile's fire in front of its victim.
+(defn- fire (actor:&Mobj):void
+  (when-some (dest (actor 'tracer))
+    (when (check-sight (subst-null (actor 'target)) dest)
+      (let (an (fine-index (dest 'angle)))
+        (unset-thing-position actor)
+        (set! (actor 'x) (+ (dest 'x) (* (Fixed (* 24 FRAC-UNIT)) (fine-cosine an))))
+        (set! (actor 'y) (+ (dest 'y) (* (Fixed (* 24 FRAC-UNIT)) (fine-sine an))))
+        (set! (actor 'z) (dest 'z))
+        (set-thing-position actor)))))
+
+(defn- vile-target (actor:&Mobj):void
+  (when-some (t (actor 'target))
+    (face-target actor)
+    ; Vanilla passes the target's x for y too.
+    (let (fog (spawn-mobj (t 'x) (t 'x) (t 'z) MT-FIRE))
+      (set! (actor 'tracer) fog)
+      (set! (fog 'target) actor)
+      (set! (fog 'tracer) t)
+      (fire fog))))
+
+(defn- vile-attack (actor:&Mobj):void
+  (when-some (t (actor 'target))
+    (face-target actor)
+    (when (not (check-sight actor t)) (return))
+    (start-sound actor SFX-BAREXP)
+    (damage-mobj t actor actor 20)
+    (set! (t 'momz) (Fixed (/ (* 1000 FRAC-UNIT) ((mobj-info-of t) 'mass))))
+    (let (an (fine-index (actor 'angle)))
+      (when-some (fire (actor 'tracer))
+        ; Move the fire between the vile and its victim, then blow it up.
+        (set! (fire 'x) (- (t 'x) (* (Fixed (* 24 FRAC-UNIT)) (fine-cosine an))))
+        (set! (fire 'y) (- (t 'y) (* (Fixed (* 24 FRAC-UNIT)) (fine-sine an))))
+        (radius-attack fire actor 70)))))
+
+;; The mancubus.
+
+(defconst- FATSPREAD (/ ANG90 8))
+
+(defn- aim-missile (mo:&Mobj):void
+  (let (an (fine-index (mo 'angle)) speed:Fixed (Fixed ((mobj-info-of mo) 'speed))) ; ISSUE-025
+    (set! (mo 'momx) (* speed (fine-cosine an)))
+    (set! (mo 'momy) (* speed (fine-sine an)))))
+
+; Offsets are signed turns; adding them as unsigned angles wraps the same.
+(defn- fat-attack (actor:&Mobj turn:i32 first-off:i32 second-off:i32):void
+  (face-target actor)
+  (set! (actor 'angle) (+ (actor 'angle) (unsafe/cast ui32 turn)))
+  (let (target (subst-null (actor 'target))
+        mo1 (spawn-missile actor target MT-FATSHOT))
+    (when (!= first-off 0)
+      (set! (mo1 'angle) (+ (mo1 'angle) (unsafe/cast ui32 first-off)))
+      (aim-missile mo1))
+    (let (mo2 (spawn-missile actor target MT-FATSHOT))
+      (set! (mo2 'angle) (+ (mo2 'angle) (unsafe/cast ui32 second-off)))
+      (aim-missile mo2))))
+
+;; The lost soul and pain elemental.
+
+(defconst- SKULLSPEED (* 20 FRAC-UNIT))
+
+(defn- skull-attack (actor:&Mobj):void
+  (when-some (dest (actor 'target))
+    (set! (actor 'flags) (bit-or (actor 'flags) MF-SKULLFLY))
+    (start-sound actor ((mobj-info-of actor) 'attack-sound))
+    (face-target actor)
+    (let (an (fine-index (actor 'angle)))
+      (set! (actor 'momx) (* (Fixed SKULLSPEED) (fine-cosine an)))
+      (set! (actor 'momy) (* (Fixed SKULLSPEED) (fine-sine an))))
+    (let (d (/ ((approx-distance (- (dest 'x) (actor 'x)) (- (dest 'y) (actor 'y))) 'v) SKULLSPEED)
+          dist (if (< d 1) 1 d))
+      (set! (actor 'momz) (/ (- (+ (dest 'z) (fx-shr (dest 'height) 1)) (actor 'z)) dist)))))
+
+(defn- pain-shoot-skull (actor:&Mobj angle:Angle):void
+  ; No more than 20 lost souls at once.
+  (let (count:i32 0)
+    (do-mobjs m (when (= (m 'type) MT-SKULL) (inc! count)))
+    (when (> count 20) (return)))
+  (let (an (fine-index angle)
+        prestep:Fixed (Fixed (+ (* 4 FRAC-UNIT) ; ISSUE-025
+                          (/ (* 3 (+ (((mobj-info-of actor) 'radius) 'v) (((aref mobj-info MT-SKULL) 'radius) 'v))) 2)))
+        x (+ (actor 'x) (* prestep (fine-cosine an)))
+        y (+ (actor 'y) (* prestep (fine-sine an)))
+        z (+ (actor 'z) (Fixed (* 8 FRAC-UNIT)))
+        newmobj (spawn-mobj x y z MT-SKULL))
+    ; Spawned inside a wall: it dies at once.
+    (when (not (try-move newmobj (newmobj 'x) (newmobj 'y)))
+      (damage-mobj newmobj actor actor 10000)
+      (return))
+    (set! (newmobj 'target) (actor 'target))
+    (skull-attack newmobj)))
+
+;; Dying.
+
+(defn- scream (actor:&Mobj):void
+  (let (ds ((mobj-info-of actor) 'death-sound))
+    (when (= ds 0) (return))
+    (let (sound (case ds
+                  (:or SFX-PODTH1 SFX-PODTH2 SFX-PODTH3) (+ SFX-PODTH1 (% (p-random) 3))
+                  (:or SFX-BGDTH1 SFX-BGDTH2) (+ SFX-BGDTH1 (% (p-random) 2))
+                  ds))
+      ; The bosses die at full volume.
+      (if (or (= (actor 'type) MT-SPIDER) (= (actor 'type) MT-CYBORG))
+        (start-sound null sound)
+        (start-sound actor sound)))))
+
+(defn- pain (actor:&Mobj):void
+  (let (s ((mobj-info-of actor) 'pain-sound))
+    (when (!= s 0) (start-sound actor s))))
+
+; Before Ultimate Doom any boss on map 8 ends the level, except barons
+; outside episode 1.
+(defn- boss-end? (type:i32):bool
+  (and (= game-map 8) (or (!= type MT-BRUISER) (= game-episode 1))))
+
+(defn- boss-death (mo:&Mobj):void
+  (if (= game-mode COMMERCIAL)
+    (when (or (!= game-map 7) (and (!= (mo 'type) MT-FATSO) (!= (mo 'type) MT-BABY))) (return))
+    (when (not (boss-end? (mo 'type))) (return)))
+  ; Nobody left alive to finish the level.
+  (let (alive false)
+    (dotimes (i MAX-PLAYERS)
+      (when (and (aref player-in-game i) (> ((player i) 'health) 0)) (set! alive true)))
+    (when (not alive) (return)))
+  (when (others-alive? mo) (return))
+  (if (= game-mode COMMERCIAL)
+    (do (when (= (mo 'type) MT-FATSO) (do-floor (tagged-line 666) FL-LOWER-TO-LOWEST) (return))
+        (when (= (mo 'type) MT-BABY) (do-floor (tagged-line 667) FL-RAISE-TO-TEXTURE) (return)))
+    (case game-episode
+      1 (do (do-floor (tagged-line 666) FL-LOWER-TO-LOWEST) (return))
+      4 (case game-map
+          6 (do (do-door (tagged-line 666) VLD-BLAZE-OPEN) (return))
+          8 (do (do-floor (tagged-line 666) FL-LOWER-TO-LOWEST) (return))
+          (do))
+      (do)))
+  (exit-level))
+
+;; The brain (Doom 2's final boss).
+
+(defvar- brain-targets:(array ?&Mobj 32))
+(defvar- num-brain-targets:i32 0)
+(defvar- brain-target-on:i32 0)
+(defvar- brain-easy:i32 0)
+
+(defn- brain-awake (mo:&Mobj):void
+  (set! num-brain-targets 0)
+  (set! brain-target-on 0)
+  (do-mobjs m
+    (when (= (m 'type) MT-BOSSTARGET)
+      (set! (aref brain-targets num-brain-targets) m)
+      (inc! num-brain-targets)))
+  (start-sound null SFX-BOSSIT))
+
+(defn- brain-rocket (x:Fixed y:Fixed):void
+  (let (z:Fixed (Fixed (+ 128 (* (p-random) 2 FRAC-UNIT))) ; ISSUE-025
+        th (spawn-mobj x y z MT-ROCKET))
+    (set! (th 'momz) (Fixed (* (p-random) 512)))
+    (set-mobj-state th S-BRAINEXPLODE1)
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random) 7)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1))))
+
+(defn- brain-scream (mo:&Mobj):void
+  (let (x (- (mo 'x) (Fixed (* 196 FRAC-UNIT))))
+    (while (< x (+ (mo 'x) (Fixed (* 320 FRAC-UNIT))))
+      (brain-rocket x (- (mo 'y) (Fixed (* 320 FRAC-UNIT))))
+      (set! x (+ x (Fixed (* 8 FRAC-UNIT))))))
+  (start-sound null SFX-BOSDTH))
+
+(defn- brain-explode (mo:&Mobj):void
+  (let (x (+ (mo 'x) (Fixed (* (p-sub-random) 2048))))
+    (brain-rocket x (mo 'y))))
+
+(defn- brain-spit (mo:&Mobj):void
+  (set! brain-easy (bit-xor brain-easy 1))
+  (when (and (<= game-skill SK-EASY) (= brain-easy 0)) (return))
+  (when (= num-brain-targets 0)
+    (fatal "A_BrainSpit: numbraintargets was 0 (vanilla crashes here)"))
+  (let (targ (unsafe/cast &Mobj (aref brain-targets brain-target-on)))
+    (set! brain-target-on (% (+ brain-target-on 1) num-brain-targets))
+    (let (newmobj (spawn-missile mo targ MT-SPAWNSHOT))
+      (set! (newmobj 'target) targ)
+      ; Plain integer divisions: tics until it reaches the target.
+      (set! (newmobj 'reaction-time)
+            (/ (/ ((- (targ 'y) (mo 'y)) 'v) ((newmobj 'momy) 'v))
+               ((aref states (newmobj 'state)) 'tics)))
+      (start-sound null SFX-BOSPIT))))
+
+(defn- spawn-fly (mo:&Mobj):void
+  (set! (mo 'reaction-time) (- (mo 'reaction-time) 1))
+  ; Still flying.
+  (when (!= (mo 'reaction-time) 0) (return))
+  (let (targ (subst-null (mo 'target))
+        fog (spawn-mobj (targ 'x) (targ 'y) (targ 'z) MT-SPAWNFIRE))
+    (start-sound fog SFX-TELEPT)
+    (let (r (p-random)
+          type (cond (< r 50) MT-TROOP
+                 (< r 90) MT-SERGEANT
+                 (< r 120) MT-SHADOWS
+                 (< r 130) MT-PAIN
+                 (< r 160) MT-HEAD
+                 (< r 162) MT-VILE
+                 (< r 172) MT-UNDEAD
+                 (< r 192) MT-BABY
+                 (< r 222) MT-FATSO
+                 (< r 246) MT-KNIGHT
+                 true MT-BRUISER)
+          newmobj (spawn-mobj (targ 'x) (targ 'y) (targ 'z) type))
+      (when (look-for-players newmobj true)
+        (set-mobj-state newmobj ((mobj-info-of newmobj) 'see-state)))
+      ; Telefrags whatever is there.
+      (teleport-move newmobj (newmobj 'x) (newmobj 'y))
+      (remove-mobj mo))))
+
+(defn- player-scream (mo:&Mobj):void
+  (start-sound mo (if (and (= game-mode COMMERCIAL) (< (mo 'health) -50)) SFX-PDIEHI SFX-PLDETH)))
+
+; Runs a thing state's action.
+(defn mobj-action (action:i32 actor:&Mobj):void
+  (case action
+    A-BFGSPRAY (bfg-spray actor)
+    A-EXPLODE (radius-attack actor (actor 'target) 128)
+    A-PAIN (pain actor)
+    A-PLAYERSCREAM (player-scream actor)
+    A-FALL (fall actor)
+    A-XSCREAM (start-sound actor SFX-SLOP)
+    A-LOOK (look actor)
+    A-CHASE (chase actor)
+    A-FACETARGET (face-target actor)
+    A-POSATTACK (pos-attack actor)
+    A-SCREAM (scream actor)
+    A-SPOSATTACK (spos-attack actor)
+    A-VILECHASE (vile-chase actor)
+    A-VILESTART (start-sound actor SFX-VILATK)
+    A-VILETARGET (vile-target actor)
+    A-VILEATTACK (vile-attack actor)
+    A-STARTFIRE (do (start-sound actor SFX-FLAMST) (fire actor))
+    A-FIRE (fire actor)
+    A-FIRECRACKLE (do (start-sound actor SFX-FLAME) (fire actor))
+    A-TRACER (tracer actor)
+    A-SKELWHOOSH (skel-whoosh actor)
+    A-SKELFIST (skel-fist actor)
+    A-SKELMISSILE (skel-missile actor)
+    A-FATRAISE (do (face-target actor) (start-sound actor SFX-MANATK))
+    A-FATATTACK1 (fat-attack actor FATSPREAD 0 FATSPREAD)
+    A-FATATTACK2 (fat-attack actor (- 0 FATSPREAD) 0 (- 0 (* FATSPREAD 2)))
+    A-FATATTACK3 (fat-attack actor 0 (- 0 (/ FATSPREAD 2)) (/ FATSPREAD 2))
+    A-BOSSDEATH (boss-death actor)
+    A-CPOSATTACK (cpos-attack actor)
+    A-CPOSREFIRE (refire actor 40)
+    A-TROOPATTACK (troop-attack actor)
+    A-SARGATTACK (sarg-attack actor)
+    A-HEADATTACK (head-attack actor)
+    A-BRUISATTACK (bruis-attack actor)
+    A-SKULLATTACK (skull-attack actor)
+    A-METAL (do (start-sound actor SFX-METAL) (chase actor))
+    A-SPIDREFIRE (refire actor 10)
+    A-BABYMETAL (do (start-sound actor SFX-BSPWLK) (chase actor))
+    A-BSPIATTACK (missile-attack actor MT-ARACHPLAZ)
+    A-HOOF (do (start-sound actor SFX-HOOF) (chase actor))
+    A-CYBERATTACK (missile-attack actor MT-ROCKET)
+    A-PAINATTACK (when (not (null? (actor 'target)))
+                   (face-target actor)
+                   (pain-shoot-skull actor (actor 'angle)))
+    A-PAINDIE (do (fall actor)
+                  (pain-shoot-skull actor (+ (actor 'angle) ANG90))
+                  (pain-shoot-skull actor (+ (actor 'angle) ANG180))
+                  (pain-shoot-skull actor (+ (actor 'angle) ANG270)))
+    A-KEENDIE (keen-die actor)
+    A-BRAINPAIN (start-sound null SFX-BOSPN)
+    A-BRAINSCREAM (brain-scream actor)
+    A-BRAINDIE (exit-level)
+    A-BRAINAWAKE (brain-awake actor)
+    A-BRAINSPIT (brain-spit actor)
+    A-SPAWNSOUND (do (start-sound actor SFX-BOSCUB) (spawn-fly actor))
+    A-SPAWNFLY (spawn-fly actor)
+    A-BRAINEXPLODE (brain-explode actor)
+    (do)))

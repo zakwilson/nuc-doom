@@ -1,0 +1,11 @@
+; ISSUE-024: across an import cycle, a `defconst` whose value is an expression
+; such as `(* 2 3)` is "undefined: EXPR — defined in a file this unit imports
+; circularly", though docs/toplevel.md says constants resolve across a cycle.
+; A literal `defconst` does resolve. Here a <-> b, and b reads a's constants.
+; flags: -I $ROOT/probes
+; fixed-when: output-contains sum=12
+(import-use "stdio.h")
+(import-use issue-024.a)
+(defn main ():i32
+  (printf "sum=%d\n" (a-sum))
+  (return 0))

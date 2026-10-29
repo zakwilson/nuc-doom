@@ -1,0 +1,577 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Movement and its consequences (p_map.c): position checks against things and
+; lines, sliding along walls, hitscan aiming and shooting, using lines,
+; explosions, and things caught by moving floors and ceilings.
+
+(ns doom.play.map)
+
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.random)
+(import-use doom.system)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.geom)
+(import-use doom.sound)
+(import-use doom.render.main)
+(import-use doom.play.maputl)
+(import-use doom.play.mobj)
+(import-use doom.play.inter)
+(import-use doom.play.spec)
+(import-use doom.play.sight)
+
+(defconst- USERANGE (* 64 FRAC-UNIT))
+(defconst- MAXSPECIALCROSS 20)
+(defconst- MAXSPECIALCROSS-ORIGINAL 8)
+
+; Stands in for "no thing" where the C's globals always hold one by the time
+; they are read.
+(defvar- no-mobj:Mobj)
+
+;; The move being checked (P_CheckPosition's results).
+
+(defvar tm-bbox:(array Fixed 4))
+(defvar- tm-thing:&Mobj &no-mobj)
+(defvar- tm-flags:i32 0)
+; Globals start at (Fixed 0): FIXED-ZERO is refused here. ISSUE-016
+(defvar- tm-x:Fixed (Fixed 0))
+(defvar- tm-y:Fixed (Fixed 0))
+; Whether the move failed only on height, so a floater may rise or sink.
+(defvar float-ok:bool false)
+(defvar tm-floorz:Fixed (Fixed 0))
+(defvar tm-ceilingz:Fixed (Fixed 0))
+(defvar- tm-dropoffz:Fixed (Fixed 0))
+; The line that set tm-ceilingz; a missile hitting sky there vanishes.
+(defvar ceiling-line:?&Line null)
+
+; Special lines the move touched, to trigger if it crosses them.
+(defvar- spechit:(array ?&Line 20))
+(defvar- num-spechit:i32 0)
+
+(defvar- crush-change:bool false)
+(defvar- no-fit:bool false)
+
+(defn- set-tm-bbox (x:Fixed y:Fixed r:Fixed):void
+  (set! (aref tm-bbox BOXTOP) (+ y r))
+  (set! (aref tm-bbox BOXBOTTOM) (- y r))
+  (set! (aref tm-bbox BOXRIGHT) (+ x r))
+  (set! (aref tm-bbox BOXLEFT) (- x r)))
+
+; Starts a position check of `thing` at (x, y) against its new subsector.
+(defn- begin-check (thing:&Mobj x:Fixed y:Fixed):void
+  (set! tm-thing thing)
+  (set! tm-flags (thing 'flags))
+  (set! tm-x x)
+  (set! tm-y y)
+  (set-tm-bbox x y (thing 'radius))
+  (let (sec ((point-in-subsector x y) 'sector))
+    (set! ceiling-line null)
+    (set! tm-floorz (sec 'floor-height))
+    (set! tm-dropoffz (sec 'floor-height))
+    (set! tm-ceilingz (sec 'ceiling-height)))
+  (inc! validcount)
+  (set! num-spechit 0))
+
+; Runs `func` over the things in every cell the box (widened by `pad`) touches.
+(defn- box-things (pad:Fixed func:(fn bool)(&Mobj)):bool
+  (let (xl (block-x (- (aref tm-bbox BOXLEFT) pad))
+        xh (block-x (+ (aref tm-bbox BOXRIGHT) pad))
+        yl (block-y (- (aref tm-bbox BOXBOTTOM) pad))
+        yh (block-y (+ (aref tm-bbox BOXTOP) pad))
+        ok true bx xl)
+    (while (and ok (<= bx xh)) ; ISSUE-026
+      (let (by yl)
+        (while (and ok (<= by yh)) ; ISSUE-026
+          (when (not (block-things-iterator bx by func)) (set! ok false))
+          (inc! by)))
+      (inc! bx))
+    ok))
+
+(defn- stomp-thing (thing:&Mobj):bool
+  (let (blockdist (+ (thing 'radius) (tm-thing 'radius)))
+    (cond (= (bit-and (thing 'flags) MF-SHOOTABLE) 0) true
+      (or (>= (fx-abs (- (thing 'x) tm-x)) blockdist)
+          (>= (fx-abs (- (thing 'y) tm-y)) blockdist)) true
+      (= (unsafe/cast ptr thing) (unsafe/cast ptr tm-thing)) true
+      ; Only players telefrag, except on MAP30.
+      (and (null? (tm-thing 'player)) (!= game-map 30)) false
+      true (do (damage-mobj thing tm-thing tm-thing 10000) true))))
+
+(defn teleport-move (thing:&Mobj x:Fixed y:Fixed):bool
+  (begin-check thing x y)
+  (if (not (box-things (Fixed MAXRADIUS) stomp-thing))
+    false
+    (do (unset-thing-position thing)
+        (set! (thing 'floorz) tm-floorz)
+        (set! (thing 'ceilingz) tm-ceilingz)
+        (set! (thing 'x) x)
+        (set! (thing 'y) y)
+        (set-thing-position thing)
+        true)))
+
+; Vanilla's spechit[8] overran into the globals after it; Chocolate Doom
+; reproduces the writes it can.
+(defn- spechit-overrun (ld:&Line):void
+  (let (addr (+ 0x01C09C98 (* (index-of lines ld) 0x3E)))
+    (case num-spechit
+      (:or 9 10 11 12) (set! (aref tm-bbox (- num-spechit 9)) (Fixed addr))
+      13 (set! crush-change (!= addr 0))
+      14 (set! no-fit (!= addr 0))
+      (do))))
+
+(defn- check-line (ld:&Line):bool
+  (cond (or (<= (aref tm-bbox BOXRIGHT) (aref (ld 'bbox) BOXLEFT))
+            (>= (aref tm-bbox BOXLEFT) (aref (ld 'bbox) BOXRIGHT))
+            (<= (aref tm-bbox BOXTOP) (aref (ld 'bbox) BOXBOTTOM))
+            (>= (aref tm-bbox BOXBOTTOM) (aref (ld 'bbox) BOXTOP))) true
+    (!= (box-on-line-side tm-bbox ld) -1) true
+    ; One-sided lines block everything.
+    (null? (ld 'back-sector)) false
+    (and (= (bit-and (tm-thing 'flags) MF-MISSILE) 0)
+         (or (!= (bit-and (ld 'flags) ML-BLOCKING) 0)
+             (and (null? (tm-thing 'player)) (!= (bit-and (ld 'flags) ML-BLOCKMONSTERS) 0)))) false
+    true
+    (do (line-opening ld)
+        (when (< open-top tm-ceilingz)
+          (set! tm-ceilingz open-top)
+          (set! ceiling-line ld))
+        (when (> open-bottom tm-floorz) (set! tm-floorz open-bottom))
+        (when (< low-floor tm-dropoffz) (set! tm-dropoffz low-floor))
+        (when (!= (ld 'special) 0)
+          (when (= num-spechit MAXSPECIALCROSS) (fatal "spechit overflow"))
+          (set! (aref spechit num-spechit) ld)
+          (inc! num-spechit)
+          (when (> num-spechit MAXSPECIALCROSS-ORIGINAL) (spechit-overrun ld)))
+        true)))
+
+(defn crossed-specials? ():bool (!= num-spechit 0))
+
+; A monster that bumped into special lines tries to use them (doors), last
+; one first; true if any worked.
+(defn use-crossed-specials (actor:&Mobj):bool
+  (let (good false)
+    (while (> num-spechit 0)
+      (set! num-spechit (- num-spechit 1))
+      (when-some (ld (aref spechit num-spechit))
+        (when (use-special-line actor ld 0) (set! good true))))
+    good))
+
+(defn- same-species? (a:&Mobj b:&Mobj):bool
+  (or (= (a 'type) (b 'type))
+      (and (= (a 'type) MT-KNIGHT) (= (b 'type) MT-BRUISER))
+      (and (= (a 'type) MT-BRUISER) (= (b 'type) MT-KNIGHT))))
+
+(defn- check-thing (thing:&Mobj):bool
+  (let (blockdist (+ (thing 'radius) (tm-thing 'radius))
+        tm tm-thing)
+    (cond (= (bit-and (thing 'flags) (bit-or MF-SOLID (bit-or MF-SPECIAL MF-SHOOTABLE))) 0) true
+      (or (>= (fx-abs (- (thing 'x) tm-x)) blockdist)
+          (>= (fx-abs (- (thing 'y) tm-y)) blockdist)) true
+      (= (unsafe/cast ptr thing) (unsafe/cast ptr tm)) true
+      ; A charging lost soul hits whatever it meets.
+      (!= (bit-and (tm 'flags) MF-SKULLFLY) 0)
+      (let (damage (* (+ (% (p-random) 8) 1) ((mobj-info-of tm) 'damage)))
+        (damage-mobj thing tm tm damage)
+        (set! (tm 'flags) (bit-and (tm 'flags) (bit-not MF-SKULLFLY)))
+        (set! (tm 'momx) (Fixed 0))
+        (set! (tm 'momy) (Fixed 0))
+        (set! (tm 'momz) (Fixed 0))
+        (set-mobj-state tm ((mobj-info-of tm) 'spawn-state))
+        false)
+      (!= (bit-and (tm 'flags) MF-MISSILE) 0) (missile-hits tm thing)
+      (!= (bit-and (thing 'flags) MF-SPECIAL) 0)
+      (let (solid (!= (bit-and (thing 'flags) MF-SOLID) 0))
+        (when (!= (bit-and tm-flags MF-PICKUP) 0) (touch-special-thing thing tm))
+        (not solid))
+      true (= (bit-and (thing 'flags) MF-SOLID) 0))))
+
+; Whether missile `tm` passes `thing`; damages it if not.
+(defn- missile-hits (tm:&Mobj thing:&Mobj):bool
+  (cond (> (tm 'z) (+ (thing 'z) (thing 'height))) true
+    (< (+ (tm 'z) (tm 'height)) (thing 'z)) true
+    true
+    (let (decided false result false)
+      ; Monsters don't hurt their own kind with missiles.
+      (when-some (src (tm 'target))
+        (when (same-species? src thing)
+          (cond (= (unsafe/cast ptr thing) (unsafe/cast ptr src)) (do (set! decided true) (set! result true))
+            (!= (thing 'type) MT-PLAYER) (do (set! decided true) (set! result false)))))
+      (cond decided result
+        (= (bit-and (thing 'flags) MF-SHOOTABLE) 0) (= (bit-and (thing 'flags) MF-SOLID) 0)
+        true (let (damage (* (+ (% (p-random) 8) 1) ((mobj-info-of tm) 'damage)))
+               (damage-mobj thing tm (tm 'target) damage)
+               false)))))
+
+; Whether `thing` could stand at (x, y), leaving the opening it would have in
+; tm-floorz and tm-ceilingz. Things are checked before lines.
+(defn check-position (thing:&Mobj x:Fixed y:Fixed):bool
+  (begin-check thing x y)
+  (cond (!= (bit-and tm-flags MF-NOCLIP) 0) true
+    (not (box-things (Fixed MAXRADIUS) check-thing)) false
+    true
+    (let (xl (block-x (aref tm-bbox BOXLEFT))
+          xh (block-x (aref tm-bbox BOXRIGHT))
+          yl (block-y (aref tm-bbox BOXBOTTOM))
+          yh (block-y (aref tm-bbox BOXTOP))
+          ok true bx xl)
+      (while (and ok (<= bx xh)) ; ISSUE-026
+        (let (by yl)
+          (while (and ok (<= by yh)) ; ISSUE-026
+            (when (not (block-lines-iterator bx by check-line)) (set! ok false))
+            (inc! by)))
+        (inc! bx))
+      ok)))
+
+(defn try-move (thing:&Mobj x:Fixed y:Fixed):bool
+  (set! float-ok false)
+  (cond (not (check-position thing x y)) false
+    (and (= (bit-and (thing 'flags) MF-NOCLIP) 0) (not (fits? thing))) false
+    true
+    (let (oldx (thing 'x) oldy (thing 'y))
+      (unset-thing-position thing)
+      (set! (thing 'floorz) tm-floorz)
+      (set! (thing 'ceilingz) tm-ceilingz)
+      (set! (thing 'x) x)
+      (set! (thing 'y) y)
+      (set-thing-position thing)
+      (when (= (bit-and (thing 'flags) (bit-or MF-TELEPORT MF-NOCLIP)) 0)
+        ; Last touched first, as the C counts down.
+        (while (> num-spechit 0)
+          (set! num-spechit (- num-spechit 1))
+          (when-some (ld (aref spechit num-spechit))
+            (let (side (point-on-line-side (thing 'x) (thing 'y) ld)
+                  oldside (point-on-line-side oldx oldy ld))
+              (when (and (!= side oldside) (!= (ld 'special) 0))
+                (cross-special-line ld oldside thing))))))
+      true)))
+
+; The height tests of a move whose position check passed.
+(defn- fits? (thing:&Mobj):bool
+  (let (step:Fixed (Fixed (* 24 FRAC-UNIT))) ; ISSUE-025
+    (cond (< (- tm-ceilingz tm-floorz) (thing 'height)) false
+      true
+      (do (set! float-ok true)
+          (cond (and (= (bit-and (thing 'flags) MF-TELEPORT) 0)
+                     (< (- tm-ceilingz (thing 'z)) (thing 'height))) false
+            (and (= (bit-and (thing 'flags) MF-TELEPORT) 0)
+                 (> (- tm-floorz (thing 'z)) step)) false
+            (and (= (bit-and (thing 'flags) (bit-or MF-DROPOFF MF-FLOAT)) 0)
+                 (> (- tm-floorz tm-dropoffz) step)) false
+            true true)))))
+
+; Refits a thing to its sector after the floor or ceiling moved; false if it
+; no longer fits.
+(defn thing-height-clip (thing:&Mobj):bool
+  (let (onfloor (= (thing 'z) (thing 'floorz)))
+    (check-position thing (thing 'x) (thing 'y))
+    (set! (thing 'floorz) tm-floorz)
+    (set! (thing 'ceilingz) tm-ceilingz)
+    (if onfloor
+      (set! (thing 'z) (thing 'floorz))
+      (when (> (+ (thing 'z) (thing 'height)) (thing 'ceilingz))
+        (set! (thing 'z) (- (thing 'ceilingz) (thing 'height)))))
+    (>= (- (thing 'ceilingz) (thing 'floorz)) (thing 'height))))
+
+;; Sliding along walls.
+
+(defvar- best-slide-frac:Fixed (Fixed 0))
+(defvar- second-slide-frac:Fixed (Fixed 0))
+(defvar- best-slide-line:?&Line null)
+(defvar- second-slide-line:?&Line null)
+(defvar- slide-mo:&Mobj &no-mobj)
+(defvar- tm-xmove:Fixed (Fixed 0))
+(defvar- tm-ymove:Fixed (Fixed 0))
+
+; Cuts the move down to its component along the wall.
+(defn- hit-slide-line (ld:&Line):void
+  (cond (= (ld 'slope-type) ST-HORIZONTAL) (set! tm-ymove (Fixed 0))
+    (= (ld 'slope-type) ST-VERTICAL) (set! tm-xmove (Fixed 0))
+    true
+    (let (side (point-on-line-side (slide-mo 'x) (slide-mo 'y) ld)
+          lineangle:Angle (point-to-angle2 (Fixed 0) (Fixed 0) (ld 'dx) (ld 'dy)))
+      (when (= side 1) (set! lineangle (+ lineangle ANG180)))
+      (let (moveangle (point-to-angle2 (Fixed 0) (Fixed 0) tm-xmove tm-ymove)
+            deltaangle:Angle (- moveangle lineangle))
+        (when (> deltaangle ANG180) (set! deltaangle (+ deltaangle ANG180)))
+        (let (movelen (approx-distance tm-xmove tm-ymove)
+              newlen (* movelen (fine-cosine (fine-index deltaangle))))
+          (set! tm-xmove (* newlen (fine-cosine (fine-index lineangle))))
+          (set! tm-ymove (* newlen (fine-sine (fine-index lineangle)))))))))
+
+(defn- slide-traverse (in:&Intercept):bool
+  (if-some (li (in 'line))
+    (let (blocking
+          (if (= (bit-and (li 'flags) ML-TWOSIDED) 0)
+            ; The back of a one-sided line doesn't block.
+            (= (point-on-line-side (slide-mo 'x) (slide-mo 'y) li) 0)
+            (do (line-opening li)
+                (or (< open-range (slide-mo 'height))
+                    (< (- open-top (slide-mo 'z)) (slide-mo 'height))
+                    (> (- open-bottom (slide-mo 'z)) (Fixed (* 24 FRAC-UNIT)))))))
+      (if (not blocking)
+        true
+        (do (when (< (in 'frac) best-slide-frac)
+              (set! second-slide-frac best-slide-frac)
+              (set! second-slide-line best-slide-line)
+              (set! best-slide-frac (in 'frac))
+              (set! best-slide-line li))
+            false)))
+    (do (fatal "PTR_SlideTraverse: not a line?") false)))
+
+; Tries the move along the axes when the slide gives up.
+(defn- stair-step (mo:&Mobj):void
+  (when (not (try-move mo (mo 'x) (+ (mo 'y) (mo 'momy))))
+    (try-move mo (+ (mo 'x) (mo 'momx)) (mo 'y))))
+
+; The player's move hit something: slide along the nearest wall the leading
+; corners would cross.
+(defn slide-move (mo:&Mobj):void
+  (set! slide-mo mo)
+  (let (hitcount:i32 0 again true)
+    (while again
+      (set! again false)
+      (inc! hitcount)
+      (if (= hitcount 3)
+        (stair-step mo)
+        (let (r (mo 'radius)
+              leadx (if (> ((mo 'momx) 'v) 0) (+ (mo 'x) r) (- (mo 'x) r))
+              trailx (if (> ((mo 'momx) 'v) 0) (- (mo 'x) r) (+ (mo 'x) r))
+              leady (if (> ((mo 'momy) 'v) 0) (+ (mo 'y) r) (- (mo 'y) r))
+              traily (if (> ((mo 'momy) 'v) 0) (- (mo 'y) r) (+ (mo 'y) r))
+              unset:Fixed (Fixed (+ FRAC-UNIT 1))) ; ISSUE-025
+          (set! best-slide-frac unset)
+          (path-traverse leadx leady (+ leadx (mo 'momx)) (+ leady (mo 'momy)) PT-ADDLINES slide-traverse)
+          (path-traverse trailx leady (+ trailx (mo 'momx)) (+ leady (mo 'momy)) PT-ADDLINES slide-traverse)
+          (path-traverse leadx traily (+ leadx (mo 'momx)) (+ traily (mo 'momy)) PT-ADDLINES slide-traverse)
+          (if (= best-slide-frac unset)
+            (stair-step mo)
+            (do (set! best-slide-frac (- best-slide-frac (Fixed 0x800)))
+                (if (and (> (best-slide-frac 'v) 0)
+                         (not (try-move mo (+ (mo 'x) (* (mo 'momx) best-slide-frac))
+                                        (+ (mo 'y) (* (mo 'momy) best-slide-frac)))))
+                  (stair-step mo)
+                  (do (set! best-slide-frac (- FIXED-ONE (+ best-slide-frac (Fixed 0x800))))
+                      (when (> best-slide-frac FIXED-ONE) (set! best-slide-frac FIXED-ONE))
+                      (when (> (best-slide-frac 'v) 0)
+                        (set! tm-xmove (* (mo 'momx) best-slide-frac))
+                        (set! tm-ymove (* (mo 'momy) best-slide-frac))
+                        (when-some (bl best-slide-line) (hit-slide-line bl))
+                        (set! (mo 'momx) tm-xmove)
+                        (set! (mo 'momy) tm-ymove)
+                        (when (not (try-move mo (+ (mo 'x) tm-xmove) (+ (mo 'y) tm-ymove)))
+                          (set! again true))))))))))))
+
+;; Hitscans: aim (find a target and slope), then shoot along it.
+
+(defvar line-target:?&Mobj null)
+(defvar- shoot-thing:&Mobj &no-mobj)
+(defvar- shootz:Fixed (Fixed 0))
+(defvar- la-damage:i32 0)
+(defvar attack-range:Fixed (Fixed 0))
+(defvar- aim-slope:Fixed (Fixed 0))
+(defvar- top-slope:Fixed (Fixed 0))
+(defvar- bottom-slope:Fixed (Fixed 0))
+
+(defn- aim-traverse (in:&Intercept):bool
+  (if-some (li (in 'line))
+    (cond (= (bit-and (li 'flags) ML-TWOSIDED) 0) false
+      true
+      (do (line-opening li)
+          (if (>= open-bottom open-top)
+            false
+            (let (dist (* attack-range (in 'frac))
+                  front (unsafe/cast &Sector (li 'front-sector))
+                  back (li 'back-sector))
+              (when (or (null? back) (!= (front 'floor-height) ((unsafe/cast &Sector back) 'floor-height)))
+                (let (slope (/ (- open-bottom shootz) dist))
+                  (when (> slope bottom-slope) (set! bottom-slope slope))))
+              (when (or (null? back) (!= (front 'ceiling-height) ((unsafe/cast &Sector back) 'ceiling-height)))
+                (let (slope (/ (- open-top shootz) dist))
+                  (when (< slope top-slope) (set! top-slope slope))))
+              (> top-slope bottom-slope)))))
+    (when-some (th (in 'thing))
+      (cond (= (unsafe/cast ptr th) (unsafe/cast ptr shoot-thing)) true
+        (= (bit-and (th 'flags) MF-SHOOTABLE) 0) true
+        true
+        (let (dist (* attack-range (in 'frac))
+              thingtop (/ (- (+ (th 'z) (th 'height)) shootz) dist))
+          (if (< thingtop bottom-slope)
+            true
+            (let (thingbottom (/ (- (th 'z) shootz) dist))
+              (if (> thingbottom top-slope)
+                true
+                (let (t (if (> thingtop top-slope) top-slope thingtop)
+                      b (if (< thingbottom bottom-slope) bottom-slope thingbottom))
+                  (set! aim-slope (/ (+ t b) 2))
+                  (set! line-target th)
+                  false)))))))))
+
+; Where a hitscan hit, `back` (in map units) short of the intercept.
+(defn- hit-point (in:&Intercept back:i32):SoundOrg
+  (let (frac (- (in 'frac) (/ (Fixed (* back FRAC-UNIT)) attack-range)))
+    (SoundOrg (+ (trace 'x) (* (trace 'dx) frac))
+              (+ (trace 'y) (* (trace 'dy) frac))
+              (+ shootz (* aim-slope (* frac attack-range))))))
+
+(defn- shoot-traverse (in:&Intercept):bool
+  (if-some (li (in 'line))
+    (do (when (!= (li 'special) 0) (shoot-special-line shoot-thing li))
+        (let (front (unsafe/cast &Sector (li 'front-sector))
+              hit
+              (if (= (bit-and (li 'flags) ML-TWOSIDED) 0)
+                true
+                (do (line-opening li)
+                    (let (dist (* attack-range (in 'frac)))
+                      (if-some (back (li 'back-sector))
+                        (or (and (!= (front 'floor-height) (back 'floor-height))
+                                 (> (/ (- open-bottom shootz) dist) aim-slope))
+                            (and (!= (front 'ceiling-height) (back 'ceiling-height))
+                                 (< (/ (- open-top shootz) dist) aim-slope)))
+                        (or (> (/ (- open-bottom shootz) dist) aim-slope)
+                            (< (/ (- open-top shootz) dist) aim-slope)))))))
+          (if (not hit)
+            true
+            (let (p (hit-point in 4))
+              ; Shots into the sky make no puff.
+              (when (not (and (= (front 'ceiling-pic) sky-flat-num)
+                              (or (> (p 'z) (front 'ceiling-height))
+                                  (if-some (back (li 'back-sector))
+                                    (= (back 'ceiling-pic) sky-flat-num)
+                                    false))))
+                (spawn-puff (p 'x) (p 'y) (p 'z)))
+              false))))
+    (if-some (th (in 'thing))
+      (cond (= (unsafe/cast ptr th) (unsafe/cast ptr shoot-thing)) true
+        (= (bit-and (th 'flags) MF-SHOOTABLE) 0) true
+        true
+        (let (dist (* attack-range (in 'frac)))
+          (cond (< (/ (- (+ (th 'z) (th 'height)) shootz) dist) aim-slope) true
+            (> (/ (- (th 'z) shootz) dist) aim-slope) true
+            true
+            (let (p (hit-point in 10))
+              (if (!= (bit-and (th 'flags) MF-NOBLOOD) 0)
+                (spawn-puff (p 'x) (p 'y) (p 'z))
+                (spawn-blood (p 'x) (p 'y) (p 'z) la-damage))
+              (when (!= la-damage 0) (damage-mobj th shoot-thing shoot-thing la-damage))
+              false))))
+      true)))
+
+(defn- trace-end (t1:&Mobj angle:Angle distance:Fixed):SoundOrg
+  (let (n (fx-int distance) a (fine-index angle))
+    (SoundOrg (+ (t1 'x) (* (fine-cosine a) n)) (+ (t1 'y) (* (fine-sine a) n)) (Fixed 0))))
+
+; The slope to the first shootable thing in range along `angle`, or 0, with
+; line-target set to it.
+(defn aim-line-attack (t1:&Mobj angle:Angle distance:Fixed):Fixed
+  (let (end (trace-end t1 angle distance))
+    (set! shoot-thing t1)
+    (set! shootz (+ (+ (t1 'z) (fx-shr (t1 'height) 1)) (Fixed (* 8 FRAC-UNIT))))
+    (set! top-slope (Fixed (/ (* 100 FRAC-UNIT) 160)))
+    (set! bottom-slope (Fixed (/ (* -100 FRAC-UNIT) 160)))
+    (set! attack-range distance)
+    (set! line-target null)
+    (path-traverse (t1 'x) (t1 'y) (end 'x) (end 'y) (bit-or PT-ADDLINES PT-ADDTHINGS) aim-traverse)
+    (if (null? line-target) (Fixed 0) aim-slope)))
+
+(defn line-attack (t1:&Mobj angle:Angle distance:Fixed slope:Fixed damage:i32):void
+  (let (end (trace-end t1 angle distance))
+    (set! shoot-thing t1)
+    (set! la-damage damage)
+    (set! shootz (+ (+ (t1 'z) (fx-shr (t1 'height) 1)) (Fixed (* 8 FRAC-UNIT))))
+    (set! attack-range distance)
+    (set! aim-slope slope)
+    (path-traverse (t1 'x) (t1 'y) (end 'x) (end 'y) (bit-or PT-ADDLINES PT-ADDTHINGS) shoot-traverse)))
+
+;; Using lines.
+
+(defvar- use-thing:&Mobj &no-mobj)
+
+(defn- use-traverse (in:&Intercept):bool
+  (when-some (li (in 'line))
+    (if (= (li 'special) 0)
+      (do (line-opening li)
+          (if (<= (open-range 'v) 0)
+            (do (start-sound use-thing SFX-NOWAY) false)
+            true))
+      (do (use-special-line use-thing li (if (= (point-on-line-side (use-thing 'x) (use-thing 'y) li) 1) 1 0))
+          false))))
+
+(defn use-lines (p:&Player):void
+  (when-some (mo (p 'mo))
+    (set! use-thing mo)
+    (let (end (trace-end mo (mo 'angle) (Fixed USERANGE)))
+      (path-traverse (mo 'x) (mo 'y) (end 'x) (end 'y) PT-ADDLINES use-traverse))))
+
+;; Explosions.
+
+(defvar- bomb-source:?&Mobj null)
+(defvar- bomb-spot:&Mobj &no-mobj)
+(defvar- bomb-damage:i32 0)
+
+(defn- radius-attack-thing (thing:&Mobj):bool
+  (when (and (!= (bit-and (thing 'flags) MF-SHOOTABLE) 0)
+             ; The bosses shrug off splash damage.
+             (!= (thing 'type) MT-CYBORG) (!= (thing 'type) MT-SPIDER))
+    (let (dx (fx-abs (- (thing 'x) (bomb-spot 'x)))
+          dy (fx-abs (- (thing 'y) (bomb-spot 'y)))
+          d (fx-int (- (if (> dx dy) dx dy) (thing 'radius)))
+          dist (if (< d 0) 0 d))
+      (when (and (< dist bomb-damage) (check-sight thing bomb-spot))
+        (damage-mobj thing bomb-spot bomb-source (- bomb-damage dist)))))
+  true)
+
+(defn radius-attack (spot:&Mobj source:?&Mobj damage:i32):void
+  ; MAXRADIUS is already fixed point, so the shift overflows it away, as in the C.
+  (let (dist:Fixed (Fixed (bit-shl (+ damage MAXRADIUS) FRAC-BITS)) ; ISSUE-025
+        yh (block-y (+ (spot 'y) dist)) yl (block-y (- (spot 'y) dist))
+        xh (block-x (+ (spot 'x) dist)) xl (block-x (- (spot 'x) dist)))
+    (set! bomb-spot spot)
+    (set! bomb-source source)
+    (set! bomb-damage damage)
+    (let (y yl)
+      (while (<= y yh)
+        (let (x xl)
+          (while (<= x xh)
+            (block-things-iterator x y radius-attack-thing)
+            (inc! x)))
+        (inc! y)))))
+
+;; Things in a sector whose floor or ceiling moved.
+
+(defn- change-sector-thing (thing:&Mobj):bool
+  (cond (thing-height-clip thing) true
+    ; Corpses are crushed to gibs.
+    (<= (thing 'health) 0)
+    (do (set-mobj-state thing S-GIBS)
+        (set! (thing 'flags) (bit-and (thing 'flags) (bit-not MF-SOLID)))
+        (set! (thing 'height) (Fixed 0))
+        (set! (thing 'radius) (Fixed 0))
+        true)
+    (!= (bit-and (thing 'flags) MF-DROPPED) 0) (do (remove-mobj thing) true)
+    (= (bit-and (thing 'flags) MF-SHOOTABLE) 0) true
+    true
+    (do (set! no-fit true)
+        (when (and crush-change (= (bit-and level-time 3) 0))
+          (damage-mobj thing null null 10)
+          (let (mo (spawn-mobj (thing 'x) (thing 'y) (+ (thing 'z) (/ (thing 'height) 2)) MT-BLOOD))
+            (set! (mo 'momx) (Fixed (bit-shl (p-sub-random) 12)))
+            (set! (mo 'momy) (Fixed (bit-shl (p-sub-random) 12)))))
+        true)))
+
+; Refits every thing in the sector's blockmap box; true if one didn't fit.
+(defn change-sector (sector:&Sector crunch:bool):bool
+  (set! no-fit false)
+  (set! crush-change crunch)
+  (let (bb (sector 'blockbox) x (aref bb BOXLEFT))
+    (while (<= x (aref bb BOXRIGHT))
+      (let (y (aref bb BOXBOTTOM))
+        (while (<= y (aref bb BOXTOP))
+          (block-things-iterator x y change-sector-thing)
+          (inc! y)))
+      (inc! x)))
+  no-fit)

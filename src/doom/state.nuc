@@ -11,6 +11,13 @@
 (defvar game-mode:i32 SHAREWARE)
 (defvar game-mission:i32 DOOM)
 
+; The executable being emulated (d_mode.h), in its order: the playsim tests
+; ranges of versions.
+(defenum GameVersion
+  EXE-DOOM-1-2 EXE-DOOM-1-5 EXE-DOOM-1-666 EXE-DOOM-1-7 EXE-DOOM-1-8 EXE-DOOM-1-9
+  EXE-HACX EXE-ULTIMATE EXE-FINAL EXE-FINAL2 EXE-CHEX)
+(defvar game-version:i32 EXE-DOOM-1-9)
+
 (defvar game-skill:i32 SK-MEDIUM)
 (defvar game-episode:i32 1)
 (defvar game-map:i32 1)
@@ -21,6 +28,7 @@
 (defvar deathmatch:i32 0)
 (defvar nomonsters:bool false)
 (defvar respawn-monsters:bool false)
+(defvar respawn-parm:bool false)
 (defvar fast-parm:bool false)
 
 (defvar players:(array Player 4))
@@ -28,15 +36,27 @@
 (defvar console-player:i32 0)
 (defvar display-player:i32 0)
 
+(defvar game-tic:i32 0)
 (defvar level-time:i32 0)
 (defvar total-kills:i32 0)
 (defvar total-items:i32 0)
 (defvar total-secret:i32 0)
 
 (defvar demo-playback:bool false)
+(defvar timing-demo:bool false)
 (defvar paused:bool false)
 (defvar menu-active:bool false)
 (defvar automap-active:bool false)
 (defvar view-active:bool false)
 
 (defn player (i:i32):&Player (unsafe/cast &Player (unsafe/ptr+ (unsafe/cast ptr:Player &players) i)))
+
+(defn same-player? (a:&Player b:&Player):bool (= (unsafe/cast ptr a) (unsafe/cast ptr b)))
+
+(defn console-player? (p:&Player):bool (same-player? p (player console-player)))
+
+; The C gets a player's number by pointer subtraction.
+(defn player-num (p:&Player):i32
+  (let (i:i32 0)
+    (while (and (< i MAX-PLAYERS) (not (same-player? p (player i)))) (inc! i))
+    i))

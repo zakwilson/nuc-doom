@@ -27,6 +27,11 @@ Format and rules: `PROMPT.md` §7.
 | — | ISSUE-019 | papercut | diagnostics | 0 |
 | — | ISSUE-020 | papercut | docs | 1 |
 | — | ISSUE-021 | minor | design gap | many |
+| — | ISSUE-022 | major | bug | 1 |
+| — | ISSUE-023 | major | bug | 1 |
+| — | ISSUE-024 | minor | bug | 8 |
+| — | ISSUE-025 | minor | design gap | 13 |
+| — | ISSUE-026 | minor | design gap | ~15 |
 
 ---
 
@@ -393,6 +398,88 @@ elements and a `ptr` has no bounds, so neither fits.
 
 ---
 
+## ISSUE-022: A `match` whose arms mix a struct value and a struct literal silently returns zero
+
+- **Severity:** major (silent wrong code)
+- **Kind:** bug
+- **Status:** fixed in nucleus `5daff8f`
+- **Probe:** `probes/issue-022.nuc`. Expected `union 3 7 / enum 1 7 / niche 4 7`. Actual `union 0 0 / enum 0 0 / niche 0 0`. Bound in a `let`, the same match gives "alloca void" IR. In the port it surfaced as "internal: aggregate return of a ptr where the declared return type is Fixed".
+- **Port sites:** `src/doom/play/spec.nuc` (`find-next-highest-floor`, a match on `?i32` whose arms are `(Fixed …)` and a Fixed variable)
+- **Workaround:** none needed after the fix. Before it, wrap the literal in `(deref …)` or return from each arm explicitly.
+- **Suggestion:** done. Both match joins now load a `&S` arm under a by-value `S` want, as cond does since ISSUE-003. A union or enum match whose arms still disagree is refused at a return. The niche-Maybe match path still doesn't record why its join was lost, so a disagreeing niche match still returns zero. One shared branch-join helper for cond and every match path would have prevented this.
+
+Context: this is ISSUE-003 again, in the other branching form. ISSUE-003's fix
+went into `emit-cond` alone, while `match` keeps two join loops of its own
+(`emit-match-clauses` and `emit-niche-match-arm`). Each repeats cond's typing
+rules by hand, and the comments say so.
+
+---
+
+## ISSUE-023: An untyped `let` binding that shares a function's name loses the let's tail to the function
+
+- **Severity:** major (an internal error at line 0, or a refusal that names neither binding)
+- **Kind:** bug
+- **Status:** fixed in nucleus `ec21b5e`
+- **Probe:** `probes/issue-023.nuc`. Expected `4 8`. Actual: "shadow: implicit return type mismatch — last expression does not match declared return type". With a struct return, "internal: aggregate return of a (f64):f64 where the declared return type is Fixed", at line 0.
+- **Port sites:** `src/doom/play/spec.nuc` (`find-lowest-floor-surrounding`, whose local `floor` met libm's `floor`, pulled in by an import)
+- **Workaround:** none needed after the fix. Before it, give the binding a type or another name.
+- **Suggestion:** done. `node-type-block` now types a bare binding by its init, as `emit-let` does. The aggregate-return internal error also names its function now. The root cause is two passes that must agree: every Val's type is overwritten by `node-type`'s answer, so any form `node-type` models less precisely than the emitter is a latent miscompile. A debug mode that checks the two agree, instead of overwriting, would find the rest.
+
+Context: the name came from an unrelated `math.h` import, three modules away,
+so nothing in `spec.nuc` hinted at it. Only a temporary patch to the compiler's
+message showed which function it was in.
+
+---
+
+## ISSUE-024: A computed `defconst` doesn't resolve across an import cycle, though the docs say constants do
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-024.nuc` (with `probes/issue-024/`). Expected `sum=12`. Actual: "undefined: EXPR — defined in a file this unit imports circularly, and not registered yet at this point".
+- **Port sites:** `src/doom/world.nuc` (eight playsim constants, `MELEERANGE` …, moved out of `play/map`, `play/mobj`, `play/maputl` and `play/pspr`)
+- **Workaround:** define such constants in a module outside the cycle.
+- **Suggestion:** `docs/toplevel.md` ("Cross-file resolution") promises that "every function, global, constant and enum-member reference inside the cycle resolves". The prescan registers only a `defconst` whose value is a literal. A computed one (`(* 64 FRAC-UNIT)`, or even a bare `FRAC-UNIT`) waits for its file to be emitted, because macros aren't registered yet. Either fold on demand at the first reference, or add the case to the docs' table of things a cycle doesn't carry.
+
+Context: the playsim modules call each other freely, as the C files do
+through `p_local.h`, so they form one big cycle. The diagnostic was good, but
+it said nothing about constants, and it named only one cycle pair.
+
+---
+
+## ISSUE-025: A struct literal bound by an untyped `let` is a `&S`, so `S`'s operators and `set!`s don't apply
+
+- **Severity:** minor
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** none; this is the documented rule (`docs/structs-unions.md`, "Compound literals in by-value struct positions").
+- **Port sites:** 13 `name:Fixed (Fixed …)` bindings in `play/*.nuc`; `movers.nuc` `do-donut` (`s3-height`)
+- **Workaround:** give the binding its type: `(let (range:Fixed (Fixed …)) …)`.
+- **Suggestion:** bind an untyped struct literal as an `S` value, the way a `:S` binding takes it. Then join a `&S` literal branch with `S` siblings as `S` even with no want. Today `(let (h (if-some (s x) (s 'floor-height) (Fixed 0))) …)` collapses to void.
+
+Context: `(let (step (Fixed (* 24 FRAC-UNIT))) (* step x))` reads as a value.
+Instead it fails with "no matching method for '_*' with operand types
+(&Fixed, Fixed)". `(set! step other)` fails with "value is Fixed, slot is
+&Fixed". Both messages are accurate, and neither says the literal is the cause.
+
+---
+
+## ISSUE-026: Loops have no `break` or `continue`, and no form loops while a Maybe has a value
+
+- **Severity:** minor
+- **Kind:** design gap
+- **Status:** worked-around
+- **Probe:** none; nothing is broken.
+- **Port sites:** about 15 loops in `play/map.nuc`, `play/maputl.nuc`, `play/movers.nuc`, `play/setup.nuc` and `render/bsp.nuc` carry an `ok`/`go`/`going`/`stopped` flag; 4 linked-list walks in `play/thinkers.nuc` and `render/things.nuc`
+- **Workaround:** a flag in the `while` test; for lists, `(while (not (null? cur)) (when-some (n cur) … (set! cur (next n))))`, hidden in `do-mobjs`. `(return)` covers a loop at the end of a function.
+- **Suggestion:** a `break` (and `continue`) scoped to the nearest `while`/`dotimes`, and a `while-some` that binds the narrowed value each pass, as `when-some` does once. `label`/`goto` can express both, but they're function-scoped and read as C.
+
+Context: the blockmap and line-iterator code is all "walk until a callback
+says stop". The C writes it as `if (!func(...)) return false;` inside
+nested `for` loops. The flags make each loop's test longer than its body.
+
+---
+
 ## What worked well
 
 - **Row-set macros for `info.c`.** A table macro holding the rows, plus
@@ -410,3 +497,16 @@ elements and a `ptr` has no bounds, so neither fits.
   `w_wad.c`.
 - **`nucleus.test`.** `deftest` plus `check-eq-int` made the element-wise
   table-equality gate about 60 lines, reading `tables.c` at test time.
+- **A union for thinkers.** The C keeps each thinker's behavior as a function
+  pointer in a struct that every thinker type embeds, and finds mobjs by
+  comparing that pointer with `P_MobjThinker`. The port's `Thinker` union has
+  one arm per kind. One `match` in `doom.play.tick` runs them, and
+  `thinker-mobj` is a `match` too. A ninth kind of thinker would be a compile
+  error at each `match`, not a silent no-op.
+- **`case` with `(:or …)`** maps the C's fall-through `switch` groups (line
+  specials, pickups, state actions) row for row without the `break`s.
+- **Signedness errors earned their keep.** About a dozen "mixed
+  signed/unsigned operands" refusals in the playsim each forced a decision the
+  C makes implicitly: angle arithmetic wraps, turn offsets are signed, button
+  bits are bytes. Once the M4 modules compiled, all three demos stayed in sync
+  for every tic on the first run.

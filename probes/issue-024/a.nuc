@@ -1,0 +1,5 @@
+(ns issue-024.a)
+(import-use issue-024.b)
+(defconst PLAIN 6)
+(defconst EXPR (* 2 3))
+(defn a-sum ():i32 (b-sum))

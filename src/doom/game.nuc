@@ -7,6 +7,9 @@
 
 (import-use "string.h")
 (import-use nucleus.error)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
 (import-use doom.math)
 (import-use doom.defs)
 (import-use doom.random)
@@ -14,7 +17,14 @@
 (import-use doom.state)
 (import-use doom.render.main)
 (import-use doom.render.data)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.system)
+(import-use doom.sys.timer)
+(import-use doom.status)
 (import-use doom.play.setup)
+(import-use doom.play.tick)
+(import-use doom.play.spec)
 
 (defconst- MAX-AMMO (array i32 200 50 300 50))
 
@@ -38,8 +48,13 @@
     (set! (aref (p 'ammo) AM-CLIP) 50)
     (dotimes (i NUM-AMMO) (set! (aref (p 'max-ammo) i) (aref MAX-AMMO i)))))
 
+; The game state the screen last showed; a change starts a wipe.
+(defvar wipe-game-state:i32 GS-DEMOSCREEN)
+
 (defn do-load-level ():!void
   (set! sky-flat-num (flat-num-for-name "F_SKY1"))
+  ; Reloading the level wipes too.
+  (when (= wipe-game-state GS-LEVEL) (set! wipe-game-state -1))
   (set! game-state GS-LEVEL)
   (dotimes (i MAX-PLAYERS)
     (let (p (player i))
@@ -61,7 +76,9 @@
   (when (< map 1) (set! map 1))
   (when (and (> map 9) (!= game-mode COMMERCIAL)) (set! map 9))
   (clear-random)
-  (set! respawn-monsters (= skill SK-NIGHTMARE))
+  (set! respawn-monsters (or (= skill SK-NIGHTMARE) respawn-parm))
+  (when (or fast-parm (and (= skill SK-NIGHTMARE) (!= game-skill SK-NIGHTMARE)))
+    (fatal "G_InitNew: fast monsters are not ported yet"))
   (dotimes (i MAX-PLAYERS) (set! ((player i) 'player-state) PST-REBORN))
   (set! demo-playback false)
   (set! automap-active false)
@@ -76,3 +93,144 @@
                         (= episode 4) "SKY4"
                         true "SKY1")))
   (do-load-level))
+
+;; Leaving a level.
+
+(defvar secret-exit:bool false)
+
+(defn exit-level ():void
+  (set! secret-exit false)
+  (set! game-action GA-COMPLETED))
+
+(defn secret-exit-level ():void
+  (set! secret-exit (not (and (= game-mode COMMERCIAL) (< (check-num-for-name "map31") 0))))
+  (set! game-action GA-COMPLETED))
+
+;; Demos.
+
+(defconst- DEMOMARKER 0x80)
+
+(defvar- demo-name:StrView "")
+(defvar- demo:Bytes (Bytes null 0))
+(defvar- demo-pos:i32 0)
+(defvar- start-time:i32 0)
+
+; The IWAD's own demos say which executable it shipped with (d_main.c's
+; InitGameVersion).
+(defn detect-game-version ():void
+  (set! game-version EXE-DOOM-1-9)
+  (dotimes (i 3)
+    (let (lnum (check-num-for-name (string-as-view &(str "demo" (+ i 1)))))
+      (when (> lnum 0)
+        (let (v (u8 (lump lnum) 0)
+              ver (cond (<= v 4) EXE-DOOM-1-2
+                        (= v 106) EXE-DOOM-1-666
+                        (= v 107) EXE-DOOM-1-7
+                        (= v 108) EXE-DOOM-1-8
+                        (= v 109) EXE-DOOM-1-9
+                        true -1))
+          (when (>= ver 0)
+            (set! game-version ver)
+            (return)))))))
+
+(defn- demo-byte ():i32
+  (let (b (u8 demo demo-pos))
+    (inc! demo-pos)
+    b))
+
+(defn defer-play-demo (name:StrView):void
+  (set! demo-name name)
+  (set! game-action GA-PLAY-DEMO))
+
+(defn time-demo (name:StrView):void
+  (set! timing-demo true)
+  (defer-play-demo name))
+
+(defn- do-play-demo ():!void
+  (set! game-action GA-NOTHING)
+  (set! demo (try (lump-named demo-name)))
+  (set! demo-pos 0)
+  ; A pre-1.4 demo has no version byte and starts at the skill.
+  (let (version (u8 demo 0)
+        old-demo (<= version 4))
+    (when (not old-demo) (inc! demo-pos))
+    (when (and (!= version DOOM-VERSION) (not (and old-demo (<= game-version EXE-DOOM-1-2))))
+      (fatal (string-as-view &(str "Demo is from a different game version! (read " version ", should be " DOOM-VERSION ")"))))
+    (let (skill (demo-byte) episode (demo-byte) map (demo-byte))
+      (if old-demo
+        (do (set! deathmatch 0)
+            (set! respawn-parm false)
+            (set! fast-parm false)
+            (set! nomonsters false)
+            (set! console-player 0))
+        (do (set! deathmatch (demo-byte))
+            (set! respawn-parm (!= (demo-byte) 0))
+            (set! fast-parm (!= (demo-byte) 0))
+            (set! nomonsters (!= (demo-byte) 0))
+            (set! console-player (demo-byte))))
+      (dotimes (i MAX-PLAYERS) (set! (aref player-in-game i) (!= (demo-byte) 0)))
+      (when (aref player-in-game 1) (fatal "G_DoPlayDemo: net demos are not ported yet"))
+      (try (init-new skill episode map))))
+  (set! start-time (get-time))
+  (set! demo-playback true)
+  (ok))
+
+; The demo is over: a timed one reports and quits.
+(defn- check-demo-status ():void
+  (when timing-demo
+    (let (realtics (- (get-time) start-time))
+      (fatal (string-as-view &(str "timed " game-tic " gametics in " realtics " realtics")))))
+  (when demo-playback
+    (set! demo-playback false)
+    (set! deathmatch 0)
+    (set! respawn-parm false)
+    (set! fast-parm false)
+    (set! nomonsters false)
+    (set! console-player 0)
+    (fatal "demo over")))
+
+(defn- read-demo-ticcmd (cmd:&TicCmd):void
+  (if (= (u8 demo demo-pos) DEMOMARKER)
+    (check-demo-status)
+    (do (set! (cmd 'forward-move) (unsafe/cast i8 (demo-byte)))
+        (set! (cmd 'side-move) (unsafe/cast i8 (demo-byte)))
+        (set! (cmd 'angle-turn) (unsafe/cast i16 (bit-shl (demo-byte) 8)))
+        (set! (cmd 'buttons) (unsafe/cast ui8 (demo-byte))))))
+
+;; The game tic.
+
+; A single player who died restarts the level.
+(defn- do-reborn (pn:i32):void
+  (if (not netgame)
+    (set! game-action GA-LOAD-LEVEL)
+    (fatal "G_DoReborn: netgame respawning is not ported yet")))
+
+(defn- do-completed ():void
+  (fatal "G_DoCompleted: the intermission is not ported yet"))
+
+(defn game-ticker ():!void
+  (dotimes (i MAX-PLAYERS)
+    (when (and (aref player-in-game i) (= ((player i) 'player-state) PST-REBORN))
+      (do-reborn i)))
+  (while (!= game-action GA-NOTHING)
+    (case game-action
+      GA-LOAD-LEVEL (try (do-load-level))
+      GA-PLAY-DEMO (try (do-play-demo))
+      GA-COMPLETED (do-completed)
+      (fatal "G_Ticker: game action not ported yet")))
+  (dotimes (i MAX-PLAYERS)
+    (when (aref player-in-game i)
+      (let (cmd &((player i) 'cmd))
+        (memset (unsafe/cast ptr cmd) 0 (unsafe/cast usize (sizeof TicCmd)))
+        (when demo-playback (read-demo-ticcmd cmd)))))
+  (dotimes (i MAX-PLAYERS)
+    (when (aref player-in-game i)
+      (let (buttons (((player i) 'cmd) 'buttons))
+        (when (and (!= (bit-and (as i32 buttons) BT-SPECIAL) 0)
+                   (= (bit-and (as i32 buttons) BT-SPECIALMASK) BTS-PAUSE))
+          (set! paused (not paused))))))
+  (case game-state
+    GS-LEVEL (do (ticker)
+                 (status-ticker))
+    (do))
+  (ok))

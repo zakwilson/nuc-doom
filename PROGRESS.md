@@ -8,8 +8,8 @@
 | 1 | Foundations: fixed, tables, random, WAD, info, types, argv | done |
 | 2 | Static graphics, `-framedump` | done |
 | 3 | Level load and renderer | done |
-| 4 | Playsim, demos, `-tichash` | next |
-| 5 | Playable | — |
+| 4 | Playsim, demos, `-tichash` | done |
+| 5 | Playable | next |
 | 6 | Sound and music (optional) | — |
 | 7 | Savegames and config (optional) | — |
 | 8 | Idiom pass and final report | — |
@@ -61,12 +61,26 @@
 | `doom.render.plane` | `src/doom/render/plane.nuc` | r_plane.c, plus one clip store for every C clip array |
 | `doom.render.segs` | `src/doom/render/segs.nuc` | r_segs.c |
 | `doom.render.things` | `src/doom/render/things.nuc` | r_things.c (vissprites, masked walls, player sprites) |
-| `doom.play.tick` | `src/doom/play/tick.nuc` | p_tick.c (the thinker list; a `Thinker` union with an explicit state) |
+| `doom.play.thinkers` | `src/doom/play/thinkers.nuc` | p_tick.c's list (a `Thinker` union with an explicit state; `do-mobjs`) |
+| `doom.play.tick` | `src/doom/play/tick.nuc` | P_Ticker, and the `match` that stands in for each thinker's function pointer |
 | `doom.play.setup` | `src/doom/play/setup.nuc` | p_setup.c, including vanilla's REJECT padding |
-| `doom.play.mobj` | `src/doom/play/mobj.nuc` | p_mobj.c spawning, p_maputl.c position links |
-| `doom.play.pspr` | `src/doom/play/pspr.nuc` | p_pspr.c (only a stand-in raised pistol so far) |
-| `doom.play.user` | `src/doom/play/user.nuc` | p_user.c (`calc-height` so far) |
-| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`; a stand-in level tic) |
+| `doom.play.mobj` | `src/doom/play/mobj.nuc` | p_mobj.c |
+| `doom.play.maputl` | `src/doom/play/maputl.nuc` | p_maputl.c (blockmap links, iterators, intercepts and path traversal) |
+| `doom.play.map` | `src/doom/play/map.nuc` | p_map.c (movement, sliding, aiming, shooting, use, radius attacks, sector change) |
+| `doom.play.sight` | `src/doom/play/sight.nuc` | p_sight.c (both the BSP walk and Doom 1.2's blockmap walk) |
+| `doom.play.inter` | `src/doom/play/inter.nuc` | p_inter.c (pickups, damage, death) |
+| `doom.play.enemy` | `src/doom/play/enemy.nuc` | p_enemy.c, and the dispatch from each `Action` to its function |
+| `doom.play.pspr` | `src/doom/play/pspr.nuc` | p_pspr.c |
+| `doom.play.user` | `src/doom/play/user.nuc` | p_user.c |
+| `doom.play.movers` | `src/doom/play/movers.nuc` | p_floor.c, p_ceilng.c, p_doors.c, p_plats.c |
+| `doom.play.lights` | `src/doom/play/lights.nuc` | p_lights.c |
+| `doom.play.spec` | `src/doom/play/spec.nuc` | p_spec.c, p_switch.c, p_telept.c |
+| `doom.sound` | `src/doom/sound.nuc` | s_sound.c's effect on the game: the `M_Random` pitch draws only |
+| `doom.status` | `src/doom/status.nuc` | st_stuff.c's ticker (one `M_Random` a tic; nothing drawn yet) |
+| `doom.wipe` | `src/doom/wipe.nuc` | f_wipe.c's melt setup (its 320 `M_Random` draws; nothing drawn yet) |
+| `doom.sys.timer` | `src/doom/sys/timer.nuc` | i_timer.c |
+| `doom.tichash` | `src/doom/tichash.nuc` | `-tichash`, the port's half of the demo-sync harness |
+| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`, `-playdemo`, `-timedemo`) |
 | `tests.*` | `src/tests/*.nuc` | unit tests; `scripts/run-tests.sh` |
 
 - The trig tables can't be generated: no closed-form `sin`/`tan`/`atan` (double,
@@ -74,20 +88,30 @@
   differs at 33/200/1,870 entries. They are embedded and `tests.tables`
   checks them element-wise against `tables.c`.
 - State actions are a `defenum Action` (`A-NULL`, `A-LIGHT0`, …), so `doom.info`
-  doesn't depend on the playsim. M4 must map each to its function.
+  doesn't depend on the playsim. `doom.play.enemy` and `doom.play.pspr` map
+  each one to its function with a `case`.
+- The shareware IWAD's demos are Doom 1.2 demos, so `game-version` is
+  detected from them as Chocolate Doom does, and the playsim keeps both sides
+  of every `gameversion` branch: sight, melee range, the demon's bite,
+  threshold, self-targeting, pickup sounds, armor bonus cap, line triggers,
+  turbo floors, sector 17 and the line-anim limit.
+- Not ported yet; each one stops with a message: fast/nightmare monsters,
+  deathmatch starts, netgame respawn and net demos, and the intermission
+  (`G_DoCompleted`), which M5 adds.
 
 ## Gates
 
 - `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info).
 - `scripts/check-frames.sh`: `title` matches the reference byte for byte.
-  `e1m1` matches except the status bar (M5) and 3 view pixels at x=178..180,
-  y=87: a distant barrel whose two-frame animation needs the thinkers (M4).
-- `scripts/check-demos.sh`: from M4.
+  `e1m1` matches everywhere but the status bar, which M5 draws.
+- `scripts/check-demos.sh`: demo1, demo2 and demo3 match the reference's
+  tic hashes for all 5658, 13980 and 13605 tics.
 - `scripts/check-probes.sh`: issue probes.
 
 ## Next steps
 
-- Milestone 4: the playsim (p_*), tic commands, demo playback and `-tichash`.
-  `states`/`mobj-info` are constants; fast/nightmare mode mutates them in the
-  C, so they need a mutable copy. Replace the stand-ins in `doom.play.pspr`
-  and `doom.main`'s level tic. Gate: `scripts/check-demos.sh`.
+- Milestone 5: menus, HUD messages, the status bar, automap, intermission,
+  finale, the wipe's drawing and cheats. The status bar and wipe already make
+  their random draws, so drawing them mustn't add any. Gate: demos still sync,
+  and `-warp` into every shareware map runs without a crash. Then a playtest
+  request.

@@ -1,0 +1,3 @@
+(ns issue-024.b)
+(import-use issue-024.a)
+(defn b-sum ():i32 (+ PLAIN EXPR))

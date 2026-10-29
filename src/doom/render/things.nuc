@@ -160,7 +160,7 @@
     (set! (sec 'validcount) validcount)
     (set! sprite-lights (light-row (+ (bit-shr (sec 'light-level) LIGHTSEGSHIFT) extra-light)))
     (let (t (sec 'thing-list))
-      (while (not (null? t))
+      (while (not (null? t)) ; ISSUE-026
         (when-some (m t)
           (project-sprite m)
           (set! t (m 'snext)))))))

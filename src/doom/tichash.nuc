@@ -1,0 +1,59 @@
+; nuc-doom's demo-sync harness (GPLv2 or later; see COPYING).
+;
+; -tichash <file>: after each game tic, one line of the RNG indices, an FNV-1a
+; hash of every thing, and each player's tallies. reference/tichash.patch
+; makes Chocolate Doom write the same lines; the two must match exactly.
+
+(ns doom.tichash)
+
+(import-use "stdio.h")
+(import-use doom.args)
+(import-use doom.defs)
+(import-use doom.random)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.play.thinkers)
+
+(defvar- file:ptr null)
+(defvar- opened:bool false)
+
+(defn- hash-int (h:ui32 v:i32):ui32
+  (let (u (unsafe/cast ui32 v) out h)
+    (dotimes (b 4)
+      (set! out (bit-xor out (bit-and (bit-shr u (unsafe/cast ui32 (* 8 b))) 0xff)))
+      (set! out (* out 16777619)))
+    out))
+
+(defn- hash-mobjs ():ui32
+  (let (h:ui32 2166136261)
+    (do-mobjs mo
+      (set! h (hash-int h ((mo 'x) 'v)))
+      (set! h (hash-int h ((mo 'y) 'v)))
+      (set! h (hash-int h ((mo 'z) 'v)))
+      (set! h (hash-int h (unsafe/cast i32 (mo 'angle))))
+      (set! h (hash-int h ((mo 'momx) 'v)))
+      (set! h (hash-int h ((mo 'momy) 'v)))
+      (set! h (hash-int h ((mo 'momz) 'v)))
+      (set! h (hash-int h (mo 'health)))
+      (set! h (hash-int h (mo 'type)))
+      (set! h (hash-int h (mo 'state)))
+      (set! h (hash-int h (mo 'flags))))
+    h))
+
+(defn tichash-write ():void
+  (when (not opened)
+    (set! opened true)
+    (let (p (check-parm-with-args "-tichash" 1))
+      (when (!= p 0)
+        (let (path (arg (+ p 1)))
+          ; StrView args point into argv, so they are NUL-terminated.
+          (set! file (fopen (unsafe/cast CStr (path 'data)) "w"))))))
+  (when (not (null? file))
+    (fprintf file "tic=%d rnd=%d prnd=%d mobj=%08x" game-tic rnd-index prnd-index (hash-mobjs))
+    (dotimes (i MAX-PLAYERS)
+      (when (aref player-in-game i)
+        (let (p (player i))
+          (fprintf file " p%d=%d,%d,%d,%d,%d,%d" i (p 'health) (p 'armor-points) (p 'ready-weapon)
+                   (p 'kill-count) (p 'item-count) (p 'secret-count)))))
+    (fputc 10 file)
+    (fflush file)))
