@@ -11,6 +11,13 @@
 (defvar game-mode:i32 SHAREWARE)
 (defvar game-mission:i32 DOOM)
 
+; Chex Quest and HACX are Doom and Doom II underneath.
+(defn logical-mission ():i32
+  (case game-mission
+    PACK-CHEX DOOM
+    PACK-HACX DOOM2
+    game-mission))
+
 ; The executable being emulated (d_mode.h), in its order: the playsim tests
 ; ranges of versions.
 (defenum GameVersion
@@ -60,3 +67,10 @@
   (let (i:i32 0)
     (while (and (< i MAX-PLAYERS) (not (same-player? p (player i)))) (inc! i))
     i))
+
+; What the intermission shows (d_player.h's wbstartstruct_t).
+(defstruct WorldPlayer in:bool skills:i32 sitems:i32 ssecret:i32 stime:i32 frags:(array i32 4) score:i32)
+(defstruct WorldInfo
+  epsd:i32 did-secret:bool last:i32 next:i32
+  maxkills:i32 maxitems:i32 maxsecret:i32 maxfrags:i32 partime:i32 pnum:i32
+  plyr:(array WorldPlayer 4))

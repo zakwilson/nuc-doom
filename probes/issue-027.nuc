@@ -1,0 +1,11 @@
+; ISSUE-027: a field access on a string literal (or a string defconst)
+; stores the literal's bare data pointer as a StrView: invalid IR.
+; fixed-when: output-contains b 3
+(import-use "stdio.h")
+(import-use nucleus.strview)
+
+(defconst- WORD "abc")
+
+(defn main ():i32
+  (printf "%c %d\n" (as i32 (aref (WORD 'data) 1)) (unsafe/cast i32 ("abc" 'len)))
+  (return 0))

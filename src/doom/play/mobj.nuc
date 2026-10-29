@@ -27,6 +27,7 @@
 (import-use doom.play.enemy)
 (import-use doom.game)
 (import-use doom.status)
+(import-use doom.hud)
 
 (defconst- STOPSPEED 0x1000)
 (defconst- FRICTION 0xe800)
@@ -335,7 +336,8 @@
         (when (!= deathmatch 0)
           (dotimes (i NUM-CARDS) (set! (aref (p 'cards) i) true)))
         (when (= pn console-player)
-          (status-start))))))
+          (status-start)
+          (hud-start))))))
 
 (defn spawn-map-thing (mt:MapThing):void
   (cond (= (mt 'type) 11) (when (< deathmatch-count 10)

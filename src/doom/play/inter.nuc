@@ -8,6 +8,7 @@
 (import-use doom.math)
 (import-use doom.defs)
 (import-use doom.info)
+(import-use doom.items)
 (import-use doom.sounds)
 (import-use doom.random)
 (import-use doom.world)

@@ -19,7 +19,7 @@ fail=0
 for d in "${demos[@]}"; do
     want="$ROOT/reference/data/$d.tichash"
     got="$TMP/$d.tichash"
-    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout 600 "$ROOT/build/nuc-doom" \
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout -k 5 600 "$ROOT/build/nuc-doom" \
         -iwad "$IWAD" -nosound -timedemo "$d" -tichash "$got" > "$TMP/$d.log" 2>&1
     if [ ! -f "$got" ]; then
         echo "$d: FAIL (no tichash written; last output: $(tail -1 "$TMP/$d.log"))"

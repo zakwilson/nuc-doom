@@ -73,3 +73,10 @@
 ; memory that isn't an origin at all.
 (defn start-sound-at (x:Fixed y:Fixed sfx:i32):void
   (start false x y sfx))
+
+; Music plays once there is a mixer (milestone 6); for now only its choice.
+(defvar music-playing:i32 0)
+(defvar music-volume:i32 64)
+
+(defn change-music (music:i32 looping:bool):void
+  (set! music-playing music))

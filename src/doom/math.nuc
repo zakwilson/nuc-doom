@@ -34,6 +34,10 @@
 ; Wraps on INT_MIN exactly as C's abs() does in practice; FixedDiv relies on it.
 (defn- iabs (x:i32):i32 (if (< x 0) (- 0 x) x))
 
+; The stdlib has no scalar min or max (ISSUE-035).
+(defn imin (a:i32 b:i32):i32 (if (< a b) a b))
+(defn imax (a:i32 b:i32):i32 (if (> a b) a b))
+
 (defn _/ (a:Fixed b:Fixed):Fixed
   (if (>= (bit-shr (iabs (a 'v)) 14) (iabs (b 'v)))
     (if (< (bit-xor (a 'v) (b 'v)) 0) FIXED-MIN FIXED-MAX)

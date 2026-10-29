@@ -1,0 +1,353 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The end-of-episode text, art screens and Doom II's cast call (f_finale.c).
+
+(ns doom.finale)
+
+(import-use nucleus.strview)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.event)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.video)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.info)
+(import-use doom.sound)
+(import-use doom.sounds)
+(import-use doom.hud)
+(import-use doom.game)
+(import-use doom.render.data)
+
+(defenum FinaleStage TEXT-STAGE ART-STAGE CAST-STAGE)
+
+(defconst- TEXT-SPEED 3)
+(defconst- TEXT-WAIT 250)
+
+(defvar- stage:i32 TEXT-STAGE)
+(defvar- finale-count:i32 0)
+(defvar- finale-text:StrView "")
+(defvar- finale-flat:StrView "")
+
+;; Which text and background: Doom's end each episode at map 8 (5 in Chex
+;; Quest), Doom II's and Final Doom's come between maps.
+
+(defconst- DOOM-FLATS (array StrView "FLOOR4_8" "SFLR6_1" "MFLR8_4" "MFLR8_3"))
+(defconst- COMMERCIAL-MAPS (array i32 6 11 20 30 15 31))
+(defconst- COMMERCIAL-FLATS (array StrView "SLIME16" "RROCK14" "RROCK07" "RROCK17" "RROCK13" "RROCK19"))
+
+(defn- choose-text ():void
+  (let (mission (logical-mission))
+    (if (= mission DOOM)
+      (when (and (= game-map (if (= game-version EXE-CHEX) 5 8))
+                 (>= game-episode 1) (<= game-episode 4))
+        (set! finale-text (aref DOOM-TEXTS (- game-episode 1)))
+        (set! finale-flat (aref DOOM-FLATS (- game-episode 1))))
+      (dotimes (i 6)
+        (when (= game-map (aref COMMERCIAL-MAPS i))
+          (set! finale-flat (aref COMMERCIAL-FLATS i))
+          (case mission
+            DOOM2 (set! finale-text (aref DOOM2-TEXTS i))
+            PACK-TNT (set! finale-text (aref TNT-TEXTS i))
+            PACK-PLUT (set! finale-text (aref PLUTONIA-TEXTS i))
+            (do)))))))
+
+(defn finale-start ():void
+  (set! game-action GA-NOTHING)
+  (set! game-state GS-FINALE)
+  (set! view-active false)
+  (set! automap-active false)
+  (change-music (if (= (logical-mission) DOOM) MUS-VICTOR MUS-READ-M) true)
+  (choose-text)
+  (set! stage TEXT-STAGE)
+  (set! finale-count 0))
+
+;; The cast call.
+
+(defconst- CAST-TYPES
+  (array i32 MT-POSSESSED MT-SHOTGUY MT-CHAINGUY MT-TROOP MT-SERGEANT MT-SKULL MT-HEAD
+             MT-KNIGHT MT-BRUISER MT-BABY MT-PAIN MT-UNDEAD MT-FATSO MT-VILE MT-SPIDER
+             MT-CYBORG MT-PLAYER))
+(defconst- CAST-COUNT 17)
+
+(defvar- cast-num:i32 0)
+(defvar- cast-tics:i32 0)
+(defvar- cast-state:i32 S-NULL)
+(defvar- cast-death:bool false)
+(defvar- cast-frames:i32 0)
+(defvar- cast-on-melee:bool false)
+(defvar- cast-attacking:bool false)
+
+(defn- cast-info ():&MobjInfo &(aref mobj-info (aref CAST-TYPES cast-num)))
+(defn- cast-st ():&State &(aref states cast-state))
+
+(defn- start-cast ():void
+  (set! wipe-game-state -1)
+  (set! cast-num 0)
+  (set! cast-state ((cast-info) 'see-state))
+  (set! cast-tics ((cast-st) 'tics))
+  (set! cast-death false)
+  (set! stage CAST-STAGE)
+  (set! cast-frames 0)
+  (set! cast-on-melee false)
+  (set! cast-attacking false)
+  (change-music MUS-EVIL true))
+
+; The attack sounds the cast plays itself, since its actors have no actions.
+(defn- cast-sound (st:i32):i32
+  (case st
+    S-PLAY-ATK1 SFX-DSHTGN
+    S-POSS-ATK2 SFX-PISTOL
+    S-SPOS-ATK2 SFX-SHOTGN
+    S-VILE-ATK2 SFX-VILATK
+    S-SKEL-FIST2 SFX-SKESWG
+    S-SKEL-FIST4 SFX-SKEPCH
+    S-SKEL-MISS2 SFX-SKEATK
+    (:or S-FATT-ATK8 S-FATT-ATK5 S-FATT-ATK2) SFX-FIRSHT
+    (:or S-CPOS-ATK2 S-CPOS-ATK3 S-CPOS-ATK4) SFX-SHOTGN
+    S-TROO-ATK3 SFX-CLAW
+    S-SARG-ATK2 SFX-SGTATK
+    (:or S-BOSS-ATK2 S-BOS2-ATK2 S-HEAD-ATK2) SFX-FIRSHT
+    S-SKULL-ATK2 SFX-SKLATK
+    (:or S-SPID-ATK2 S-SPID-ATK3) SFX-SHOTGN
+    S-BSPI-ATK2 SFX-PLASMA
+    (:or S-CYBER-ATK2 S-CYBER-ATK4 S-CYBER-ATK6) SFX-RLAUNC
+    S-PAIN-ATK3 SFX-SKLATK
+    0))
+
+(defn- cast-ticker ():void
+  (dec! cast-tics)
+  (when (<= cast-tics 0)
+    ; The player's attack ends at once: the C jumps straight to stopping it.
+    (let (stop false)
+      (cond (or (= ((cast-st) 'tics) -1) (= ((cast-st) 'next-state) S-NULL))
+            ; From the death frames to the next monster.
+            (do (inc! cast-num)
+                (set! cast-death false)
+                (when (= cast-num CAST-COUNT) (set! cast-num 0))
+                (when (!= ((cast-info) 'see-sound) 0)
+                  (start-sound null ((cast-info) 'see-sound)))
+                (set! cast-state ((cast-info) 'see-state))
+                (set! cast-frames 0))
+            (= cast-state S-PLAY-ATK1) (set! stop true)
+            true
+            (do (set! cast-state ((cast-st) 'next-state))
+                (inc! cast-frames)
+                (let (sfx (cast-sound cast-state))
+                  (when (!= sfx 0) (start-sound null sfx)))))
+      (when (and (not stop) (= cast-frames 12))
+        (set! cast-attacking true)
+        (set! cast-state (if cast-on-melee ((cast-info) 'melee-state) ((cast-info) 'missile-state)))
+        (set! cast-on-melee (not cast-on-melee))
+        (when (= cast-state S-NULL)
+          (set! cast-state (if cast-on-melee ((cast-info) 'melee-state) ((cast-info) 'missile-state)))))
+      (when (or stop
+                (and cast-attacking
+                     (or (= cast-frames 24) (= cast-state ((cast-info) 'see-state)))))
+        (set! cast-attacking false)
+        (set! cast-frames 0)
+        (set! cast-state ((cast-info) 'see-state)))
+      (set! cast-tics ((cast-st) 'tics))
+      (when (= cast-tics -1) (set! cast-tics 15)))))
+
+(defn- cast-responder (ev:&Event):bool
+  (cond (!= (ev 'type) EV-KEYDOWN) false
+        ; Already in the dying frames.
+        cast-death true
+        true
+        (do (set! cast-death true)
+            (set! cast-state ((cast-info) 'death-state))
+            (set! cast-tics ((cast-st) 'tics))
+            (set! cast-frames 0)
+            (set! cast-attacking false)
+            (when (!= ((cast-info) 'death-sound) 0)
+              (start-sound null ((cast-info) 'death-sound)))
+            true)))
+
+(defn finale-responder (ev:&Event):bool
+  (and (= stage CAST-STAGE) (cast-responder ev)))
+
+;; The ticker.
+
+(defn- any-buttons? ():bool
+  (let (any false)
+    (dotimes (i MAX-PLAYERS)
+      (when (!= (((player i) 'cmd) 'buttons) 0) (set! any true)))
+    any))
+
+(defn finale-ticker ():void
+  ; Doom II skips its text on any button.
+  (when (and (= game-mode COMMERCIAL) (> finale-count 50) (any-buttons?))
+    (if (= game-map 30)
+      (start-cast)
+      (set! game-action GA-WORLD-DONE)))
+  (inc! finale-count)
+  (cond (= stage CAST-STAGE) (cast-ticker)
+        (= game-mode COMMERCIAL) (do)
+        (and (= stage TEXT-STAGE)
+             (> finale-count (+ (* (unsafe/cast i32 (finale-text 'len)) TEXT-SPEED) TEXT-WAIT)))
+        (do (set! finale-count 0)
+            (set! stage ART-STAGE)
+            ; Forces a wipe.
+            (set! wipe-game-state -1)
+            (when (= game-episode 3) (change-music MUS-BUNNY false)))))
+
+;; Drawing.
+
+(defn- upper (c:i32):i32 (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+(defn- font-index (c:i32):i32
+  (let (i (- (upper c) FONT-START))
+    (if (or (< i 0) (>= i FONT-SIZE)) -1 i)))
+
+; The flat tiled over the screen, then the text typed out over time.
+(defn- text-write ():!void
+  (let (flat (try (lump-named finale-flat)))
+    (dotimes (y SCREEN-HEIGHT)
+      (dotimes (x SCREEN-WIDTH)
+        (set! (aref screen (+ (* y SCREEN-WIDTH) x))
+              (u8 flat (+ (bit-shl (bit-and y 63) 6) (bit-and x 63)))))))
+  (let (cx 10 cy 10 i 0
+        n (unsafe/cast i32 (finale-text 'len))
+        count (imax 0 (/ (- finale-count 10) TEXT-SPEED)))
+    (while (and (> count 0) (< i n))
+      (let (c (as i32 (aref (finale-text 'data) i)) f (font-index c))
+        (cond (= c 10) (do (set! cx 10) (set! cy (+ cy 11)))
+              (< f 0) (set! cx (+ cx 4))
+              true (let (w (patch-width (aref hu-font f)))
+                     (if (> (+ cx w) SCREEN-WIDTH)
+                       (set! count 1)
+                       (do (try (draw-patch cx cy (aref hu-font f)))
+                           (set! cx (+ cx w)))))))
+      (inc! i)
+      (dec! count)))
+  (ok))
+
+(defn- text-width (s:StrView):i32
+  (let (w 0)
+    (dotimes (i (unsafe/cast i32 (s 'len)))
+      (let (f (font-index (as i32 (aref (s 'data) i))))
+        (set! w (+ w (if (< f 0) 4 (patch-width (aref hu-font f)))))))
+    w))
+
+(defn- cast-print (s:StrView):!void
+  (let (cx (- (/ SCREEN-WIDTH 2) (/ (text-width s) 2)))
+    (dotimes (i (unsafe/cast i32 (s 'len)))
+      (let (f (font-index (as i32 (aref (s 'data) i))))
+        (if (< f 0)
+          (set! cx (+ cx 4))
+          (do (try (draw-patch cx 180 (aref hu-font f)))
+              (set! cx (+ cx (patch-width (aref hu-font f)))))))))
+  (ok))
+
+(defn- cast-drawer ():!void
+  (try (draw-patch 0 0 (try (patch-named "BOSSBACK"))))
+  (try (cast-print (aref CAST-NAMES cast-num)))
+  (let (st (cast-st)
+        fr (sprite-frame (st 'sprite) (bit-and (st 'frame) FF-FRAMEMASK))
+        p (patch-num (+ (aref (fr 'lump) 0) first-sprite-lump)))
+    (if (!= (aref (fr 'flip) 0) 0)
+      (try (draw-patch-flipped (/ SCREEN-WIDTH 2) 170 p))
+      (try (draw-patch (/ SCREEN-WIDTH 2) 170 p))))
+  (ok))
+
+(defconst- END-NAMES (array StrView "END0" "END1" "END2" "END3" "END4" "END5" "END6"))
+(defvar- last-stage:i32 0)
+
+; Episode 3's picture scrolls from the demon's head to the bunny's, then
+; "THE END" is shot into place.
+(defn- bunny-scroll ():!void
+  (let (p1 (try (patch-named "PFUB2"))
+        p2 (try (patch-named "PFUB1"))
+        scrolled (imax 0 (imin SCREEN-WIDTH (- SCREEN-WIDTH (/ (- finale-count 230) 2)))))
+    (dotimes (x SCREEN-WIDTH)
+      (if (< (+ x scrolled) SCREEN-WIDTH)
+        (draw-patch-column x p1 (+ x scrolled))
+        (draw-patch-column x p2 (- (+ x scrolled) SCREEN-WIDTH)))))
+  (let (x (/ (- SCREEN-WIDTH (* 13 8)) 2) y (/ (- SCREEN-HEIGHT (* 8 8)) 2))
+    (cond (< finale-count 1130) (do)
+          (< finale-count 1180) (do (try (draw-patch x y (try (patch-named "END0"))))
+                                    (set! last-stage 0))
+          true
+          (let (s (imin 6 (/ (- finale-count 1180) 5)))
+            (when (> s last-stage)
+              (start-sound null SFX-PISTOL)
+              (set! last-stage s))
+            (try (draw-patch x y (try (patch-named (aref END-NAMES s))))))))
+  (ok))
+
+(defn- art-screen-drawer ():!void
+  (case game-episode
+    1 (try (draw-patch 0 0 (try (patch-named (if (>= game-version EXE-ULTIMATE) "CREDIT" "HELP2")))))
+    2 (try (draw-patch 0 0 (try (patch-named "VICTORY2"))))
+    3 (try (bunny-scroll))
+    4 (try (draw-patch 0 0 (try (patch-named "ENDPIC"))))
+    (do))
+  (ok))
+
+(defn finale-drawer ():!void
+  (case stage
+    CAST-STAGE (try (cast-drawer))
+    TEXT-STAGE (try (text-write))
+    ART-STAGE (try (art-screen-drawer))
+    (do))
+  (ok))
+
+;; The texts (d_englsh.h), generated from it.
+
+(defconst- DOOM-TEXTS
+  (array StrView
+    "Once you beat the big badasses and\nclean out the moon base you're supposed\nto win, aren't you? Aren't you? Where's\nyour fat reward and ticket home? What\nthe hell is this? It's not supposed to\nend this way!\n\nIt stinks like rotten meat, but looks\nlike the lost Deimos base.  Looks like\nyou're stuck on The Shores of Hell.\nThe only way out is through.\n\nTo continue the DOOM experience, play\nThe Shores of Hell and its amazing\nsequel, Inferno!\n"
+    "You've done it! The hideous cyber-\ndemon lord that ruled the lost Deimos\nmoon base has been slain and you\nare triumphant! But ... where are\nyou? You clamber to the edge of the\nmoon and look down to see the awful\ntruth.\n\nDeimos floats above Hell itself!\nYou've never heard of anyone escaping\nfrom Hell, but you'll make the bastards\nsorry they ever heard of you! Quickly,\nyou rappel down to  the surface of\nHell.\n\nNow, it's on to the final chapter of\nDOOM! -- Inferno."
+    "The loathsome spiderdemon that\nmasterminded the invasion of the moon\nbases and caused so much death has had\nits ass kicked for all time.\n\nA hidden doorway opens and you enter.\nYou've proven too tough for Hell to\ncontain, and now Hell at last plays\nfair -- for you emerge from the door\nto see the green fields of Earth!\nHome at last.\n\nYou wonder what's been happening on\nEarth while you were battling evil\nunleashed. It's good that no Hell-\nspawn could have come through that\ndoor with you ..."
+    "the spider mastermind must have sent forth\nits legions of hellspawn before your\nfinal confrontation with that terrible\nbeast from hell.  but you stepped forward\nand brought forth eternal damnation and\nsuffering upon the horde as a true hero\nwould in the face of something so evil.\n\nbesides, someone was gonna pay for what\nhappened to daisy, your pet rabbit.\n\nbut now, you see spread before you more\npotential pain and gibbitude as a nation\nof demons run amok among our cities.\n\nnext stop, hell on earth!"))
+
+(defconst- DOOM2-TEXTS
+  (array StrView
+    "YOU HAVE ENTERED DEEPLY INTO THE INFESTED\nSTARPORT. BUT SOMETHING IS WRONG. THE\nMONSTERS HAVE BROUGHT THEIR OWN REALITY\nWITH THEM, AND THE STARPORT'S TECHNOLOGY\nIS BEING SUBVERTED BY THEIR PRESENCE.\n\nAHEAD, YOU SEE AN OUTPOST OF HELL, A\nFORTIFIED ZONE. IF YOU CAN GET PAST IT,\nYOU CAN PENETRATE INTO THE HAUNTED HEART\nOF THE STARBASE AND FIND THE CONTROLLING\nSWITCH WHICH HOLDS EARTH'S POPULATION\nHOSTAGE."
+    "YOU HAVE WON! YOUR VICTORY HAS ENABLED\nHUMANKIND TO EVACUATE EARTH AND ESCAPE\nTHE NIGHTMARE.  NOW YOU ARE THE ONLY\nHUMAN LEFT ON THE FACE OF THE PLANET.\nCANNIBAL MUTATIONS, CARNIVOROUS ALIENS,\nAND EVIL SPIRITS ARE YOUR ONLY NEIGHBORS.\nYOU SIT BACK AND WAIT FOR DEATH, CONTENT\nTHAT YOU HAVE SAVED YOUR SPECIES.\n\nBUT THEN, EARTH CONTROL BEAMS DOWN A\nMESSAGE FROM SPACE: \"SENSORS HAVE LOCATED\nTHE SOURCE OF THE ALIEN INVASION. IF YOU\nGO THERE, YOU MAY BE ABLE TO BLOCK THEIR\nENTRY.  THE ALIEN BASE IS IN THE HEART OF\nYOUR OWN HOME CITY, NOT FAR FROM THE\nSTARPORT.\" SLOWLY AND PAINFULLY YOU GET\nUP AND RETURN TO THE FRAY."
+    "YOU ARE AT THE CORRUPT HEART OF THE CITY,\nSURROUNDED BY THE CORPSES OF YOUR ENEMIES.\nYOU SEE NO WAY TO DESTROY THE CREATURES'\nENTRYWAY ON THIS SIDE, SO YOU CLENCH YOUR\nTEETH AND PLUNGE THROUGH IT.\n\nTHERE MUST BE A WAY TO CLOSE IT ON THE\nOTHER SIDE. WHAT DO YOU CARE IF YOU'VE\nGOT TO GO THROUGH HELL TO GET TO IT?"
+    "THE HORRENDOUS VISAGE OF THE BIGGEST\nDEMON YOU'VE EVER SEEN CRUMBLES BEFORE\nYOU, AFTER YOU PUMP YOUR ROCKETS INTO\nHIS EXPOSED BRAIN. THE MONSTER SHRIVELS\nUP AND DIES, ITS THRASHING LIMBS\nDEVASTATING UNTOLD MILES OF HELL'S\nSURFACE.\n\nYOU'VE DONE IT. THE INVASION IS OVER.\nEARTH IS SAVED. HELL IS A WRECK. YOU\nWONDER WHERE BAD FOLKS WILL GO WHEN THEY\nDIE, NOW. WIPING THE SWEAT FROM YOUR\nFOREHEAD YOU BEGIN THE LONG TREK BACK\nHOME. REBUILDING EARTH OUGHT TO BE A\nLOT MORE FUN THAN RUINING IT WAS.\n"
+    "CONGRATULATIONS, YOU'VE FOUND THE SECRET\nLEVEL! LOOKS LIKE IT'S BEEN BUILT BY\nHUMANS, RATHER THAN DEMONS. YOU WONDER\nWHO THE INMATES OF THIS CORNER OF HELL\nWILL BE."
+    "CONGRATULATIONS, YOU'VE FOUND THE\nSUPER SECRET LEVEL!  YOU'D BETTER\nBLAZE THROUGH THIS ONE!\n"))
+
+(defconst- PLUTONIA-TEXTS
+  (array StrView
+    "You gloat over the steaming carcass of the\nGuardian.  With its death, you've wrested\nthe Accelerator from the stinking claws\nof Hell.  You relax and glance around the\nroom.  Damn!  There was supposed to be at\nleast one working prototype, but you can't\nsee it. The demons must have taken it.\n\nYou must find the prototype, or all your\nstruggles will have been wasted. Keep\nmoving, keep fighting, keep killing.\nOh yes, keep living, too."
+    "Even the deadly Arch-Vile labyrinth could\nnot stop you, and you've gotten to the\nprototype Accelerator which is soon\nefficiently and permanently deactivated.\n\nYou're good at that kind of thing."
+    "You've bashed and battered your way into\nthe heart of the devil-hive.  Time for a\nSearch-and-Destroy mission, aimed at the\nGatekeeper, whose foul offspring is\ncascading to Earth.  Yeah, he's bad. But\nyou know who's worse!\n\nGrinning evilly, you check your gear, and\nget ready to give the bastard a little Hell\nof your own making!"
+    "The Gatekeeper's evil face is splattered\nall over the place.  As its tattered corpse\ncollapses, an inverted Gate forms and\nsucks down the shards of the last\nprototype Accelerator, not to mention the\nfew remaining demons.  You're done. Hell\nhas gone back to pounding bad dead folks \ninstead of good live ones.  Remember to\ntell your grandkids to put a rocket\nlauncher in your coffin. If you go to Hell\nwhen you die, you'll need it for some\nfinal cleaning-up ..."
+    "You've found the second-hardest level we\ngot. Hope you have a saved game a level or\ntwo previous.  If not, be prepared to die\naplenty. For master marines only."
+    "Betcha wondered just what WAS the hardest\nlevel we had ready for ya?  Now you know.\nNo one gets out alive."))
+
+(defconst- TNT-TEXTS
+  (array StrView
+    "You've fought your way out of the infested\nexperimental labs.   It seems that UAC has\nonce again gulped it down.  With their\nhigh turnover, it must be hard for poor\nold UAC to buy corporate health insurance\nnowadays..\n\nAhead lies the military complex, now\nswarming with diseased horrors hot to get\ntheir teeth into you. With luck, the\ncomplex still has some warlike ordnance\nlaying around."
+    "You hear the grinding of heavy machinery\nahead.  You sure hope they're not stamping\nout new hellspawn, but you're ready to\nream out a whole herd if you have to.\nThey might be planning a blood feast, but\nyou feel about as mean as two thousand\nmaniacs packed into one mad killer.\n\nYou don't plan to go down easy."
+    "The vista opening ahead looks real damn\nfamiliar. Smells familiar, too -- like\nfried excrement. You didn't like this\nplace before, and you sure as hell ain't\nplanning to like it now. The more you\nbrood on it, the madder you get.\nHefting your gun, an evil grin trickles\nonto your face. Time to take some names."
+    "Suddenly, all is silent, from one horizon\nto the other. The agonizing echo of Hell\nfades away, the nightmare sky turns to\nblue, the heaps of monster corpses start \nto evaporate along with the evil stench \nthat filled the air. Jeeze, maybe you've\ndone it. Have you really won?\n\nSomething rumbles in the distance.\nA blue light begins to glow inside the\nruined skull of the demon-spitter."
+    "What now? Looks totally different. Kind\nof like King Tut's condo. Well,\nwhatever's here can't be any worse\nthan usual. Can it?  Or maybe it's best\nto let sleeping gods lie.."
+    "Time for a vacation. You've burst the\nbowels of hell and by golly you're ready\nfor a break. You mutter to yourself,\nMaybe someone else can kick Hell's ass\nnext time around. Ahead lies a quiet town,\nwith peaceful flowing water, quaint\nbuildings, and presumably no Hellspawn.\n\nAs you step off the transport, you hear\nthe stomp of a cyberdemon's iron shoe."))
+
+(defconst- CAST-NAMES
+  (array StrView
+    "ZOMBIEMAN"
+    "SHOTGUN GUY"
+    "HEAVY WEAPON DUDE"
+    "IMP"
+    "DEMON"
+    "LOST SOUL"
+    "CACODEMON"
+    "HELL KNIGHT"
+    "BARON OF HELL"
+    "ARACHNOTRON"
+    "PAIN ELEMENTAL"
+    "REVENANT"
+    "MANCUBUS"
+    "ARCH-VILE"
+    "THE SPIDER MASTERMIND"
+    "THE CYBERDEMON"
+    "OUR HERO"))
+

@@ -1,0 +1,575 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The automap (am_map.c). The C's enter and exit notices to the status bar
+; are left out: they ask it for a full redraw, and it redraws every frame.
+
+(ns doom.automap)
+
+(import-use nucleus.strview)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.event)
+(import-use doom.video)
+(import-use doom.table)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.cheat)
+
+;; Colors and speeds.
+
+(defconst- REDS (- 256 (* 5 16)))
+(defconst- REDRANGE 16)
+(defconst- GREENS (* 7 16))
+(defconst- GRAYS (* 6 16))
+(defconst- GRAYSRANGE 16)
+(defconst- BROWNS (* 4 16))
+(defconst- YELLOWS (+ (- 256 32) 7))
+(defconst- WHITE (- 256 47))
+
+(defconst- BACKGROUND 0)
+(defconst- WALL-COLORS REDS)
+(defconst- TS-WALL-COLORS GRAYS)
+(defconst- FD-WALL-COLORS BROWNS)
+(defconst- CD-WALL-COLORS YELLOWS)
+(defconst- THING-COLORS GREENS)
+(defconst- GRID-COLORS (+ GRAYS (/ GRAYSRANGE 2)))
+(defconst- XHAIR-COLORS GRAYS)
+
+(defconst- NUM-MARK-POINTS 10)
+
+; The C writes these as doubles cast to fixed_t: .2, 1.02, 1/1.02 and .7.
+(defconst- INIT-SCALE-MTOF 13107)
+(defconst- ZOOM-IN 66846)
+(defconst- ZOOM-OUT 64250)
+(defconst- LEVEL-SCALE 45875)
+; How far the window pans each tic, in frame-buffer pixels.
+(defconst- PAN-INC 4)
+
+(defconst- INT-MAX 2147483647)
+(defconst- PLAYER-RADIUS (* 16 FRAC-UNIT))
+
+;; Line drawings, as (ax ay bx by) rows in map units, pointing east.
+
+(defconst- R (/ (* 8 PLAYER-RADIUS) 7))
+(defconst- NR (- 0 R))
+
+(defconst- PLAYER-ARROW
+  (array i32
+    (+ NR (/ R 8)) 0 R 0
+    R 0 (- R (/ R 2)) (/ R 4)
+    R 0 (- R (/ R 2)) (- 0 (/ R 4))
+    (+ NR (/ R 8)) 0 (- NR (/ R 8)) (/ R 4)
+    (+ NR (/ R 8)) 0 (- NR (/ R 8)) (- 0 (/ R 4))
+    (+ NR (/ (* 3 R) 8)) 0 (+ NR (/ R 8)) (/ R 4)
+    (+ NR (/ (* 3 R) 8)) 0 (+ NR (/ R 8)) (- 0 (/ R 4))))
+
+(defconst- CHEAT-PLAYER-ARROW
+  (array i32
+    (+ NR (/ R 8)) 0 R 0
+    R 0 (- R (/ R 2)) (/ R 6)
+    R 0 (- R (/ R 2)) (- 0 (/ R 6))
+    (+ NR (/ R 8)) 0 (- NR (/ R 8)) (/ R 6)
+    (+ NR (/ R 8)) 0 (- NR (/ R 8)) (- 0 (/ R 6))
+    (+ NR (/ (* 3 R) 8)) 0 (+ NR (/ R 8)) (/ R 6)
+    (+ NR (/ (* 3 R) 8)) 0 (+ NR (/ R 8)) (- 0 (/ R 6))
+    (/ NR 2) 0 (/ NR 2) (/ NR 6)
+    (/ NR 2) (/ NR 6) (+ (/ NR 2) (/ R 6)) (/ NR 6)
+    (+ (/ NR 2) (/ R 6)) (/ NR 6) (+ (/ NR 2) (/ R 6)) (/ R 4)
+    (/ NR 6) 0 (/ NR 6) (/ NR 6)
+    (/ NR 6) (/ NR 6) 0 (/ NR 6)
+    0 (/ NR 6) 0 (/ R 4)
+    (/ R 6) (/ R 4) (/ R 6) (/ NR 7)
+    (/ R 6) (/ NR 7) (+ (/ R 6) (/ R 32)) (- (/ NR 7) (/ R 32))
+    (+ (/ R 6) (/ R 32)) (- (/ NR 7) (/ R 32)) (+ (/ R 6) (/ R 10)) (/ NR 7)))
+
+; A thing: a thin triangle of unit size, scaled up when drawn.
+(defconst- THIN-TRIANGLE
+  (array i32
+    -32768 -45875 65536 0
+    65536 0 -32768 45875
+    -32768 45875 -32768 -45875))
+
+;; State.
+
+(defstruct- MLine ax:Fixed ay:Fixed bx:Fixed by:Fixed)
+
+(defvar- cheating:i32 0)
+(defvar- grid:bool false)
+
+; The window on the screen: the view above the status bar.
+(defconst- F-W SCREEN-WIDTH)
+(defconst- F-H (- SCREEN-HEIGHT 32))
+
+(defvar- light-lev:i32 0)
+(defvar- am-clock:i32 0)
+
+; Pan and zoom each tic.
+(defvar- pan-x:Fixed (Fixed 0))
+(defvar- pan-y:Fixed (Fixed 0))
+(defvar- mtof-zoom-mul:Fixed (Fixed FRAC-UNIT))
+(defvar- ftom-zoom-mul:Fixed (Fixed FRAC-UNIT))
+
+; The window on the map: its lower-left corner, size and upper-right corner.
+(defvar- m-x:Fixed (Fixed 0))
+(defvar- m-y:Fixed (Fixed 0))
+(defvar- m-w:Fixed (Fixed 0))
+(defvar- m-h:Fixed (Fixed 0))
+(defvar- m-x2:Fixed (Fixed 0))
+(defvar- m-y2:Fixed (Fixed 0))
+
+; The level's extent.
+(defvar- min-x:Fixed (Fixed 0))
+(defvar- min-y:Fixed (Fixed 0))
+(defvar- max-x:Fixed (Fixed 0))
+(defvar- max-y:Fixed (Fixed 0))
+
+(defvar- min-scale-mtof:Fixed (Fixed 0))
+(defvar- max-scale-mtof:Fixed (Fixed 0))
+
+(defvar- old-m-x:Fixed (Fixed 0))
+(defvar- old-m-y:Fixed (Fixed 0))
+(defvar- old-m-w:Fixed (Fixed 0))
+(defvar- old-m-h:Fixed (Fixed 0))
+
+; Where the followed player was; x is INT-MAX to force a recentre.
+(defvar- old-loc-x:Fixed (Fixed 0))
+(defvar- old-loc-y:Fixed (Fixed 0))
+
+(defvar- scale-mtof:Fixed (Fixed INIT-SCALE-MTOF))
+(defvar- scale-ftom:Fixed (Fixed 0))
+
+(defvar- plr:?&Player null)
+
+(defvar- mark-nums:(array Patch 10))
+(defvar- mark-x:(array Fixed 10))
+(defvar- mark-y:(array Fixed 10))
+(defvar- mark-point-num:i32 0)
+
+(defvar- follow-player:bool true)
+(defvar- stopped:bool true)
+(defvar- big-state:bool false)
+(defvar- last-level:i32 -1)
+(defvar- last-episode:i32 -1)
+
+(defvar- cheat-amap:Cheat (Cheat "iddt" 0))
+
+(defn- the-player ():&Player (unwrap plr))
+(defn- player-mo ():&Mobj (unwrap ((the-player) 'mo)))
+
+; Frame-buffer distance to map distance, and back.
+(defn- ftom (x:i32):Fixed (* (fx x) scale-ftom))
+(defn- mtof (x:Fixed):i32 (fx-int (* x scale-mtof)))
+(defn- cx-mtof (x:Fixed):i32 (mtof (- x m-x)))
+(defn- cy-mtof (y:Fixed):i32 (- F-H (mtof (- y m-y))))
+
+;; The window.
+
+(defn- set-corner ():void
+  (set! m-x2 (+ m-x m-w))
+  (set! m-y2 (+ m-y m-h)))
+
+(defn- activate-new-scale ():void
+  (set! m-x (+ m-x (/ m-w 2)))
+  (set! m-y (+ m-y (/ m-h 2)))
+  (set! m-w (ftom F-W))
+  (set! m-h (ftom F-H))
+  (set! m-x (- m-x (/ m-w 2)))
+  (set! m-y (- m-y (/ m-h 2)))
+  (set-corner))
+
+(defn- save-scale-and-loc ():void
+  (set! old-m-x m-x)
+  (set! old-m-y m-y)
+  (set! old-m-w m-w)
+  (set! old-m-h m-h))
+
+(defn- restore-scale-and-loc ():void
+  (set! m-w old-m-w)
+  (set! m-h old-m-h)
+  (if follow-player
+    (do (set! m-x (- ((player-mo) 'x) (/ m-w 2)))
+        (set! m-y (- ((player-mo) 'y) (/ m-h 2))))
+    (do (set! m-x old-m-x)
+        (set! m-y old-m-y)))
+  (set-corner)
+  (set! scale-mtof (/ (fx F-W) m-w))
+  (set! scale-ftom (/ (Fixed FRAC-UNIT) scale-mtof)))
+
+(defn- add-mark ():void
+  (set! (aref mark-x mark-point-num) (+ m-x (/ m-w 2)))
+  (set! (aref mark-y mark-point-num) (+ m-y (/ m-h 2)))
+  (set! mark-point-num (% (+ mark-point-num 1) NUM-MARK-POINTS)))
+
+(defn- clear-marks ():void
+  (dotimes (i NUM-MARK-POINTS) (set! (aref mark-x i) (Fixed -1)))
+  (set! mark-point-num 0))
+
+; The level's bounding box, and so the zoom range.
+(defn- find-min-max-boundaries ():void
+  (set! min-x (Fixed INT-MAX))
+  (set! min-y (Fixed INT-MAX))
+  (set! max-x (Fixed (- 0 INT-MAX)))
+  (set! max-y (Fixed (- 0 INT-MAX)))
+  (dotimes (i (table-len vertexes))
+    (let (v (vertexes i))
+      (cond (< (v 'x) min-x) (set! min-x (v 'x))
+            (> (v 'x) max-x) (set! max-x (v 'x)))
+      (cond (< (v 'y) min-y) (set! min-y (v 'y))
+            (> (v 'y) max-y) (set! max-y (v 'y)))))
+  (let (a (/ (fx F-W) (- max-x min-x))
+        b (/ (fx F-H) (- max-y min-y)))
+    (set! min-scale-mtof (if (< a b) a b))
+    (set! max-scale-mtof (/ (fx F-H) (Fixed (* 2 PLAYER-RADIUS))))))
+
+(defn- change-window-loc ():void
+  (when (or (!= (pan-x 'v) 0) (!= (pan-y 'v) 0))
+    (set! follow-player false)
+    (set! old-loc-x (Fixed INT-MAX)))
+  (set! m-x (+ m-x pan-x))
+  (set! m-y (+ m-y pan-y))
+  (cond (> (+ m-x (/ m-w 2)) max-x) (set! m-x (- max-x (/ m-w 2)))
+        (< (+ m-x (/ m-w 2)) min-x) (set! m-x (- min-x (/ m-w 2))))
+  (cond (> (+ m-y (/ m-h 2)) max-y) (set! m-y (- max-y (/ m-h 2)))
+        (< (+ m-y (/ m-h 2)) min-y) (set! m-y (- min-y (/ m-h 2))))
+  (set-corner))
+
+(defn- init-variables ():void
+  (set! automap-active true)
+  (set! old-loc-x (Fixed INT-MAX))
+  (set! am-clock 0)
+  (set! light-lev 0)
+  (set! pan-x (Fixed 0))
+  (set! pan-y (Fixed 0))
+  (set! ftom-zoom-mul (Fixed FRAC-UNIT))
+  (set! mtof-zoom-mul (Fixed FRAC-UNIT))
+  (set! m-w (ftom F-W))
+  (set! m-h (ftom F-H))
+  ; The console player, or else the first one in the game.
+  (if (aref player-in-game console-player)
+    (set! plr (player console-player))
+    (let (found -1)
+      (dotimes (i MAX-PLAYERS)
+        (when (and (< found 0) (aref player-in-game i)) (set! found i)))
+      (set! plr (player (imax found 0)))))
+  (set! m-x (- ((player-mo) 'x) (/ m-w 2)))
+  (set! m-y (- ((player-mo) 'y) (/ m-h 2)))
+  (change-window-loc)
+  (save-scale-and-loc))
+
+(defconst- MARK-NAMES
+  (array StrView "AMMNUM0" "AMMNUM1" "AMMNUM2" "AMMNUM3" "AMMNUM4"
+                 "AMMNUM5" "AMMNUM6" "AMMNUM7" "AMMNUM8" "AMMNUM9"))
+
+; The C loads these each time the map opens.
+(defn automap-init ():!void
+  (dotimes (i 10) (set! (aref mark-nums i) (try (patch-named (aref MARK-NAMES i)))))
+  (ok))
+
+(defn- level-init ():void
+  (clear-marks)
+  (find-min-max-boundaries)
+  (set! scale-mtof (/ min-scale-mtof (Fixed LEVEL-SCALE)))
+  (when (> scale-mtof max-scale-mtof) (set! scale-mtof min-scale-mtof))
+  (set! scale-ftom (/ (Fixed FRAC-UNIT) scale-mtof)))
+
+(defn automap-stop ():void
+  (set! automap-active false)
+  (set! stopped true))
+
+(defn- automap-start ():void
+  (when (not stopped) (automap-stop))
+  (set! stopped false)
+  (when (or (!= last-level game-map) (!= last-episode game-episode))
+    (level-init)
+    (set! last-level game-map)
+    (set! last-episode game-episode))
+  (init-variables))
+
+(defn- min-out-window-scale ():void
+  (set! scale-mtof min-scale-mtof)
+  (set! scale-ftom (/ (Fixed FRAC-UNIT) scale-mtof))
+  (activate-new-scale))
+
+(defn- max-out-window-scale ():void
+  (set! scale-mtof max-scale-mtof)
+  (set! scale-ftom (/ (Fixed FRAC-UNIT) scale-mtof))
+  (activate-new-scale))
+
+;; Input.
+
+(defn- console-message (msg:CStr):void (set! ((the-player) 'message) msg))
+
+(defvar- mark-message:(array ui8 20))
+
+; "Marked Spot N", in a buffer that outlives the message.
+(defn- mark-spot-message ():void
+  (let (s "Marked Spot " n (unsafe/cast i32 (s 'len)))
+    (dotimes (i n) (set! (aref mark-message i) (aref (s 'data) i)))
+    (set! (aref mark-message n) (unsafe/cast ui8 (+ 48 mark-point-num)))
+    (set! (aref mark-message (+ n 1)) 0)
+    (console-message (unsafe/cast CStr &mark-message))))
+
+; A key while the map is up; false lets the game have it too.
+(defn- map-key-down (key:i32):bool
+  (cond (= key key-map-east) (if follow-player false (do (set! pan-x (ftom PAN-INC)) true))
+        (= key key-map-west) (if follow-player false (do (set! pan-x (fx-neg (ftom PAN-INC))) true))
+        (= key key-map-north) (if follow-player false (do (set! pan-y (ftom PAN-INC)) true))
+        (= key key-map-south) (if follow-player false (do (set! pan-y (fx-neg (ftom PAN-INC))) true))
+        (= key key-map-zoomout) (do (set! mtof-zoom-mul (Fixed ZOOM-OUT))
+                                    (set! ftom-zoom-mul (Fixed ZOOM-IN))
+                                    true)
+        (= key key-map-zoomin) (do (set! mtof-zoom-mul (Fixed ZOOM-IN))
+                                   (set! ftom-zoom-mul (Fixed ZOOM-OUT))
+                                   true)
+        (= key key-map-toggle) (do (set! big-state false)
+                                   (set! view-active true)
+                                   (automap-stop)
+                                   true)
+        (= key key-map-maxzoom) (do (set! big-state (not big-state))
+                                    (if big-state
+                                      (do (save-scale-and-loc) (min-out-window-scale))
+                                      (restore-scale-and-loc))
+                                    true)
+        (= key key-map-follow) (do (set! follow-player (not follow-player))
+                                   (set! old-loc-x (Fixed INT-MAX))
+                                   (console-message (if follow-player "Follow Mode ON" "Follow Mode OFF"))
+                                   true)
+        (= key key-map-grid) (do (set! grid (not grid))
+                                 (console-message (if grid "Grid ON" "Grid OFF"))
+                                 true)
+        (= key key-map-mark) (do (mark-spot-message) (add-mark) true)
+        (= key key-map-clearmark) (do (clear-marks)
+                                      (console-message "All Marks Cleared")
+                                      true)
+        true false))
+
+(defn- map-key-up (key:i32):void
+  (cond (or (= key key-map-east) (= key key-map-west))
+        (when (not follow-player) (set! pan-x (Fixed 0)))
+        (or (= key key-map-north) (= key key-map-south))
+        (when (not follow-player) (set! pan-y (Fixed 0)))
+        (or (= key key-map-zoomout) (= key key-map-zoomin))
+        (do (set! mtof-zoom-mul (Fixed FRAC-UNIT))
+            (set! ftom-zoom-mul (Fixed FRAC-UNIT)))))
+
+(defn automap-responder (ev:&Event):bool
+  (cond (not automap-active)
+        (if (and (= (ev 'type) EV-KEYDOWN) (= (ev 'data1) key-map-toggle))
+          (do (automap-start)
+              (set! view-active false)
+              true)
+          false)
+        (= (ev 'type) EV-KEYDOWN)
+        (let (rc (map-key-down (ev 'data1)))
+          (if (and (or (= deathmatch 0) (<= game-version EXE-DOOM-1-8))
+                   (cheat? &cheat-amap (ev 'data2)))
+            (do (set! cheating (% (+ cheating 1) 3))
+                false)
+            rc))
+        (= (ev 'type) EV-KEYUP)
+        (do (map-key-up (ev 'data1))
+            false)
+        true false))
+
+;; The ticker.
+
+(defn- change-window-scale ():void
+  (set! scale-mtof (* scale-mtof mtof-zoom-mul))
+  (set! scale-ftom (/ (Fixed FRAC-UNIT) scale-mtof))
+  (cond (< scale-mtof min-scale-mtof) (min-out-window-scale)
+        (> scale-mtof max-scale-mtof) (max-out-window-scale)
+        true (activate-new-scale)))
+
+(defn- do-follow-player ():void
+  (let (mo (player-mo))
+    (when (or (!= old-loc-x (mo 'x)) (!= old-loc-y (mo 'y)))
+      (set! m-x (- (ftom (mtof (mo 'x))) (/ m-w 2)))
+      (set! m-y (- (ftom (mtof (mo 'y))) (/ m-h 2)))
+      (set-corner)
+      (set! old-loc-x (mo 'x))
+      (set! old-loc-y (mo 'y)))))
+
+(defn automap-ticker ():void
+  (when automap-active
+    (inc! am-clock)
+    (when follow-player (do-follow-player))
+    (when (!= (ftom-zoom-mul 'v) FRAC-UNIT) (change-window-scale))
+    (when (or (!= (pan-x 'v) 0) (!= (pan-y 'v) 0)) (change-window-loc))))
+
+;; Drawing, straight into the screen.
+
+(defconst- LEFT 1)
+(defconst- RIGHT 2)
+(defconst- BOTTOM 4)
+(defconst- TOP 8)
+
+(defn- outcode (x:i32 y:i32):i32
+  (bit-or (cond (< y 0) TOP (>= y F-H) BOTTOM true 0)
+          (cond (< x 0) LEFT (>= x F-W) RIGHT true 0)))
+
+(defn- put-dot (x:i32 y:i32 color:i32):void
+  (set! (aref screen (+ (* y F-W) x)) (unsafe/cast ui8 color)))
+
+; Bresenham, between two points already clipped to the window.
+(defn- draw-fline (ax:i32 ay:i32 bx:i32 by:i32 color:i32):void
+  (when (and (>= ax 0) (< ax F-W) (>= ay 0) (< ay F-H)
+             (>= bx 0) (< bx F-W) (>= by 0) (< by F-H))
+    (let (dx (- bx ax) adx (* 2 (if (< dx 0) (- 0 dx) dx)) sx (if (< dx 0) -1 1)
+          dy (- by ay) ady (* 2 (if (< dy 0) (- 0 dy) dy)) sy (if (< dy 0) -1 1)
+          x ax y ay go true)
+      (if (> adx ady)
+        (let (d (- ady (/ adx 2)))
+          (while go
+            (put-dot x y color)
+            (if (= x bx)
+              (set! go false)
+              (do (when (>= d 0) (set! y (+ y sy)) (set! d (- d adx)))
+                  (set! x (+ x sx))
+                  (set! d (+ d ady))))))
+        (let (d (- adx (/ ady 2)))
+          (while go
+            (put-dot x y color)
+            (if (= y by)
+              (set! go false)
+              (do (when (>= d 0) (set! x (+ x sx)) (set! d (- d ady)))
+                  (set! y (+ y sy))
+                  (set! d (+ d adx))))))))))
+
+; Cohen-Sutherland, with the C's quick rejects in map coordinates first.
+(defn- draw-mline (l:&MLine color:i32):void
+  (let (oc1 (cond (> (l 'ay) m-y2) TOP (< (l 'ay) m-y) BOTTOM true 0)
+        oc2 (cond (> (l 'by) m-y2) TOP (< (l 'by) m-y) BOTTOM true 0))
+    (when (= (bit-and oc1 oc2) 0)
+      (set! oc1 (bit-or oc1 (cond (< (l 'ax) m-x) LEFT (> (l 'ax) m-x2) RIGHT true 0)))
+      (set! oc2 (bit-or oc2 (cond (< (l 'bx) m-x) LEFT (> (l 'bx) m-x2) RIGHT true 0)))
+      (when (= (bit-and oc1 oc2) 0)
+        (let (ax (cx-mtof (l 'ax)) ay (cy-mtof (l 'ay))
+              bx (cx-mtof (l 'bx)) by (cy-mtof (l 'by))
+              visible true)
+          (set! oc1 (outcode ax ay))
+          (set! oc2 (outcode bx by))
+          (when (!= (bit-and oc1 oc2) 0) (set! visible false))
+          (while (and visible (!= (bit-or oc1 oc2) 0))
+            (let (outside (if (!= oc1 0) oc1 oc2) tx 0 ty 0)
+              (cond (!= (bit-and outside TOP) 0)
+                    (do (set! tx (+ ax (/ (* (- bx ax) ay) (- ay by))))
+                        (set! ty 0))
+                    (!= (bit-and outside BOTTOM) 0)
+                    (do (set! tx (+ ax (/ (* (- bx ax) (- ay F-H)) (- ay by))))
+                        (set! ty (- F-H 1)))
+                    (!= (bit-and outside RIGHT) 0)
+                    (do (set! ty (+ ay (/ (* (- by ay) (- F-W 1 ax)) (- bx ax))))
+                        (set! tx (- F-W 1)))
+                    (!= (bit-and outside LEFT) 0)
+                    (do (set! ty (+ ay (/ (* (- by ay) (- 0 ax)) (- bx ax))))
+                        (set! tx 0)))
+              (if (= outside oc1)
+                (do (set! ax tx) (set! ay ty) (set! oc1 (outcode ax ay)))
+                (do (set! bx tx) (set! by ty) (set! oc2 (outcode bx by))))
+              (when (!= (bit-and oc1 oc2) 0) (set! visible false))))
+          (when visible (draw-fline ax ay bx by color)))))))
+
+(defn- draw-grid (color:i32):void
+  (let (unit (* MAPBLOCKUNITS FRAC-UNIT))
+    ; Vertical lines, from the first block edge in the window.
+    (let (start (m-x 'v) end (+ (m-x 'v) (m-w 'v)) x 0)
+      (let (r (% (- start (bmap-org-x 'v)) unit))
+        (when (!= r 0) (set! start (+ start (- unit r)))))
+      (set! x start)
+      (while (< x end)
+        (draw-mline (MLine (Fixed x) m-y (Fixed x) (+ m-y m-h)) color)
+        (set! x (+ x unit))))
+    (let (start (m-y 'v) end (+ (m-y 'v) (m-h 'v)) y 0)
+      (let (r (% (- start (bmap-org-y 'v)) unit))
+        (when (!= r 0) (set! start (+ start (- unit r)))))
+      (set! y start)
+      (while (< y end)
+        (draw-mline (MLine m-x (Fixed y) (+ m-x m-w) (Fixed y)) color)
+        (set! y (+ y unit))))))
+
+(defn- draw-walls ():void
+  (dotimes (i (table-len lines))
+    (let (ln (lines i)
+          l:MLine (MLine ((ln 'v1) 'x) ((ln 'v1) 'y) ((ln 'v2) 'x) ((ln 'v2) 'y)) ; ISSUE-025
+          never-see (!= (bit-and (ln 'flags) ML-DONTDRAW) 0))
+      (cond (or (!= cheating 0) (!= (bit-and (ln 'flags) ML-MAPPED) 0))
+            (when (or (not never-see) (!= cheating 0))
+              (if-some (back (ln 'back-sector))
+                (let (front (unwrap (ln 'front-sector)))
+                  (cond (= (ln 'special) 39) ; teleporters
+                        (draw-mline &l (+ WALL-COLORS (/ REDRANGE 2)))
+                        (!= (bit-and (ln 'flags) ML-SECRET) 0)
+                        (draw-mline &l (+ WALL-COLORS light-lev))
+                        (!= (back 'floor-height) (front 'floor-height))
+                        (draw-mline &l (+ FD-WALL-COLORS light-lev))
+                        (!= (back 'ceiling-height) (front 'ceiling-height))
+                        (draw-mline &l (+ CD-WALL-COLORS light-lev))
+                        (!= cheating 0)
+                        (draw-mline &l (+ TS-WALL-COLORS light-lev))))
+                (draw-mline &l (+ WALL-COLORS light-lev))))
+            (!= (aref ((the-player) 'powers) PW-ALLMAP) 0)
+            (when (not never-see) (draw-mline &l (+ GRAYS 3)))))))
+
+(defn- rotate (x:Fixed y:Fixed a:Angle):MLine
+  (let (i (fine-index a))
+    (MLine (- (* x (fine-cosine i)) (* y (fine-sine i)))
+           (+ (* x (fine-sine i)) (* y (fine-cosine i)))
+           (Fixed 0) (Fixed 0))))
+
+; One end of a drawing's line, scaled, turned and moved to (x, y).
+(defn- place (px:i32 py:i32 scale:Fixed angle:Angle x:Fixed y:Fixed):MLine
+  (let (ax:Fixed (Fixed px) ay:Fixed (Fixed py)) ; ISSUE-025
+    (when (!= (scale 'v) 0)
+      (set! ax (* scale ax))
+      (set! ay (* scale ay)))
+    (when (!= angle 0)
+      (let (r (rotate ax ay angle))
+        (set! ax (r 'ax))
+        (set! ay (r 'ay))))
+    (MLine (+ ax x) (+ ay y) (Fixed 0) (Fixed 0))))
+
+(defn- draw-line-character (rows:&i32 n:i32 scale:Fixed angle:Angle color:i32
+                            x:Fixed y:Fixed):void
+  (dotimes (i n)
+    (let (a (place (aref rows (* i 4)) (aref rows (+ (* i 4) 1)) scale angle x y)
+          b (place (aref rows (+ (* i 4) 2)) (aref rows (+ (* i 4) 3)) scale angle x y))
+      (draw-mline (MLine (a 'ax) (a 'ay) (b 'ax) (b 'ay)) color))))
+
+(defn- draw-players ():void
+  (let (mo (player-mo))
+    ; Netgames are out of scope: only the single player's arrow.
+    (if (!= cheating 0)
+      (draw-line-character CHEAT-PLAYER-ARROW 16 (Fixed 0)
+                           (mo 'angle) WHITE (mo 'x) (mo 'y))
+      (draw-line-character PLAYER-ARROW 7 (Fixed 0)
+                           (mo 'angle) WHITE (mo 'x) (mo 'y)))))
+
+(defn- draw-things (colors:i32):void
+  (dotimes (i (table-len sectors))
+    (let (t ((sectors i) 'thing-list))
+      (while (not (null? t)) ; ISSUE-026
+        (when-some (m t)
+          (draw-line-character THIN-TRIANGLE 3 (fx 16)
+                               (m 'angle) (+ colors light-lev) (m 'x) (m 'y))
+          (set! t (m 'snext)))))))
+
+(defn- draw-marks ():!void
+  (dotimes (i NUM-MARK-POINTS)
+    (when (!= ((aref mark-x i) 'v) -1)
+      ; The C uses 5 by 6, not the patch's size.
+      (let (x (cx-mtof (aref mark-x i)) y (cy-mtof (aref mark-y i)))
+        (when (and (>= x 0) (<= x (- F-W 5)) (>= y 0) (<= y (- F-H 6)))
+          (try (draw-patch x y (aref mark-nums i)))))))
+  (ok))
+
+(defn automap-drawer ():!void
+  (when automap-active
+    (dotimes (i (* F-W F-H)) (set! (aref screen i) BACKGROUND))
+    (when grid (draw-grid GRID-COLORS))
+    (draw-walls)
+    (draw-players)
+    (when (= cheating 2) (draw-things THING-COLORS))
+    (set! (aref screen (/ (* F-W (+ F-H 1)) 2)) XHAIR-COLORS)
+    (try (draw-marks)))
+  (ok))

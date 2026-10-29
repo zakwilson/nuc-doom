@@ -1,17 +1,423 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 ;
-; The status bar (st_stuff.c). Until it is drawn (milestone 5), only what the
-; game's timeline depends on: its ticker draws one m-random per level tic for
-; the face's glances.
+; The status bar and its cheats (st_stuff.c, st_lib.c, m_cheat.c). The C
+; redraws only the widgets whose values changed, erasing each from a backing
+; copy of the bar; redrawing the whole bar every frame gives the same pixels.
+; The ticker draws one m-random per level tic, which demo sync sees.
 
 (ns doom.status)
 
+(import-use "stdio.h")
+(import-use nucleus.fmt)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use doom.math)
+(import-use doom.defs)
 (import-use doom.random)
+(import-use doom.event)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.video)
+(import-use doom.geom)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.sound)
+(import-use doom.sounds)
+(import-use doom.items)
+(import-use doom.cheat)
+(import-use doom.game)
+(import-use doom.play.inter)
+
+(defconst ST-HEIGHT 32)
+(defconst ST-Y 168)
+
+;; Graphics.
+
+(defvar- bar:Patch)
+; Doom 1.0 split the bar in two.
+(defvar- bar-right:Patch)
+(defvar- has-bar-right:bool false)
+(defvar- tall-num:(array Patch 10))
+(defvar- short-num:(array Patch 10))
+(defvar- tall-percent:Patch)
+(defvar- tall-minus:Patch)
+(defvar- has-minus:bool false)
+(defvar- key-icons:(array Patch 6))
+(defvar- arms-bg:Patch)
+(defvar- arms-gray:(array Patch 6))
+(defvar- face-back:Patch)
+(defvar- faces:(array Patch 42))
+(defvar- playpal:i32 0)
+
+(defn- numbered (prefix:StrView n:i32):!Patch
+  (patch-named (string-as-view &(str prefix n))))
+
+(defn status-init ():!void
+  (dotimes (i 10)
+    (set! (aref tall-num i) (try (numbered "STTNUM" i)))
+    (set! (aref short-num i) (try (numbered "STYSNUM" i))))
+  (set! tall-percent (try (patch-named "STTPRCNT")))
+  (set! has-minus (>= (check-num-for-name "STTMINUS") 0))
+  (when has-minus (set! tall-minus (try (patch-named "STTMINUS"))))
+  (dotimes (i NUM-CARDS) (set! (aref key-icons i) (try (numbered "STKEYS" i))))
+  (set! arms-bg (try (patch-named "STARMS")))
+  (dotimes (i 6) (set! (aref arms-gray i) (try (numbered "STGNUM" (+ i 2)))))
+  (set! face-back (try (numbered "STFB" console-player)))
+  (if (>= (check-num-for-name "STBAR") 0)
+    (set! bar (try (patch-named "STBAR")))
+    (do (set! bar (try (patch-named "STMBARL")))
+        (set! bar-right (try (patch-named "STMBARR")))
+        (set! has-bar-right true)))
+  (let (n 0)
+    (dotimes (i NUM-PAIN-FACES)
+      (dotimes (j NUM-STRAIGHT-FACES)
+        (set! (aref faces n) (try (patch-named (string-as-view &(str "STFST" i j)))))
+        (inc! n))
+      (set! (aref faces n) (try (patch-named (string-as-view &(str "STFTR" i "0")))))
+      (set! (aref faces (+ n 1)) (try (patch-named (string-as-view &(str "STFTL" i "0")))))
+      (set! (aref faces (+ n 2)) (try (numbered "STFOUCH" i)))
+      (set! (aref faces (+ n 3)) (try (numbered "STFEVL" i)))
+      (set! (aref faces (+ n 4)) (try (numbered "STFKILL" i)))
+      (set! n (+ n 5)))
+    (set! (aref faces GOD-FACE) (try (patch-named "STFGOD0")))
+    (set! (aref faces DEAD-FACE) (try (patch-named "STFDEAD0"))))
+  (set! playpal (try (lump-num "PLAYPAL")))
+  (ok))
+
+;; The face.
+
+(defconst- NUM-PAIN-FACES 5)
+(defconst- NUM-STRAIGHT-FACES 3)
+; Each pain level has 3 straight faces, 2 turned, ouch, evil grin and rampage.
+(defconst- FACE-STRIDE 8)
+(defconst- TURN-OFFSET 3)
+(defconst- OUCH-OFFSET 5)
+(defconst- EVIL-GRIN-OFFSET 6)
+(defconst- RAMPAGE-OFFSET 7)
+(defconst- GOD-FACE 40)
+(defconst- DEAD-FACE 41)
+
+(defconst- EVIL-GRIN-COUNT (* 2 TIC-RATE))
+(defconst- STRAIGHT-FACE-COUNT (/ TIC-RATE 2))
+(defconst- TURN-COUNT TIC-RATE)
+(defconst- RAMPAGE-DELAY (* 2 TIC-RATE))
+(defconst- MUCH-PAIN 20)
 
 (defvar- random-number:i32 0)
+(defvar- old-health:i32 -1)
+(defvar- old-weapons-owned:(array i32 9))
+(defvar- face-index:i32 0)
+(defvar- face-count:i32 0)
+(defvar- priority:i32 0)
+(defvar- last-attack-down:i32 -1)
 
-(defn status-start ():void (do))
+(defn- pain-offset (p:&Player):i32
+  (let (health (if (> (p 'health) 100) 100 (p 'health)))
+    (* FACE-STRIDE (/ (* (- 100 health) NUM-PAIN-FACES) 101))))
+
+; Which way the face looks at whoever hurt the player.
+(defn- attacker-face (p:&Player attacker:&Mobj):i32
+  (let (mo (player-mobj p)
+        bad (point-to-angle2 (mo 'x) (mo 'y) (attacker 'x) (attacker 'y))
+        right:bool false
+        diff:Angle 0)
+    ; Both comparisons are the C's, which is confusing, as it says itself.
+    (if (> bad (mo 'angle))
+      (do (set! diff (- bad (mo 'angle)))
+          (set! right (> diff ANG180)))
+      (do (set! diff (- (mo 'angle) bad))
+          (set! right (<= diff ANG180))))
+    (+ (pain-offset p)
+       (cond (< diff ANG45) RAMPAGE-OFFSET
+             right TURN-OFFSET
+             true (+ TURN-OFFSET 1)))))
+
+; The precedence is dead > evil grin > hurt > rampage > god > straight ahead;
+; a face holds until its count runs out or something more urgent happens.
+(defn- update-face (p:&Player):void
+  (when (and (< priority 10) (= (p 'health) 0))
+    (set! priority 9)
+    (set! face-index DEAD-FACE)
+    (set! face-count 1))
+  (when (and (< priority 9) (!= (p 'bonus-count) 0))
+    (let (grin false)
+      (dotimes (i NUM-WEAPONS)
+        (when (!= (aref old-weapons-owned i) (aref (p 'weapon-owned) i))
+          (set! grin true)
+          (set! (aref old-weapons-owned i) (aref (p 'weapon-owned) i))))
+      (when grin
+        (set! priority 8)
+        (set! face-count EVIL-GRIN-COUNT)
+        (set! face-index (+ (pain-offset p) EVIL-GRIN-OFFSET)))))
+  (when (< priority 8)
+    (when-some (attacker (p 'attacker))
+      (when (and (!= (p 'damage-count) 0)
+                 (!= (unsafe/cast ptr attacker) (unsafe/cast ptr (p 'mo))))
+        (set! priority 7)
+        (set! face-count TURN-COUNT)
+        ; Gaining health counts as much pain: the C's test is backwards.
+        (set! face-index (if (> (- (p 'health) old-health) MUCH-PAIN)
+                           (+ (pain-offset p) OUCH-OFFSET)
+                           (attacker-face p attacker))))))
+  (when (and (< priority 7) (!= (p 'damage-count) 0))
+    (set! face-count TURN-COUNT)
+    (if (> (- (p 'health) old-health) MUCH-PAIN)
+      (do (set! priority 7)
+          (set! face-index (+ (pain-offset p) OUCH-OFFSET)))
+      (do (set! priority 6)
+          (set! face-index (+ (pain-offset p) RAMPAGE-OFFSET)))))
+  (when (< priority 6)
+    (if (!= (p 'attack-down) 0)
+      (if (= last-attack-down -1)
+        (set! last-attack-down RAMPAGE-DELAY)
+        (do (dec! last-attack-down)
+            (when (= last-attack-down 0)
+              (set! priority 5)
+              (set! face-index (+ (pain-offset p) RAMPAGE-OFFSET))
+              (set! face-count 1)
+              (set! last-attack-down 1))))
+      (set! last-attack-down -1)))
+  (when (and (< priority 5)
+             (or (!= (bit-and (p 'cheats) CF-GODMODE) 0)
+                 (!= (aref (p 'powers) PW-INVULNERABILITY) 0)))
+    (set! priority 4)
+    (set! face-index GOD-FACE)
+    (set! face-count 1))
+  (when (= face-count 0)
+    (set! face-index (+ (pain-offset p) (% random-number 3)))
+    (set! face-count STRAIGHT-FACE-COUNT)
+    (set! priority 0))
+  (dec! face-count))
 
 (defn status-ticker ():void
-  (set! random-number (m-random)))
+  (let (p (player console-player))
+    (set! random-number (m-random))
+    (update-face p)
+    (set! old-health (p 'health))))
+
+;; Palette shifts for damage, pickups and the radiation suit.
+
+(defconst- START-RED-PALS 1)
+(defconst- START-BONUS-PALS 9)
+(defconst- NUM-RED-PALS 8)
+(defconst- NUM-BONUS-PALS 4)
+(defconst- RADIATION-PAL 13)
+
+(defvar- palette:i32 0)
+
+(defn- shift (count:i32 n:i32 start:i32):i32
+  (let (pal (bit-shr (+ count 7) 3))
+    (+ start (if (>= pal n) (- n 1) pal))))
+
+(defn- update-palette (p:&Player):void
+  (let (cnt (p 'damage-count)
+        strength (aref (p 'powers) PW-STRENGTH)
+        iron (aref (p 'powers) PW-IRONFEET))
+    ; The berserk red fades out slowly.
+    (when (!= strength 0)
+      (let (bzc (- 12 (bit-shr strength 6)))
+        (when (> bzc cnt) (set! cnt bzc))))
+    (let (pal (cond (!= cnt 0) (shift cnt NUM-RED-PALS START-RED-PALS)
+                    (!= (p 'bonus-count) 0) (shift (p 'bonus-count) NUM-BONUS-PALS START-BONUS-PALS)
+                    (or (> iron (* 4 32)) (!= (bit-and iron 8) 0)) RADIATION-PAL
+                    true 0))
+      ; Chex Quest's player never sees red: flemoids slime the screen green.
+      (when (and (= game-version EXE-CHEX) (>= pal START-RED-PALS)
+                 (< pal (+ START-RED-PALS NUM-RED-PALS)))
+        (set! pal RADIATION-PAL))
+      (when (!= pal palette)
+        (set! palette pal)
+        (set-palette (sub (lump playpal) (* pal 768) 768))))))
+
+;; Drawing.
+
+(defn- digit (tall:bool d:i32):Patch (if tall (aref tall-num d) (aref short-num d)))
+
+; A number right-aligned at x in at most `digits` digits; 1994 means "none".
+(defn- draw-num (x:i32 y:i32 tall:bool value:i32 digits:i32):!void
+  (let (w (patch-width (digit tall 0))
+        neg (< value 0)
+        num value)
+    (when neg
+      (cond (and (= digits 2) (< num -9)) (set! num -9)
+            (and (= digits 3) (< num -99)) (set! num -99))
+      (set! num (- 0 num)))
+    (when (!= num 1994)
+      (let (cx x n digits)
+        (when (= num 0) (try (draw-patch (- cx w) y (digit tall 0))))
+        (while (and (!= num 0) (> n 0))
+          (set! cx (- cx w))
+          (try (draw-patch cx y (digit tall (% num 10))))
+          (set! num (/ num 10))
+          (dec! n))
+        (when (and neg has-minus) (try (draw-patch (- cx 8) y tall-minus))))))
+  (ok))
+
+(defn- draw-percent (x:i32 y:i32 value:i32):!void
+  (try (draw-patch x y tall-percent))
+  (draw-num x y true value 3))
+
+(defn- ready-ammo (p:&Player):i32
+  (let (ammo ((aref weapon-info (p 'ready-weapon)) 'ammo))
+    (if (= ammo AM-NOAMMO) 1994 (aref (p 'ammo) ammo))))
+
+; Each box shows a skull key over the card of its colour.
+(defn- key-box (p:&Player i:i32):i32
+  (cond (aref (p 'cards) (+ i 3)) (+ i 3)
+        (aref (p 'cards) i) i
+        true -1))
+
+(defn- frags (p:&Player):i32
+  (let (n 0)
+    (dotimes (i MAX-PLAYERS)
+      (set! n (if (= i console-player)
+                (- n (aref (p 'frags) i))
+                (+ n (aref (p 'frags) i)))))
+    n))
+
+(defconst- AMMO-Y (array i32 173 179 191 185))
+
+(defn- draw-bar (p:&Player):!void
+  (try (draw-patch 0 ST-Y bar))
+  (when has-bar-right (try (draw-patch 104 ST-Y bar-right)))
+  (when netgame (try (draw-patch 143 ST-Y face-back)))
+  (try (draw-num 44 171 true (ready-ammo p) 3))
+  (dotimes (i 4)
+    (try (draw-num 288 (aref AMMO-Y i) false (aref (p 'ammo) i) 3))
+    (try (draw-num 314 (aref AMMO-Y i) false (aref (p 'max-ammo) i) 3)))
+  (try (draw-percent 90 171 (p 'health)))
+  (try (draw-percent 221 171 (p 'armor-points)))
+  (when (= deathmatch 0)
+    (try (draw-patch 104 168 arms-bg))
+    (dotimes (i 6)
+      (try (draw-patch (+ 111 (* (% i 3) 12)) (+ 172 (* (/ i 3) 10))
+                       (if (!= (aref (p 'weapon-owned) (+ i 1)) 0)
+                         (aref short-num (+ i 2))
+                         (aref arms-gray i))))))
+  (try (draw-patch 143 168 (aref faces face-index)))
+  (dotimes (i 3)
+    (let (k (key-box p i))
+      (when (!= k -1) (try (draw-patch 239 (+ 171 (* i 10)) (aref key-icons k))))))
+  (when (!= deathmatch 0) (try (draw-num 138 171 true (frags p) 2)))
+  (ok))
+
+(defn status-drawer (full-screen:bool):!void
+  (let (p (player console-player))
+    (update-palette p)
+    (when (or (not full-screen) automap-active)
+      (try (draw-bar p))))
+  (ok))
+
+(defn status-start ():void
+  (let (p (player console-player))
+    (set! face-index 0)
+    (set! palette -1)
+    (set! old-health -1)
+    (dotimes (i NUM-WEAPONS)
+      (set! (aref old-weapons-owned i) (aref (p 'weapon-owned) i)))))
+
+;; Cheats.
+
+(defvar- cheat-mus:Cheat (Cheat "idmus" 2))
+(defvar- cheat-god:Cheat (Cheat "iddqd" 0))
+(defvar- cheat-ammo:Cheat (Cheat "idkfa" 0))
+(defvar- cheat-ammo-no-key:Cheat (Cheat "idfa" 0))
+(defvar- cheat-noclip:Cheat (Cheat "idspispopd" 0))
+(defvar- cheat-commercial-noclip:Cheat (Cheat "idclip" 0))
+(defvar- cheat-powerup:(array Cheat 7)
+  (array Cheat (Cheat "idbeholdv" 0) (Cheat "idbeholds" 0) (Cheat "idbeholdi" 0)
+         (Cheat "idbeholdr" 0) (Cheat "idbeholda" 0) (Cheat "idbeholdl" 0)
+         (Cheat "idbehold" 0)))
+(defvar- cheat-choppers:Cheat (Cheat "idchoppers" 0))
+(defvar- cheat-clev:Cheat (Cheat "idclev" 2))
+(defvar- cheat-mypos:Cheat (Cheat "idmypos" 0))
+
+(defn- full-arsenal (p:&Player armor:i32):void
+  (set! (p 'armor-points) armor)
+  (set! (p 'armor-type) 2)
+  (dotimes (i NUM-WEAPONS) (set! (aref (p 'weapon-owned) i) 1))
+  (dotimes (i NUM-AMMO) (set! (aref (p 'ammo) i) (aref (p 'max-ammo) i))))
+
+(defn- music-cheat (p:&Player):void
+  (let (a (cheat-param &cheat-mus 0) b (cheat-param &cheat-mus 1))
+    (set! (p 'message) "Music Change")
+    ; v1.9 played the Doom II music in every game; Ultimate fixed that.
+    (if (or (= game-mode COMMERCIAL) (< game-version EXE-ULTIMATE))
+      (if (and (> (+ (* a 10) b) 35) (>= game-version EXE-DOOM-1-8))
+        (set! (p 'message) "IMPOSSIBLE SELECTION")
+        (change-music (+ MUS-RUNNIN (* a 10) b -1) true))
+      (if (> (+ (* (- a 1) 9) (- b 1)) 31)
+        (set! (p 'message) "IMPOSSIBLE SELECTION")
+        (change-music (+ MUS-E1M1 (* (- a 1) 9) (- b 1)) true)))))
+
+(defvar- mypos-message:(array i8 52))
+
+(defn- single-player-cheats (p:&Player key:i32):void
+  (cond (cheat? &cheat-god key)
+        (do (set! (p 'cheats) (bit-xor (p 'cheats) CF-GODMODE))
+            (if (!= (bit-and (p 'cheats) CF-GODMODE) 0)
+              (do (when-some (mo (p 'mo)) (set! (mo 'health) 100))
+                  (set! (p 'health) 100)
+                  (set! (p 'message) "Degreelessness Mode On"))
+              (set! (p 'message) "Degreelessness Mode Off")))
+        (cheat? &cheat-ammo-no-key key)
+        (do (full-arsenal p 200)
+            (set! (p 'message) "Ammo (no keys) Added"))
+        (cheat? &cheat-ammo key)
+        (do (full-arsenal p 200)
+            (dotimes (i NUM-CARDS) (set! (aref (p 'cards) i) true))
+            (set! (p 'message) "Very Happy Ammo Added"))
+        (cheat? &cheat-mus key) (music-cheat p)
+        ; Doom 1 spells noclip idspispopd; the others, idclip.
+        (if (= (logical-mission) DOOM) (cheat? &cheat-noclip key) (cheat? &cheat-commercial-noclip key))
+        (do (set! (p 'cheats) (bit-xor (p 'cheats) CF-NOCLIP))
+            (set! (p 'message) (if (!= (bit-and (p 'cheats) CF-NOCLIP) 0)
+                                 "No Clipping Mode ON"
+                                 "No Clipping Mode OFF"))))
+  ; Every power-up sequence sees every key.
+  (dotimes (i 6)
+    (when (cheat? &(aref cheat-powerup i) key)
+      (cond (= (aref (p 'powers) i) 0) (give-power p i)
+            (!= i PW-STRENGTH) (set! (aref (p 'powers) i) 1)
+            true (set! (aref (p 'powers) i) 0))
+      (set! (p 'message) "Power-up Toggled")))
+  (cond (cheat? &(aref cheat-powerup 6) key)
+        (set! (p 'message) "inVuln, Str, Inviso, Rad, Allmap, or Lite-amp")
+        (cheat? &cheat-choppers key)
+        (do (set! (aref (p 'weapon-owned) WP-CHAINSAW) 1)
+            (set! (aref (p 'powers) PW-INVULNERABILITY) 1)
+            (set! (p 'message) "... doesn't suck - GM"))
+        (cheat? &cheat-mypos key)
+        (let (mo (player-mobj (player console-player)))
+          ; nucleus.fmt has no hex. ISSUE-028
+          (snprintf (unsafe/cast ptr &mypos-message) 52 "ang=0x%x;x,y=(0x%x,0x%x)"
+                    (mo 'angle) ((mo 'x) 'v) ((mo 'y) 'v))
+          (set! (p 'message) (unsafe/cast CStr &mypos-message)))))
+
+; idclev ignores a level that doesn't exist.
+(defn- level-cheat (p:&Player):void
+  (let (a (cheat-param &cheat-clev 0) b (cheat-param &cheat-clev 1)
+        episode (if (= game-mode COMMERCIAL) 0 a)
+        map (if (= game-mode COMMERCIAL) (+ (* a 10) b) b))
+    ; Chex.exe always warps to episode 1.
+    (when (= game-version EXE-CHEX)
+      (when (> episode 1) (set! episode 1))
+      (when (> map 5) (set! map 5)))
+    (when (if (= game-mode COMMERCIAL)
+            (and (>= map 1) (<= map 40))
+            (and (>= episode 1) (<= episode 4)
+                 (or (< episode 4) (>= game-version EXE-ULTIMATE))
+                 (>= map 1) (<= map 9)))
+      (set! (p 'message) "Changing Level...")
+      (defer-init-new game-skill episode map))))
+
+(defn status-responder (ev:&Event):bool
+  ; The automap's enter/exit messages ask for a full redraw: every frame is one.
+  (when (= (ev 'type) EV-KEYDOWN)
+    (let (p (player console-player) key (ev 'data2))
+      (when (and (not netgame) (!= game-skill SK-NIGHTMARE))
+        (single-player-cheats p key))
+      (when (and (not netgame) (cheat? &cheat-clev key))
+        (level-cheat p))))
+  false)

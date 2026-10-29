@@ -1,0 +1,11 @@
+; ISSUE-034: a char literal (`\n`) is not a compile-time constant in a global
+; aggregate initializer, though `(char "n")`, its documented sugar, is. Fails
+; with "defvar: init must be a compile-time constant".
+; fixed-when: output-contains 110 98
+(import-use "stdio.h")
+(defstruct It n:i32 key:Char)
+(defvar it:It (It 1 \n))
+(defvar cs:(array Char 2) (array Char \a \b))
+(defn main ():i32
+  (printf "%d %d\n" (as i32 (it 'key)) (as i32 (aref cs 1)))
+  0)

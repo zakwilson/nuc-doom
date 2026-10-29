@@ -1,0 +1,136 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Input events and their queue (d_event.c), the key codes (doomkeys.h) and
+; the default bindings (m_controls.c).
+
+(ns doom.event)
+
+(defenum EvType EV-KEYDOWN EV-KEYUP EV-MOUSE EV-JOYSTICK EV-QUIT)
+
+; A key event carries the key in data1, the layout's key in data2 and the
+; typed character in data3; a mouse event carries the buttons in data1 and
+; the motion in data2/data3.
+(defstruct Event type:i32 data1:i32 data2:i32 data3:i32 data4:i32)
+
+(defconst- MAXEVENTS 64)
+(defvar- events:(array Event 64))
+(defvar- event-head:i32 0)
+(defvar- event-tail:i32 0)
+
+(defn post-event (ev:Event):void
+  (set! (aref events event-head) ev)
+  (set! event-head (% (+ event-head 1) MAXEVENTS)))
+
+; The next event, or null when the queue is empty.
+(defn pop-event ():?&Event
+  (if (= event-tail event-head)
+    null
+    (let (ev &(aref events event-tail))
+      (set! event-tail (% (+ event-tail 1) MAXEVENTS))
+      ev)))
+
+;; Key codes: ASCII for printable keys, the rest above 0x80.
+
+(defconst KEY-RIGHTARROW 0xae)
+(defconst KEY-LEFTARROW 0xac)
+(defconst KEY-UPARROW 0xad)
+(defconst KEY-DOWNARROW 0xaf)
+(defconst KEY-ESCAPE 27)
+(defconst KEY-ENTER 13)
+(defconst KEY-TAB 9)
+(defconst KEY-F1 0xbb)
+(defconst KEY-F2 0xbc)
+(defconst KEY-F3 0xbd)
+(defconst KEY-F4 0xbe)
+(defconst KEY-F5 0xbf)
+(defconst KEY-F6 0xc0)
+(defconst KEY-F7 0xc1)
+(defconst KEY-F8 0xc2)
+(defconst KEY-F9 0xc3)
+(defconst KEY-F10 0xc4)
+(defconst KEY-F11 0xd7)
+(defconst KEY-F12 0xd8)
+(defconst KEY-BACKSPACE 0x7f)
+(defconst KEY-PAUSE 0xff)
+(defconst KEY-EQUALS 0x3d)
+(defconst KEY-MINUS 0x2d)
+(defconst KEY-RSHIFT 0xb6)
+(defconst KEY-RCTRL 0x9d)
+(defconst KEY-RALT 0xb8)
+(defconst KEY-LALT 0xb8)
+(defconst KEY-CAPSLOCK 0xba)
+(defconst KEY-NUMLOCK 0xc5)
+(defconst KEY-SCRLCK 0xc6)
+(defconst KEY-PRTSCR 0xd9)
+(defconst KEY-HOME 0xc7)
+(defconst KEY-END 0xcf)
+(defconst KEY-PGUP 0xc9)
+(defconst KEY-PGDN 0xd1)
+(defconst KEY-INS 0xd2)
+(defconst KEY-DEL 0xd3)
+(defconst KEYP-5 0xcc)
+
+;; Bindings (m_controls.c's defaults; there's no config file yet).
+
+(defvar key-right:i32 KEY-RIGHTARROW)
+(defvar key-left:i32 KEY-LEFTARROW)
+(defvar key-up:i32 KEY-UPARROW)
+(defvar key-down:i32 KEY-DOWNARROW)
+(defvar key-strafeleft:i32 44)
+(defvar key-straferight:i32 46)
+(defvar key-fire:i32 KEY-RCTRL)
+(defvar key-use:i32 32)
+(defvar key-strafe:i32 KEY-RALT)
+(defvar key-speed:i32 KEY-RSHIFT)
+(defvar key-pause:i32 KEY-PAUSE)
+(defvar key-spy:i32 KEY-F12)
+(defvar key-message-refresh:i32 KEY-ENTER)
+(defvar key-prevweapon:i32 0)
+(defvar key-nextweapon:i32 0)
+; '1' to '8'.
+(defvar key-weapons:(array i32 8))
+
+(defvar key-map-north:i32 KEY-UPARROW)
+(defvar key-map-south:i32 KEY-DOWNARROW)
+(defvar key-map-east:i32 KEY-RIGHTARROW)
+(defvar key-map-west:i32 KEY-LEFTARROW)
+(defvar key-map-zoomin:i32 61)
+(defvar key-map-zoomout:i32 45)
+(defvar key-map-toggle:i32 KEY-TAB)
+(defvar key-map-maxzoom:i32 48)
+(defvar key-map-follow:i32 102)
+(defvar key-map-grid:i32 103)
+(defvar key-map-mark:i32 109)
+(defvar key-map-clearmark:i32 99)
+
+(defvar key-menu-activate:i32 KEY-ESCAPE)
+(defvar key-menu-up:i32 KEY-UPARROW)
+(defvar key-menu-down:i32 KEY-DOWNARROW)
+(defvar key-menu-left:i32 KEY-LEFTARROW)
+(defvar key-menu-right:i32 KEY-RIGHTARROW)
+(defvar key-menu-back:i32 KEY-BACKSPACE)
+(defvar key-menu-forward:i32 KEY-ENTER)
+(defvar key-menu-confirm:i32 121)
+(defvar key-menu-abort:i32 110)
+(defvar key-menu-help:i32 KEY-F1)
+(defvar key-menu-save:i32 KEY-F2)
+(defvar key-menu-load:i32 KEY-F3)
+(defvar key-menu-volume:i32 KEY-F4)
+(defvar key-menu-detail:i32 KEY-F5)
+(defvar key-menu-qsave:i32 KEY-F6)
+(defvar key-menu-endgame:i32 KEY-F7)
+(defvar key-menu-messages:i32 KEY-F8)
+(defvar key-menu-qload:i32 KEY-F9)
+(defvar key-menu-quit:i32 KEY-F10)
+(defvar key-menu-gamma:i32 KEY-F11)
+(defvar key-menu-incscreen:i32 KEY-EQUALS)
+(defvar key-menu-decscreen:i32 KEY-MINUS)
+
+(defvar mouseb-fire:i32 0)
+(defvar mouseb-strafe:i32 1)
+(defvar mouseb-forward:i32 2)
+(defvar mouse-sensitivity:i32 5)
+
+(defn init-controls ():void
+  (dotimes (i 8) (set! (aref key-weapons i) (+ 49 i))))

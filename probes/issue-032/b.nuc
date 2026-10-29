@@ -1,0 +1,8 @@
+(ns issue-032.b)
+(import-use "stdio.h")
+(defn- num (x:i32 y:i32 big:bool v:i32 w:i32):!void (printf "b.num %d\n" v) (ok))
+(defn- pct (x:i32 y:i32 v:i32):!void
+  (num x y true v 3))
+(defn b-draw ():!void
+  (try (pct 4 5 6))
+  (ok))

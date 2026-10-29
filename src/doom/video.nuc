@@ -66,6 +66,11 @@
       (draw-column p col (pixel-at (+ x col) y))))
   (ok))
 
+; One column of `p` at screen column `x`, from the top and ignoring the patch's
+; offsets, for the finale's scrolling picture.
+(defn draw-patch-column (x:i32 p:Patch col:i32):void
+  (draw-column p col (pixel-at x 0)))
+
 ; Mirrored left to right, for the status bar face.
 (defn draw-patch-flipped (x:i32 y:i32 p:Patch):!void
   (let (x (- x (patch-left p)) y (- y (patch-top p)) w (patch-width p))

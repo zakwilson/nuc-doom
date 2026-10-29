@@ -1,0 +1,31 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Cheat sequences (m_cheat.c). Each one matches its sequence key by key, then
+; reads its parameter characters.
+
+(ns doom.cheat)
+
+(import-use nucleus.strview)
+
+(defstruct Cheat seq:StrView nparams:i32 chars-read:i32 params-read:i32 params:(array i32 2))
+
+; Feeds one key to `c`; true when that key completes it.
+(defn cheat? (c:&Cheat key:i32):bool
+  (let (len (unsafe/cast i32 ((c 'seq) 'len)))
+    (cond (< (c 'chars-read) len)
+          (do (set! (c 'chars-read) (if (= key (as i32 (aref ((c 'seq) 'data) (c 'chars-read))))
+                                      (+ (c 'chars-read) 1)
+                                      0))
+              (set! (c 'params-read) 0))
+          (< (c 'params-read) (c 'nparams))
+          (do (set! (aref (c 'params) (c 'params-read)) key)
+              (set! (c 'params-read) (+ (c 'params-read) 1)))) ; ISSUE-018
+    (if (and (>= (c 'chars-read) len) (>= (c 'params-read) (c 'nparams)))
+      (do (set! (c 'chars-read) 0)
+          (set! (c 'params-read) 0)
+          true)
+      false)))
+
+; Parameter `i` as a digit.
+(defn cheat-param (c:&Cheat i:i32):i32 (- (aref (c 'params) i) 48))

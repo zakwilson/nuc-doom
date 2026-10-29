@@ -1,0 +1,12 @@
+; ISSUE-030: a struct literal can fill an array field in a defvar initializer
+; but not in a function, where it fails with "struct literal: type mismatch
+; for positional initializer", naming neither the field nor the types.
+; fixed-when: output-contains 3 6 7
+(import-use "stdio.h")
+(defstruct Row tag:i32 cells:(array i32 2))
+(defvar g:Row (Row 1 (array i32 7 8)))
+(defn mk (t:i32):Row (Row t (array i32 5 6)))
+(defn main ():i32
+  (let (r (mk 3))
+    (printf "%d %d %d\n" (r 'tag) (aref (r 'cells) 1) (aref (g 'cells) 0)))
+  (return 0))

@@ -1,19 +1,38 @@
 ; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
 ; GPLv2 or later; see COPYING.
 ;
-; The screen melt (f_wipe.c). Its column offsets come from m-random, and
-; demo sync sees those draws, so they are made even before the melt is drawn
-; (milestone 5).
+; The screen melt (f_wipe.c). It moves columns two pixels wide, so the
+; screens are read as 160 columns of 16-bit pairs. The column offsets come
+; from m-random, which demo sync sees: they're drawn on the first frame of
+; the wipe, before the next tic.
 
 (ns doom.wipe)
 
+(import-use "string.h")
 (import-use doom.random)
 (import-use doom.video)
 
-; How far down each column starts; a column moves once it reaches 0.
-(defvar melt-y:(array i32 320))
+(defconst- COLS 160)
+(defconst- ROWS 200)
 
-(defn wipe-init-melt ():void
+(defvar- wipe-start:(array ui8 64000))
+(defvar- wipe-end:(array ui8 64000))
+; How far down each column has melted; a column moves once it reaches 0.
+; The C sets up 320 of them and moves only the first 160.
+(defvar- melt-y:(array i32 320))
+(defvar- going:bool false)
+
+(defn- pairs (buf:ptr:ui8):ptr:ui16 (unsafe/cast ptr:ui16 buf))
+
+(defn wipe-start-screen ():void
+  (memcpy (unsafe/cast ptr &wipe-start) (unsafe/cast ptr &screen) (unsafe/cast usize SCREEN-SIZE)))
+
+; The new screen is drawn: keep it, and put the old one back to melt from.
+(defn wipe-end-screen ():void
+  (memcpy (unsafe/cast ptr &wipe-end) (unsafe/cast ptr &screen) (unsafe/cast usize SCREEN-SIZE))
+  (memcpy (unsafe/cast ptr &screen) (unsafe/cast ptr &wipe-start) (unsafe/cast usize SCREEN-SIZE)))
+
+(defn- init-melt ():void
   (set! (aref melt-y 0) (- 0 (% (m-random) 16)))
   (let (i:i32 1)
     (while (< i SCREEN-WIDTH)
@@ -21,3 +40,37 @@
             y (+ (aref melt-y (- i 1)) r))
         (set! (aref melt-y i) (cond (> y 0) 0 (= y -16) -15 true y)))
       (inc! i))))
+
+; Melts `ticks` steps; true when every column has finished.
+(defn- do-melt (ticks:i32):bool
+  (let (done true
+        scr (pairs (unsafe/cast ptr:ui8 &screen))
+        start (pairs (unsafe/cast ptr:ui8 &wipe-start))
+        end (pairs (unsafe/cast ptr:ui8 &wipe-end)))
+    (dotimes (t ticks)
+      (dotimes (i COLS)
+        (let (y (aref melt-y i))
+          (cond (< y 0)
+                (do (set! (aref melt-y i) (+ y 1)) (set! done false))
+                (< y ROWS)
+                (let (dy (if (< y 16) (+ y 1) 8))
+                  (when (>= (+ y dy) ROWS) (set! dy (- ROWS y)))
+                  ; The new screen comes down from the top...
+                  (dotimes (j dy)
+                    (let (k (+ (* (+ y j) COLS) i))
+                      (set! (aref scr k) (aref end k))))
+                  (set! y (+ y dy))
+                  (set! (aref melt-y i) y)
+                  ; ...pushing the old one down below it.
+                  (dotimes (j (- ROWS y))
+                    (set! (aref scr (+ (* (+ y j) COLS) i)) (aref start (+ (* j COLS) i))))
+                  (set! done false))))))
+    done))
+
+; One frame of the wipe; true when it has finished.
+(defn wipe-screen (ticks:i32):bool
+  (when (not going)
+    (set! going true)
+    (init-melt))
+  (when (do-melt ticks) (set! going false))
+  (not going))

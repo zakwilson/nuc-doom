@@ -22,6 +22,13 @@
 (import-use doom.system)
 (import-use doom.sys.timer)
 (import-use doom.status)
+(import-use doom.event)
+(import-use doom.info)
+(import-use doom.menu)
+(import-use doom.hud)
+(import-use doom.automap)
+(import-use doom.intermission)
+(import-use doom.finale)
 (import-use doom.play.setup)
 (import-use doom.play.tick)
 (import-use doom.play.spec)
@@ -53,6 +60,11 @@
 
 (defn do-load-level ():!void
   (set! sky-flat-num (flat-num-for-name "F_SKY1"))
+  ; Doom II's sky never changed until the Anthology's doom2.exe fixed it.
+  (when (and (= game-mode COMMERCIAL) (or (= game-version EXE-FINAL2) (= game-version EXE-CHEX)))
+    (set! sky-texture (texture-num-for-name (cond (< game-map 12) "SKY1"
+                                                  (< game-map 21) "SKY2"
+                                                  true "SKY3"))))
   ; Reloading the level wipes too.
   (when (= wipe-game-state GS-LEVEL) (set! wipe-game-state -1))
   (set! game-state GS-LEVEL)
@@ -64,8 +76,24 @@
   (try (setup-level game-episode game-map game-skill))
   (set! display-player console-player)
   (set! game-action GA-NOTHING)
-  (set! paused false)
+  (clear-input)
   (ok))
+
+(defn- fast-monsters (f:(fn i32)(i32)):void
+  (let (i S-SARG-RUN1)
+    (while (<= i S-SARG-PAIN2)
+      (let (s &(aref states i)) ; ISSUE-021
+        (set! (s 'tics) (f (s 'tics))))
+      (inc! i))))
+
+(defn- set-missile-speed (type:i32 speed:i32):void
+  (let (info &(aref mobj-info type)) ; ISSUE-021
+    (set! (info 'speed) (* speed FRAC-UNIT))))
+
+(defn- set-missile-speeds (bruiser:i32 head:i32 troop:i32):void
+  (set-missile-speed MT-BRUISERSHOT bruiser)
+  (set-missile-speed MT-HEADSHOT head)
+  (set-missile-speed MT-TROOPSHOT troop))
 
 (defn init-new (skill:i32 episode:i32 map:i32):!void
   (set! paused false)
@@ -77,8 +105,14 @@
   (when (and (> map 9) (!= game-mode COMMERCIAL)) (set! map 9))
   (clear-random)
   (set! respawn-monsters (or (= skill SK-NIGHTMARE) respawn-parm))
-  (when (or fast-parm (and (= skill SK-NIGHTMARE) (!= game-skill SK-NIGHTMARE)))
-    (fatal "G_InitNew: fast monsters are not ported yet"))
+  ; Fast monsters: demons move at double speed and missiles fly faster. With
+  ; -fast, every new game halves the tics again, as it did in vanilla.
+  (cond (or fast-parm (and (= skill SK-NIGHTMARE) (!= game-skill SK-NIGHTMARE)))
+        (do (fast-monsters (fn (t:i32):i32 (bit-shr t 1)))
+            (set-missile-speeds 20 20 20))
+        (and (!= skill SK-NIGHTMARE) (= game-skill SK-NIGHTMARE))
+        (do (fast-monsters (fn (t:i32):i32 (bit-shl t 1)))
+            (set-missile-speeds 15 10 10)))
   (dotimes (i MAX-PLAYERS) (set! ((player i) 'player-state) PST-REBORN))
   (set! demo-playback false)
   (set! automap-active false)
@@ -175,19 +209,26 @@
   (set! demo-playback true)
   (ok))
 
-; The demo is over: a timed one reports and quits.
+; The demo is over: a timed one reports and quits, a -playdemo one quits,
+; and the title loop's moves on.
 (defn- check-demo-status ():void
   (when timing-demo
     (let (realtics (- (get-time) start-time))
+      (set! timing-demo false)
+      (set! demo-playback false)
       (fatal (string-as-view &(str "timed " game-tic " gametics in " realtics " realtics")))))
   (when demo-playback
     (set! demo-playback false)
+    (set! netgame false)
     (set! deathmatch 0)
+    (dotimes (i 3) (set! (aref player-in-game (+ i 1)) false))
     (set! respawn-parm false)
     (set! fast-parm false)
     (set! nomonsters false)
     (set! console-player 0)
-    (fatal "demo over")))
+    (if single-demo
+      (set! quit-requested true)
+      (advance-demo))))
 
 (defn- read-demo-ticcmd (cmd:&TicCmd):void
   (if (= (u8 demo demo-pos) DEMOMARKER)
@@ -197,6 +238,354 @@
         (set! (cmd 'angle-turn) (unsafe/cast i16 (bit-shl (demo-byte) 8)))
         (set! (cmd 'buttons) (unsafe/cast ui8 (demo-byte))))))
 
+;; The title loop (d_main.c's demo sequence).
+
+(defvar single-demo:bool false)
+(defvar quit-requested:bool false)
+(defvar advance-demo-pending:bool false)
+(defvar- demo-sequence:i32 0)
+(defvar- page-tic:i32 0)
+(defvar page-name:StrView "TITLEPIC")
+
+(defn advance-demo ():void (set! advance-demo-pending true))
+
+(defn start-title ():void
+  (set! game-action GA-NOTHING)
+  (set! demo-sequence -1)
+  (advance-demo))
+
+; Shareware cycles title, demo1, credits, demo2, help, demo3.
+(defn do-advance-demo ():void
+  (set! ((player console-player) 'player-state) PST-LIVE)
+  (set! advance-demo-pending false)
+  (set! user-game false)
+  (set! paused false)
+  (set! game-action GA-NOTHING)
+  (set! demo-sequence (% (+ demo-sequence 1) (if (or (= game-version EXE-ULTIMATE) (= game-version EXE-FINAL)) 7 6)))
+  (case demo-sequence
+    0 (do (set! page-tic (if (= game-mode COMMERCIAL) (* TIC-RATE 11) 170))
+          (set! game-state GS-DEMOSCREEN)
+          (set! page-name "TITLEPIC"))
+    1 (defer-play-demo "demo1")
+    2 (do (set! page-tic 200)
+          (set! game-state GS-DEMOSCREEN)
+          (set! page-name "CREDIT"))
+    3 (defer-play-demo "demo2")
+    4 (do (set! game-state GS-DEMOSCREEN)
+          (if (= game-mode COMMERCIAL)
+            (do (set! page-tic (* TIC-RATE 11)) (set! page-name "TITLEPIC"))
+            (do (set! page-tic 200)
+                (set! page-name (if (>= game-version EXE-ULTIMATE) "CREDIT" "HELP2")))))
+    5 (defer-play-demo "demo3")
+    6 (defer-play-demo "demo4")
+    (do)))
+
+(defn- page-ticker ():void
+  (set! page-tic (- page-tic 1))
+  (when (< page-tic 0) (advance-demo)))
+
+;; Building tic commands from input (G_BuildTiccmd, G_Responder).
+
+(defconst- NUMKEYS 256)
+(defconst- SLOWTURNTICS 6)
+(defconst- FORWARD-MOVE (array i32 0x19 0x32))
+(defconst- SIDE-MOVE (array i32 0x18 0x28))
+(defconst- ANGLE-TURN (array i32 640 1280 320))
+
+(defvar- game-key-down:(array bool 256))
+(defvar- mouse-buttons:(array bool 8))
+(defvar- turn-held:i32 0)
+(defvar- mouse-x:i32 0)
+(defvar- mouse-y:i32 0)
+(defvar- send-pause:bool false)
+(defvar- next-weapon:i32 0)
+(defvar- dclick-time:i32 0)
+(defvar- dclick-state:bool false)
+(defvar- dclicks:i32 0)
+(defvar- dclick-time2:i32 0)
+(defvar- dclick-state2:bool false)
+(defvar- dclicks2:i32 0)
+(defvar user-game:bool false)
+
+(defn- key-down? (key:i32):bool (and (>= key 0) (< key NUMKEYS) (aref game-key-down key)))
+(defn- mouse-down? (b:i32):bool (and (>= b 0) (< b 8) (aref mouse-buttons b)))
+
+; prev/next weapon order: each weapon, and the slot that selects it.
+(defconst- WEAPON-ORDER (array i32 WP-FIST WP-CHAINSAW WP-PISTOL WP-SHOTGUN WP-SUPERSHOTGUN
+                               WP-CHAINGUN WP-MISSILE WP-PLASMA WP-BFG))
+(defconst- WEAPON-SLOT (array i32 WP-FIST WP-FIST WP-PISTOL WP-SHOTGUN WP-SHOTGUN
+                              WP-CHAINGUN WP-MISSILE WP-PLASMA WP-BFG))
+
+(defn- weapon-selectable? (w:i32):bool
+  (let (p (player console-player))
+    (cond (and (= w WP-SUPERSHOTGUN) (= game-mission DOOM)) false
+          (and (or (= w WP-PLASMA) (= w WP-BFG)) (= game-mission DOOM) (= game-mode SHAREWARE)) false
+          (= (aref (p 'weapon-owned) w) 0) false
+          (and (= w WP-FIST) (!= (aref (p 'weapon-owned) WP-CHAINSAW) 0)
+               (= (aref (p 'powers) PW-STRENGTH) 0)) false
+          true true)))
+
+(defn- pick-next-weapon (direction:i32):i32
+  (let (p (player console-player)
+        w (if (= (p 'pending-weapon) WP-NOCHANGE) (p 'ready-weapon) (p 'pending-weapon))
+        i:i32 0)
+    (while (and (< i 9) (!= (aref WEAPON-ORDER i) w)) (inc! i))
+    (when (>= i 9) (fatal "Internal error: weapon not present in weapon_order_table"))
+    (let (start i)
+      (set! i (% (+ i direction 9) 9))
+      (while (and (!= i start) (not (weapon-selectable? (aref WEAPON-ORDER i))))
+        (set! i (% (+ i direction 9) 9)))
+      (aref WEAPON-SLOT i))))
+
+(defn- clamp-move (v:i32):i32
+  (let (m (aref FORWARD-MOVE 1))
+    (cond (> v m) m (< v (- 0 m)) (- 0 m) true v)))
+
+; The vanilla double-click: pressing a button twice within 20 tics is use.
+(defn- double-click? (down:bool which:i32):bool
+  (let (fired false)
+    (if (= which 0)
+      (if (and (!= down dclick-state) (> dclick-time 1))
+        (do (set! dclick-state down)
+            (when down (inc! dclicks))
+            (if (= dclicks 2)
+              (do (set! fired true) (set! dclicks 0))
+              (set! dclick-time 0)))
+        (do (inc! dclick-time)
+            (when (> dclick-time 20) (set! dclicks 0) (set! dclick-state false))))
+      (if (and (!= down dclick-state2) (> dclick-time2 1))
+        (do (set! dclick-state2 down)
+            (when down (inc! dclicks2))
+            (if (= dclicks2 2)
+              (do (set! fired true) (set! dclicks2 0))
+              (set! dclick-time2 0)))
+        (do (inc! dclick-time2)
+            (when (> dclick-time2 20) (set! dclicks2 0) (set! dclick-state2 false)))))
+    fired))
+
+(defn build-ticcmd (cmd:&TicCmd):void
+  (memset (unsafe/cast ptr cmd) 0 (unsafe/cast usize (sizeof TicCmd)))
+  (let (strafe (or (key-down? key-strafe) (mouse-down? mouseb-strafe))
+        speed (if (key-down? key-speed) 1 0)
+        forward:i32 0
+        side:i32 0
+        turn:i32 0
+        buttons:i32 0)
+    ; Two-stage turning: slow for the first few tics a turn key is held.
+    (if (or (key-down? key-right) (key-down? key-left))
+      (inc! turn-held)
+      (set! turn-held 0))
+    (let (tspeed (if (< turn-held SLOWTURNTICS) 2 speed))
+      (if strafe
+        (do (when (key-down? key-right) (set! side (+ side (aref SIDE-MOVE speed))))
+            (when (key-down? key-left) (set! side (- side (aref SIDE-MOVE speed)))))
+        (do (when (key-down? key-right) (set! turn (- turn (aref ANGLE-TURN tspeed))))
+            (when (key-down? key-left) (set! turn (+ turn (aref ANGLE-TURN tspeed)))))))
+    (when (key-down? key-up) (set! forward (+ forward (aref FORWARD-MOVE speed))))
+    (when (key-down? key-down) (set! forward (- forward (aref FORWARD-MOVE speed))))
+    (when (key-down? key-strafeleft) (set! side (- side (aref SIDE-MOVE speed))))
+    (when (key-down? key-straferight) (set! side (+ side (aref SIDE-MOVE speed))))
+    (when (or (key-down? key-fire) (mouse-down? mouseb-fire))
+      (set! buttons (bit-or buttons BT-ATTACK)))
+    (when (key-down? key-use)
+      (set! buttons (bit-or buttons BT-USE))
+      (set! dclicks 0))
+    (if (and (= game-state GS-LEVEL) (!= next-weapon 0))
+      (set! buttons (bit-or buttons (bit-or BT-CHANGE (bit-shl (pick-next-weapon next-weapon) BT-WEAPONSHIFT))))
+      (let (i:i32 0)
+        (while (< i 8)
+          (if (key-down? (aref key-weapons i))
+            (do (set! buttons (bit-or buttons (bit-or BT-CHANGE (bit-shl i BT-WEAPONSHIFT))))
+                (set! i 8))
+            (inc! i)))))
+    (set! next-weapon 0)
+    (when (mouse-down? mouseb-forward) (set! forward (+ forward (aref FORWARD-MOVE speed))))
+    (when (double-click? (mouse-down? mouseb-forward) 0) (set! buttons (bit-or buttons BT-USE)))
+    (when (double-click? (mouse-down? mouseb-strafe) 1) (set! buttons (bit-or buttons BT-USE)))
+    (set! forward (+ forward mouse-y))
+    (if strafe
+      (set! side (+ side (* mouse-x 2)))
+      (set! turn (- turn (* mouse-x 8))))
+    (set! mouse-x 0)
+    (set! mouse-y 0)
+    (set! (cmd 'forward-move) (unsafe/cast i8 (clamp-move forward)))
+    (set! (cmd 'side-move) (unsafe/cast i8 (clamp-move side)))
+    (set! (cmd 'angle-turn) (unsafe/cast i16 turn))
+    (set! (cmd 'buttons) (unsafe/cast ui8 buttons))
+    (when send-pause
+      (set! send-pause false)
+      (set! (cmd 'buttons) (unsafe/cast ui8 (bit-or BT-SPECIAL BTS-PAUSE))))))
+
+(defn- clear-input ():void
+  (dotimes (i NUMKEYS) (set! (aref game-key-down i) false))
+  (dotimes (i 8) (set! (aref mouse-buttons i) false))
+  (set! mouse-x 0)
+  (set! mouse-y 0)
+  (set! send-pause false)
+  (set! paused false))
+
+(defn- set-mouse-buttons (mask:i32):void
+  (dotimes (i 8)
+    (set! (aref mouse-buttons i) (!= (bit-and mask (bit-shl 1 i)) 0))))
+
+; True if the event was used.
+(defn game-responder (ev:&Event):bool
+  (when (and (= game-state GS-LEVEL) (= (ev 'type) EV-KEYDOWN) (= (ev 'data1) key-spy)
+             (or single-demo (= deathmatch 0)))
+    (set! display-player (% (+ display-player 1) MAX-PLAYERS))
+    (while (and (not (aref player-in-game display-player)) (!= display-player console-player))
+      (set! display-player (% (+ display-player 1) MAX-PLAYERS)))
+    (return true))
+  ; Any other key in a demo or on a title page brings up the menu.
+  (when (and (= game-action GA-NOTHING) (not single-demo)
+             (or demo-playback (= game-state GS-DEMOSCREEN)))
+    (when (or (= (ev 'type) EV-KEYDOWN)
+              (and (= (ev 'type) EV-MOUSE) (!= (ev 'data1) 0)))
+      (start-control-panel)
+      (return true))
+    (return false))
+  (when (= game-state GS-LEVEL)
+    (when (hud-responder ev) (return true))
+    (when (status-responder ev) (return true))
+    (when (automap-responder ev) (return true)))
+  (when (and (= game-state GS-FINALE) (finale-responder ev)) (return true))
+  (when (= (ev 'type) EV-KEYDOWN)
+    (cond (= (ev 'data1) key-prevweapon) (set! next-weapon -1)
+          (= (ev 'data1) key-nextweapon) (set! next-weapon 1)))
+  (case (ev 'type)
+    EV-KEYDOWN (do (if (= (ev 'data1) key-pause)
+                     (set! send-pause true)
+                     (when (< (ev 'data1) NUMKEYS) (set! (aref game-key-down (ev 'data1)) true)))
+                   true)
+    EV-KEYUP (do (when (< (ev 'data1) NUMKEYS) (set! (aref game-key-down (ev 'data1)) false))
+                 false)
+    EV-MOUSE (do (set-mouse-buttons (ev 'data1))
+                 (set! mouse-x (/ (* (ev 'data2) (+ mouse-sensitivity 5)) 10))
+                 (set! mouse-y (/ (* (ev 'data3) (+ mouse-sensitivity 5)) 10))
+                 true)
+    false))
+
+;; Finishing levels.
+
+; Cards and powers don't carry over.
+(defn- player-finish-level (p:&Player):void
+  (dotimes (i NUM-POWERS) (set! (aref (p 'powers) i) 0))
+  (dotimes (i NUM-CARDS) (set! (aref (p 'cards) i) false))
+  (let (mo (player-mobj p))
+    (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-SHADOW))))
+  (set! (p 'extra-light) 0)
+  (set! (p 'fixed-colormap) 0)
+  (set! (p 'damage-count) 0)
+  (set! (p 'bonus-count) 0))
+
+(defvar world-info:WorldInfo)
+
+; Par times in seconds, by episode and map.
+(defconst- PARS
+  (array i32 0 0 0 0 0 0 0 0 0 0
+             0 30 75 120 90 165 180 180 30 165
+             0 90 90 90 120 90 360 240 30 170
+             0 90 45 90 150 90 90 165 30 135))
+(defconst- CPARS
+  (array i32 30 90 120 120 90 150 120 120 270 90 210 150 150 150 210 150 420 150 210 150
+             240 150 180 150 150 300 330 420 300 180 120 30))
+
+(defn- do-completed ():!void
+  (set! game-action GA-NOTHING)
+  (dotimes (i MAX-PLAYERS)
+    (when (aref player-in-game i) (player-finish-level (player i))))
+  (when automap-active (automap-stop))
+  (when (!= game-mode COMMERCIAL)
+    (case game-map
+      8 (do (set! game-action GA-VICTORY) (return (ok)))
+      9 (dotimes (i MAX-PLAYERS) (set! ((player i) 'did-secret) true))
+      (do)))
+  (let (wi &world-info)
+    (set! (wi 'did-secret) ((player console-player) 'did-secret))
+    (set! (wi 'epsd) (- game-episode 1))
+    (set! (wi 'last) (- game-map 1))
+    (set! (wi 'next)
+          (if (= game-mode COMMERCIAL)
+            (if secret-exit
+              (case game-map 15 30 31 31 (wi 'next))
+              (case game-map (:or 31 32) 15 game-map))
+            (cond secret-exit 8
+                  ; Back from the secret level.
+                  (= game-map 9) (case game-episode 1 3 2 5 3 6 4 2 (wi 'next))
+                  true game-map)))
+    (set! (wi 'maxkills) total-kills)
+    (set! (wi 'maxitems) total-items)
+    (set! (wi 'maxsecret) total-secret)
+    (set! (wi 'maxfrags) 0)
+    (set! (wi 'partime)
+          (* TIC-RATE (cond (= game-mode COMMERCIAL) (aref CPARS (- game-map 1))
+                            (< game-episode 4) (aref PARS (+ (* game-episode 10) game-map))
+                            true (aref CPARS game-map))))
+    (set! (wi 'pnum) console-player)
+    (dotimes (i MAX-PLAYERS)
+      (let (ps &(aref (wi 'plyr) i) p (player i))
+        (set! (ps 'in) (aref player-in-game i))
+        (set! (ps 'skills) (p 'kill-count))
+        (set! (ps 'sitems) (p 'item-count))
+        (set! (ps 'ssecret) (p 'secret-count))
+        (set! (ps 'stime) level-time)
+        (dotimes (j MAX-PLAYERS) (set! (aref (ps 'frags) j) (aref (p 'frags) j)))))
+    (set! game-state GS-INTERMISSION)
+    (set! view-active false)
+    (set! automap-active false)
+    (try (wi-start wi)))
+  (ok))
+
+; The intermission is over.
+(defn world-done ():void
+  (set! game-action GA-WORLD-DONE)
+  (when secret-exit (set! ((player console-player) 'did-secret) true))
+  (when (= game-mode COMMERCIAL)
+    (case game-map
+      (:or 15 31) (when secret-exit (finale-start))
+      (:or 6 11 20 30) (finale-start)
+      (do))))
+
+(defn- do-world-done ():!void
+  (set! game-state GS-LEVEL)
+  (set! game-map (+ (world-info 'next) 1))
+  (try (do-load-level))
+  (set! game-action GA-NOTHING)
+  (set! view-active true)
+  (ok))
+
+;; New games from the menu.
+
+(defvar- d-skill:i32 SK-MEDIUM)
+(defvar- d-episode:i32 1)
+(defvar- d-map:i32 1)
+
+(defn defer-init-new (skill:i32 episode:i32 map:i32):void
+  (set! d-skill skill)
+  (set! d-episode episode)
+  (set! d-map map)
+  (set! game-action GA-NEW-GAME))
+
+; Savegames arrive with milestone 7; until then the menu says so.
+(defn save-game (slot:i32 description:StrView):void
+  (set! ((player console-player) 'message) "savegames are not supported yet"))
+
+(defn load-game (slot:i32):void
+  (set! ((player console-player) 'message) "savegames are not supported yet"))
+
+(defn- do-new-game ():!void
+  (set! demo-playback false)
+  (set! netgame false)
+  (set! deathmatch 0)
+  (dotimes (i 3) (set! (aref player-in-game (+ i 1)) false))
+  (set! respawn-parm false)
+  (set! fast-parm false)
+  (set! nomonsters false)
+  (set! console-player 0)
+  (try (init-new d-skill d-episode d-map))
+  (set! game-action GA-NOTHING)
+  (ok))
+
 ;; The game tic.
 
 ; A single player who died restarts the level.
@@ -205,8 +594,7 @@
     (set! game-action GA-LOAD-LEVEL)
     (fatal "G_DoReborn: netgame respawning is not ported yet")))
 
-(defn- do-completed ():void
-  (fatal "G_DoCompleted: the intermission is not ported yet"))
+(defvar- old-game-state:i32 -1)
 
 (defn game-ticker ():!void
   (dotimes (i MAX-PLAYERS)
@@ -215,13 +603,16 @@
   (while (!= game-action GA-NOTHING)
     (case game-action
       GA-LOAD-LEVEL (try (do-load-level))
+      GA-NEW-GAME (try (do-new-game))
       GA-PLAY-DEMO (try (do-play-demo))
-      GA-COMPLETED (do-completed)
-      (fatal "G_Ticker: game action not ported yet")))
+      GA-COMPLETED (try (do-completed))
+      GA-VICTORY (finale-start)
+      GA-WORLD-DONE (try (do-world-done))
+      (fatal "G_Ticker: loading and saving games are not ported yet")))
   (dotimes (i MAX-PLAYERS)
     (when (aref player-in-game i)
       (let (cmd &((player i) 'cmd))
-        (memset (unsafe/cast ptr cmd) 0 (unsafe/cast usize (sizeof TicCmd)))
+        (set! @cmd @(net-cmd i))
         (when demo-playback (read-demo-ticcmd cmd)))))
   (dotimes (i MAX-PLAYERS)
     (when (aref player-in-game i)
@@ -229,8 +620,21 @@
         (when (and (!= (bit-and (as i32 buttons) BT-SPECIAL) 0)
                    (= (bit-and (as i32 buttons) BT-SPECIALMASK) BTS-PAUSE))
           (set! paused (not paused))))))
+  (when (and (= old-game-state GS-INTERMISSION) (!= game-state GS-INTERMISSION))
+    (wi-end))
+  (set! old-game-state game-state)
   (case game-state
     GS-LEVEL (do (ticker)
-                 (status-ticker))
+                 (status-ticker)
+                 (automap-ticker)
+                 (hud-ticker))
+    GS-INTERMISSION (wi-ticker)
+    GS-FINALE (finale-ticker)
+    GS-DEMOSCREEN (page-ticker)
     (do))
   (ok))
+
+;; The tic commands the loop built, one per player.
+
+(defvar- net-cmds:(array TicCmd 4))
+(defn net-cmd (i:i32):&TicCmd &(aref net-cmds i))

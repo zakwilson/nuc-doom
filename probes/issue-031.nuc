@@ -1,0 +1,14 @@
+; ISSUE-031: an unannotated aggregate defconst used above its definition, in
+; the same file, is "not defined anywhere in this compilation unit", with a
+; note that no import reaches the file itself. The docs say order doesn't
+; matter for constants.
+; fixed-when: output-contains 2 5
+(import-use "stdio.h")
+(import-use nucleus.strview)
+(defn name (i:i32):StrView (aref NAMES i))
+(defn num (i:i32):i32 (aref NUMS i))
+(defconst- NAMES (array StrView "a" "bc"))
+(defconst NUMS (array i32 4 5))
+(defn main ():i32
+  (printf "%d %d\n" (unsafe/cast i32 ((name 1) 'len)) (num 1))
+  (return 0))

@@ -9,8 +9,8 @@
 | 2 | Static graphics, `-framedump` | done |
 | 3 | Level load and renderer | done |
 | 4 | Playsim, demos, `-tichash` | done |
-| 5 | Playable | next |
-| 6 | Sound and music (optional) | — |
+| 5 | Playable | done; playtest requested |
+| 6 | Sound and music (optional) | next |
 | 7 | Savegames and config (optional) | — |
 | 8 | Idiom pass and final report | — |
 
@@ -53,7 +53,7 @@
 | `doom.world` | `src/doom/world.nuc` | r_defs.h, d_player.h, p_mobj.h, d_think.h (map, mobj, player and thinker types; the level tables) |
 | `doom.state` | `src/doom/state.nuc` | doomstat.c (game globals, `players`) |
 | `doom.geom` | `src/doom/geom.nuc` | r_main.c point/angle helpers shared by the renderer and the playsim |
-| `doom.game` | `src/doom/game.nuc` | g_game.c (new game, level load; more in M4) |
+| `doom.game` | `src/doom/game.nuc` | g_game.c (new game, level load, demos, input, level exits) |
 | `doom.render.data` | `src/doom/render/data.nuc` | r_data.c, r_things.c sprite setup (textures, flats, colormaps, sprite frames) |
 | `doom.render.draw` | `src/doom/render/draw.nuc` | r_draw.c (column and span drawers, view border) |
 | `doom.render.main` | `src/doom/render/main.nuc` | r_main.c, r_sky.c (projection, light tables, the frame) |
@@ -76,8 +76,17 @@
 | `doom.play.lights` | `src/doom/play/lights.nuc` | p_lights.c |
 | `doom.play.spec` | `src/doom/play/spec.nuc` | p_spec.c, p_switch.c, p_telept.c |
 | `doom.sound` | `src/doom/sound.nuc` | s_sound.c's effect on the game: the `M_Random` pitch draws only |
-| `doom.status` | `src/doom/status.nuc` | st_stuff.c's ticker (one `M_Random` a tic; nothing drawn yet) |
-| `doom.wipe` | `src/doom/wipe.nuc` | f_wipe.c's melt setup (its 320 `M_Random` draws; nothing drawn yet) |
+| `doom.status` | `src/doom/status.nuc` | st_stuff.c, st_lib.c (the bar, face and palette, redrawn whole each frame) and the cheats |
+| `doom.cheat` | `src/doom/cheat.nuc` | m_cheat.c |
+| `doom.items` | `src/doom/items.nuc` | d_items.c (the weapon table, out of `play.pspr` to break an import cycle) |
+| `doom.hud` | `src/doom/hud.nuc` | hu_stuff.c, hu_lib.c (the font, messages, the automap's level title; no chat) |
+| `doom.menu` | `src/doom/menu.nuc` | m_menu.c (an `Action` per item in place of function pointers) |
+| `doom.automap` | `src/doom/automap.nuc` | am_map.c |
+| `doom.intermission` | `src/doom/intermission.nuc` | wi_stuff.c (single player only) |
+| `doom.finale` | `src/doom/finale.nuc` | f_finale.c (text, art screens, the bunny scroll and Doom II's cast) |
+| `doom.event` | `src/doom/event.nuc` | d_event.c, doomkeys.h, m_controls.c's default bindings |
+| `doom.sys.input` | `src/doom/sys/input.nuc` | i_input.c (keyboard and mouse) |
+| `doom.wipe` | `src/doom/wipe.nuc` | f_wipe.c (the melt) |
 | `doom.sys.timer` | `src/doom/sys/timer.nuc` | i_timer.c |
 | `doom.tichash` | `src/doom/tichash.nuc` | `-tichash`, the port's half of the demo-sync harness |
 | `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`, `-playdemo`, `-timedemo`) |
@@ -95,23 +104,61 @@
   of every `gameversion` branch: sight, melee range, the demon's bite,
   threshold, self-targeting, pickup sounds, armor bonus cap, line triggers,
   turbo floors, sector 17 and the line-anim limit.
-- Not ported yet; each one stops with a message: fast/nightmare monsters,
-  deathmatch starts, netgame respawn and net demos, and the intermission
-  (`G_DoCompleted`), which M5 adds.
+- Not ported; each one stops with a message: deathmatch starts, netgame
+  respawn and net demos. Netgames, chat and the netgame intermission are out
+  of scope (PROMPT §5).
+- Savegames are milestone 7. Until then the load and save menus show empty
+  slots, and saving says so in a message.
+- Doom II, Final Doom and Chex Quest have code paths in the menu, HUD,
+  intermission and finale, but only the shareware IWAD has been run.
 
 ## Gates
 
 - `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info).
-- `scripts/check-frames.sh`: `title` matches the reference byte for byte.
-  `e1m1` matches everywhere but the status bar, which M5 draws.
+- `scripts/check-frames.sh`: `title` and `e1m1` (status bar included) match
+  the reference byte for byte.
 - `scripts/check-demos.sh`: demo1, demo2 and demo3 match the reference's
   tic hashes for all 5658, 13980 and 13605 tics.
+- `scripts/check-warp.sh`: E1M1 to E1M9 at skills 1, 3 and 5, each played
+  for 700 tics with no input, end in their framedump without a crash.
 - `scripts/check-probes.sh`: issue probes.
+- The menu, automap, intermission and finale were also checked by framedumps
+  with key events injected through a temporary hook (since removed). There is
+  no reference to compare those frames with, since the reference engine takes
+  no scripted input.
+
+## Playtest request (milestone 5)
+
+The compiler has fixes on `doom-bugfixes` the host binary lacks, so rebuild it
+first:
+
+```
+cd /home/zak/code/nucleus && git checkout doom-bugfixes && make
+cd /home/zak/code/nuc-doom && . scripts/env.sh && nucleus build
+build/nuc-doom -iwad /home/zak/code/chocolate-doom/src/DOOM1.WAD
+```
+
+There is no sound yet (milestone 6), and no savegames (milestone 7). Please
+try:
+
+- The title loop, then Esc: the main menu, New Game through episode and skill
+  (nightmare asks first), Options (messages, detail, screen size with `-`/`=`,
+  mouse sensitivity, the volume sliders), Read This, Quit (y/n), and the
+  window's close button.
+- Playing: movement, mouse, weapons, doors, lifts, pickups and their messages,
+  the face, palette flashes on damage and pickups, and death and respawn.
+- Tab for the automap: follow (`f`), grid (`g`), marks (`m`, `c`), zoom
+  (`-`, `=`, `0`), and `iddt`.
+- Cheats: `iddqd`, `idkfa`, `idfa`, `idclev12`, `idbehold?`, `idchoppers`,
+  `idmypos`, `idspispopd`.
+- Finishing a level: the intermission's counts and the map with the "you are
+  here" marker, then E1M8's ending text and picture.
+- F-keys: F1 help, F4 volume, F5 detail, F7 end game, F8 messages, F10 quit,
+  F11 gamma.
 
 ## Next steps
 
-- Milestone 5: menus, HUD messages, the status bar, automap, intermission,
-  finale, the wipe's drawing and cheats. The status bar and wipe already make
-  their random draws, so drawing them mustn't add any. Gate: demos still sync,
-  and `-warp` into every shareware map runs without a crash. Then a playtest
-  request.
+- Milestone 6: sound effects and music through SDL_mixer.
+- Milestone 7: savegames and a config file.
+- Milestone 8: the idiom pass, the final ISSUES.md ranking, the line-count
+  table and the executive summary.

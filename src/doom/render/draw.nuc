@@ -206,7 +206,7 @@
       (restore-buffer)))
   (ok))
 
-(defn- video-erase (ofs:i32 count:i32):void
+(defn video-erase (ofs:i32 count:i32):void
   (when have-background
     (memcpy (unsafe/ptr+ (unsafe/cast ptr:ui8 &screen) ofs)
             (unsafe/ptr+ (unsafe/cast ptr:ui8 &background) ofs)

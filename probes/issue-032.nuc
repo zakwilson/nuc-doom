@@ -1,0 +1,12 @@
+; ISSUE-032: a template instance such as `!void`'s Result, first stamped
+; inside a `defn-`, registered as private to that namespace. Another namespace
+; missed it and stamped a second one under the same IR name, so the macro JIT
+; module failed with "redefinition of type %nuc_Result.void.Err".
+; fixed-when: output-contains b.num 6
+; flags: -I $ROOT/probes
+(import-use issue-032.b)
+(import-use issue-032.a)
+(defn main ():i32
+  (match (a-draw) ((ok) 0) ((err e) 1))
+  (match (b-draw) ((ok) 0) ((err e) 1))
+  0)

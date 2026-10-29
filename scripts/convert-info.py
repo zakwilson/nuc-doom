@@ -130,7 +130,7 @@ out += [""]
 out += ["(defstruct State sprite:i32 frame:i32 tics:i32 action:i32 next-state:i32 misc1:i32 misc2:i32)", ""]
 out += macro("over-states", state_rows, 8) + [
     "", "(over-states def-enum-rows StateNum)", "(over-states def-count-row NUM-STATES)",
-    "(over-states def-table-rows states State)", ""]
+    "(over-states def-mutable-table-rows states State)", ""]
 out += ["(defstruct MobjInfo",
         "  doomed-num:i32 spawn-state:i32 spawn-health:i32 see-state:i32 see-sound:i32",
         "  reaction-time:i32 attack-sound:i32 pain-state:i32 pain-chance:i32 pain-sound:i32",
@@ -139,7 +139,7 @@ out += ["(defstruct MobjInfo",
         "  flags:i32 raise-state:i32)", ""]
 out += macro("over-mobjs", mobj_rows, 24) + [
     "", "(over-mobjs def-enum-rows MobjType)", "(over-mobjs def-count-row NUM-MOBJ-TYPES)",
-    "(over-mobjs def-table-rows mobj-info MobjInfo)", ""]
+    "(over-mobjs def-mutable-table-rows mobj-info MobjInfo)", ""]
 open(os.path.join(root, "src/doom/info.nuc"), "w").write("\n".join(out))
 print(len(sprite_rows), "sprites,", len(state_rows), "states,", len(actions), "actions,",
       len(mobj_rows), "mobj types,", len(sfx_rows), "sfx,", len(music_rows), "music")

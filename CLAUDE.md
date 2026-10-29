@@ -64,6 +64,9 @@ Other environment facts:
   after editing the patch). Always pass `-nosound`, which is much faster and
   hashes the same. A `-framedump` run exits by itself after its last dump. A
   `-timedemo` run ends in `I_Error` (exit 255) on the demo's end marker.
+- **SIGTERM doesn't stop the port** (nor the reference): SDL turns it into a
+  window-close event, which opens the quit prompt as in vanilla. Use
+  `timeout -k 5 N`, never a bare `timeout`.
 - **Probes** state their own pass condition on a `; fixed-when:` header line
   (see `scripts/check-probes.sh`).
 - **Commits** need an identity the container lacks: pass

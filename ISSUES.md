@@ -32,6 +32,15 @@ Format and rules: `PROMPT.md` §7.
 | — | ISSUE-024 | minor | bug | 8 |
 | — | ISSUE-025 | minor | design gap | 13 |
 | — | ISSUE-026 | minor | design gap | ~15 |
+| — | ISSUE-027 | major | bug | 1 |
+| — | ISSUE-028 | papercut | stdlib gap | 1 |
+| — | ISSUE-029 | papercut | diagnostics | 0 |
+| — | ISSUE-030 | minor | bug | 1 |
+| — | ISSUE-031 | minor | bug | 0 |
+| — | ISSUE-032 | major | bug | 0 |
+| — | ISSUE-033 | major | bug | 0 |
+| — | ISSUE-034 | minor | bug | 0 |
+| — | ISSUE-035 | papercut | stdlib gap | 3 |
 
 ---
 
@@ -437,7 +446,7 @@ message showed which function it was in.
 - **Kind:** bug
 - **Status:** worked-around
 - **Probe:** `probes/issue-024.nuc` (with `probes/issue-024/`). Expected `sum=12`. Actual: "undefined: EXPR — defined in a file this unit imports circularly, and not registered yet at this point".
-- **Port sites:** `src/doom/world.nuc` (eight playsim constants, `MELEERANGE` …, moved out of `play/map`, `play/mobj`, `play/maputl` and `play/pspr`)
+- **Port sites:** `src/doom/world.nuc` (eight playsim constants, `MELEERANGE` …, moved out of `play/map`, `play/mobj`, `play/maputl` and `play/pspr`); `src/doom/items.nuc` (the `weapon-info` table, moved out of `play/pspr` when the status bar joined the cycle and changed its emission order)
 - **Workaround:** define such constants in a module outside the cycle.
 - **Suggestion:** `docs/toplevel.md` ("Cross-file resolution") promises that "every function, global, constant and enum-member reference inside the cycle resolves". The prescan registers only a `defconst` whose value is a literal. A computed one (`(* 64 FRAC-UNIT)`, or even a bare `FRAC-UNIT`) waits for its file to be emitted, because macros aren't registered yet. Either fold on demand at the first reference, or add the case to the docs' table of things a cycle doesn't carry.
 
@@ -453,7 +462,7 @@ it said nothing about constants, and it named only one cycle pair.
 - **Kind:** design gap
 - **Status:** worked-around
 - **Probe:** none; this is the documented rule (`docs/structs-unions.md`, "Compound literals in by-value struct positions").
-- **Port sites:** 13 `name:Fixed (Fixed …)` bindings in `play/*.nuc`; `movers.nuc` `do-donut` (`s3-height`)
+- **Port sites:** 13 `name:Fixed (Fixed …)` bindings in `play/*.nuc`; `movers.nuc` `do-donut` (`s3-height`); 2 in `automap.nuc`
 - **Workaround:** give the binding its type: `(let (range:Fixed (Fixed …)) …)`.
 - **Suggestion:** bind an untyped struct literal as an `S` value, the way a `:S` binding takes it. Then join a `&S` literal branch with `S` siblings as `S` even with no want. Today `(let (h (if-some (s x) (s 'floor-height) (Fixed 0))) …)` collapses to void.
 
@@ -470,13 +479,160 @@ Instead it fails with "no matching method for '_*' with operand types
 - **Kind:** design gap
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
-- **Port sites:** about 15 loops in `play/map.nuc`, `play/maputl.nuc`, `play/movers.nuc`, `play/setup.nuc` and `render/bsp.nuc` carry an `ok`/`go`/`going`/`stopped` flag; 4 linked-list walks in `play/thinkers.nuc` and `render/things.nuc`
+- **Port sites:** about 15 loops in `play/map.nuc`, `play/maputl.nuc`, `play/movers.nuc`, `play/setup.nuc` and `render/bsp.nuc` carry an `ok`/`go`/`going`/`stopped` flag; 4 linked-list walks in `play/thinkers.nuc`, `render/things.nuc` and `automap.nuc`
 - **Workaround:** a flag in the `while` test; for lists, `(while (not (null? cur)) (when-some (n cur) … (set! cur (next n))))`, hidden in `do-mobjs`. `(return)` covers a loop at the end of a function.
 - **Suggestion:** a `break` (and `continue`) scoped to the nearest `while`/`dotimes`, and a `while-some` that binds the narrowed value each pass, as `when-some` does once. `label`/`goto` can express both, but they're function-scoped and read as C.
 
 Context: the blockmap and line-iterator code is all "walk until a callback
 says stop". The C writes it as `if (!func(...)) return false;` inside
 nested `for` loops. The flags make each loop's test longer than its body.
+
+---
+
+## ISSUE-027: A field access on a string literal or string `defconst` emits invalid IR
+
+- **Severity:** major (the whole build fails, with an LLVM parse error)
+- **Kind:** bug
+- **Status:** fixed in nucleus `1e1495c`
+- **Probe:** `probes/issue-027.nuc`. Expected `b 3`. Actual: "failed to parse generated IR … '%t1' defined with type 'ptr' but expected '%nuc_StrView = type { ptr, i64 }'".
+- **Port sites:** `src/doom/sys/input.nuc` (`typed-char` indexes the `SHIFTED` string table through `'data`)
+- **Workaround:** none needed after the fix. Before it, bind the literal to a `:StrView` local first.
+- **Suggestion:** done. A string literal's Val is its bare rodata pointer typed as StrView, and `materialize-struct-value` stored that pointer as a whole StrView. It now builds the view first, as other StrView consumers do. A literal whose Val doesn't hold its own type is a trap for every new consumer. Building the view when the literal is emitted, and letting LLVM fold the unused length, would remove the special case.
+
+Context: the error came from LLVM, naming an IR temporary and the mangled
+function, with no source line. Only bisecting the function by hand found
+the expression.
+
+---
+
+## ISSUE-028: `nucleus.fmt` has no hexadecimal (or any radix) formatting
+
+- **Severity:** papercut
+- **Kind:** stdlib gap
+- **Status:** worked-around
+- **Probe:** none; nothing is broken.
+- **Port sites:** `src/doom/status.nuc` (the `idmypos` cheat message)
+- **Workaround:** `snprintf` into a fixed buffer with `%x`, as the C does.
+- **Suggestion:** a `hex` wrapper (or `(radix v 16)`) with a `ToStr` method, so `(str "0x" (hex v))` works. `strview-parse-magnitude` already reads any radix, so only the writing half is missing.
+
+Context: one site, but the obvious spelling (`str` with a hex part) has no
+equivalent, so the port drops to C varargs for one message.
+
+---
+
+## ISSUE-029: `try` on a void call reports a `match` error
+
+- **Severity:** papercut
+- **Kind:** diagnostics
+- **Status:** fixed in nucleus `5f2bfae`
+- **Probe:** `probes/issue-029.nuc`. Expected: an error that says `try` needs a result (`!T`) and names the callee's type. Actual: "match: scrutinee must be a defunion value, a pointer to one, or a defenum integer".
+- **Port sites:** none left (`automap-drawer` became `!void`)
+- **Workaround:** drop the `try`, or make the callee fallible.
+- **Suggestion:** done, together with ISSUE-033. `try` now checks its operand before expanding it into a match: "try: the operand must be a result (a !T, or a union with ok and err arms), but its type is void".
+
+Context: stubbing a subsystem as `:void` and implementing it as `!void`
+later is common in the port. The message shows `try`'s expansion, not
+what was written.
+
+---
+
+## ISSUE-030: A struct literal can fill an array field in a global initializer but not in a function
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-030.nuc`. Expected `3 6 7`. Actual: "struct literal: type mismatch for positional initializer".
+- **Port sites:** `src/doom/status.nuc` (the `Cheat` constructor, dropped in favour of `defvar` literals that omit the array field)
+- **Workaround:** omit the array field (it zero-fills) and set its elements afterwards, or initialize only at a `defvar`.
+- **Suggestion:** at runtime, copy an `(array T N)` literal into an array field element by element, as the global initializer path already lays it out. Until then, the error should name the field and say that array fields take literals only in global initializers.
+
+Context: `docs/structs-unions.md` shows `(Row 1 (array i32 9 8 7 6) 2)` as a
+`defvar` initializer, so the same literal in a constructor function looks
+fine. The message names neither the field nor the types.
+
+---
+
+## ISSUE-031: An array `defconst` used above its definition is "not defined anywhere", even in the same file
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed in nucleus `3d8c5ab`
+- **Probe:** `probes/issue-031.nuc`. Expected `2 5`. Actual: "undefined: NAMES — not defined anywhere in this compilation unit", with the note "'NAMES' is defined in ./issue-031.nuc, which no import in this unit reaches". That is the file being compiled.
+- **Port sites:** none left; `src/doom/hud.nuc` keeps its level-name tables at the end of the file
+- **Workaround:** none needed after the fix. Before it, define the table above its first use, or annotate it (`NAMES:(array StrView 2)`).
+- **Suggestion:** done. The value-name prescan registered a stored constant only when its type was known early: an annotation or a struct literal's head. A bare `(array T …)` now registers too, sized from its initializers as emission sizes it. The note's wording should also exclude the current file, since "no import reaches" can't be true of it.
+
+Context: `docs/toplevel.md` says "Order does not matter. A constant may be used
+above its definition, in the same file", and that held for every scalar
+constant the port had used. Generated data tables are naturally appended at
+the end of a module, which is where this came up. This is the same prescan
+gap that makes ISSUE-024's computed constants fail across a cycle.
+
+---
+
+## ISSUE-032: Two namespaces with a `defn-` returning `!void` fail with an LLVM "redefinition of type"
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus `5d3cfe8`
+- **Probe:** `probes/issue-032.nuc` (with `probes/issue-032/a.nuc` and `b.nuc`). Expected `a.num 3` then `b.num 6`. Actual: the macro JIT module fails with "redefinition of type %nuc_Result.void.Err".
+- **Port sites:** none left; `src/doom/intermission.nuc` and `src/doom/status.nuc` both have private `draw-num` and `draw-percent`
+- **Workaround:** none needed after the fix. Before it, renaming one namespace's private functions avoided the trigger.
+- **Suggestion:** done. A template instance (`!void` is `(Result void Error)`) was registered while `g-defining-private` was still set by the enclosing `defn-`, so the instance became private to that namespace. Another namespace's lookup missed it and stamped a second copy under the same IR name. Registration now clears the flag, since an instance belongs to every namespace.
+
+Context: this showed up as a bare LLVM error with no Nucleus source line, and
+only once the intermission and the status bar both existed. The error was
+also hard to bisect: it came from the macro JIT module, not the program.
+Investigating it uncovered ISSUE-033.
+
+---
+
+## ISSUE-033: `try` on an overloaded call whose argument is a macro call picks the wrong arm shape
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus `5f2bfae`
+- **Probe:** `probes/issue-033.nuc`. Expected `f 4`. Actual: "match: arm 'ok' binder count does not match its field count".
+- **Port sites:** none left; `src/doom/intermission.nuc`'s `(try (draw-percent (- SCREEN-WIDTH STATS-X) …))`
+- **Workaround:** none needed after the fix. Before it, bind the macro-call argument with `let` first, or give the function a unique name.
+- **Suggestion:** done. `try` chose between `(ok)` and `(ok v)` from `node-type` of its operand. `node-type` returns null for a macro call (`-` is a macro), and an overloaded or mangled callee can be resolved only from its argument types, so the operand came back untyped. `try` then assumed one binder, which is wrong for `!void`. When the operand is untyped, `try` now emits it first and reads the arm shape off the value. The same change gives ISSUE-029 its message.
+
+Context: an arithmetic argument in a fallible draw call is ordinary code. The
+error named a `match` the user never wrote, and named neither `try` nor the
+callee. The private `defn-` pair in ISSUE-032 is what made the callee
+mangled, so the two bugs surfaced together.
+
+---
+
+## ISSUE-034: A char literal is "not a compile-time constant" inside a global aggregate
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed in nucleus `4d7ea58`
+- **Probe:** `probes/issue-034.nuc`. Expected `110 98`. Actual: "defvar: init must be a compile-time constant (a literal, a named constant, or an expression over them)".
+- **Port sites:** none left; `src/doom/menu.nuc`'s item table gives each item's hotkey as `\n`, `\o` and so on
+- **Workaround:** none needed after the fix. Before it, `(char "n")` was folded, and so was an `i32` field holding the code.
+- **Suggestion:** done. The global-initializer renderer had no case for a char-literal node. A scalar `Char` global hid the gap because it falls back to a run-time initializer, but an aggregate element has no such fallback.
+
+Context: `docs/builtins.md` lists "character" among the literals a constant may
+be, and calls `(char "x")` sugar for `\x`. The menu table is the natural
+place for one: each item's hotkey, as in the C's `menuitem_t`.
+
+---
+
+## ISSUE-035: No scalar `min`, `max` or `abs` in the stdlib
+
+- **Severity:** papercut
+- **Kind:** stdlib gap
+- **Status:** worked-around
+- **Probe:** none; nothing is broken.
+- **Port sites:** `src/doom/math.nuc` (`imin`, `imax`, `iabs`), used by `src/doom/menu.nuc` and `src/doom/finale.nuc`
+- **Workaround:** one-line `if` helpers per type.
+- **Suggestion:** generic `min`/`max`/`abs`/`clamp` over the numeric types in a prelude module. `nucleus.combinators` already has an iterator `min`, so a two-argument scalar overload would sit beside it.
+
+Context: `(min a b)` is the first thing a C programmer reaches for when clamping
+a length or an index. The error ("unknown: min") is clear, but the port had
+already hand-written `iabs` in milestone 1 for the same reason.
 
 ---
 

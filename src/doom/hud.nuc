@@ -1,0 +1,351 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The heads-up message line and the automap's level title (hu_stuff.c,
+; hu_lib.c). Chat is netgame-only and isn't ported.
+
+(ns doom.hud)
+
+(import-use nucleus.fmt)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use doom.defs)
+(import-use doom.event)
+(import-use doom.video)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.render.draw)
+
+(defconst FONT-START 33)
+(defconst FONT-END 95)
+(defconst FONT-SIZE 63)
+(defconst- MAX-LINE-LENGTH 80)
+(defconst- MSG-TIMEOUT (* 4 TIC-RATE))
+
+; The small red font, '!' to '_'; the menus use it too.
+(defvar hu-font:(array Patch 63))
+
+(defn hud-init ():!void
+  ; Every code is two digits, so "STCFN0" pads it to the lump's three.
+  (dotimes (i FONT-SIZE)
+    (set! (aref hu-font i) (try (patch-named (string-as-view &(str "STCFN0" (+ i FONT-START)))))))
+  (ok))
+
+;; Text lines. A line that changed erases its old text from the border for
+;; a few frames, since a reduced view doesn't redraw the border every frame.
+
+(defstruct- TextLine x:i32 y:i32 len:i32 chars:(array ui8 81) needs-update:i32)
+
+(defn- clear-line (l:&TextLine x:i32 y:i32):void
+  (set! (l 'x) x)
+  (set! (l 'y) y)
+  (set! (l 'len) 0)
+  (set! (l 'needs-update) 1))
+
+(defn- add-text (l:&TextLine s:StrView):void
+  (dotimes (i (unsafe/cast i32 (s 'len)))
+    (when (< (l 'len) MAX-LINE-LENGTH)
+      (set! (aref (l 'chars) (l 'len)) (aref (s 'data) i))
+      (set! (l 'len) (+ (l 'len) 1))
+      (set! (l 'needs-update) 4))))
+
+(defn- upper (c:i32):i32 (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+; Characters the font lacks are 4-pixel spaces; the line stops at the edge.
+(defn- draw-line (l:&TextLine):!void
+  (let (x (l 'x) i 0)
+    (while (< i (l 'len))
+      (let (c (upper (as i32 (aref (l 'chars) i))))
+        (if (and (!= c 32) (>= c FONT-START) (<= c FONT-END))
+          (let (p (aref hu-font (- c FONT-START)) w (patch-width p))
+            (if (> (+ x w) SCREEN-WIDTH)
+              (set! i (l 'len))
+              (do (try (draw-patch x (l 'y) p))
+                  (set! x (+ x w)))))
+          (do (set! x (+ x 4))
+              (when (>= x SCREEN-WIDTH) (set! i (l 'len))))))
+      (inc! i)))
+  (ok))
+
+(defn- erase-line (l:&TextLine):void
+  (when (and (not automap-active) (!= view-window-x 0) (!= (l 'needs-update) 0))
+    (dotimes (k (+ (patch-height (aref hu-font 0)) 1))
+      (let (y (+ (l 'y) k) ofs (* y SCREEN-WIDTH))
+        (if (or (< y view-window-y) (>= y (+ view-window-y view-height)))
+          (video-erase ofs SCREEN-WIDTH)
+          (do (video-erase ofs view-window-x)
+              (video-erase (+ ofs view-window-x view-width) view-window-x))))))
+  (when (!= (l 'needs-update) 0)
+    (set! (l 'needs-update) (- (l 'needs-update) 1))))
+
+;; Messages.
+
+(defvar show-messages:bool true)
+; Set by the menu, so that turning messages off still says so.
+(defvar message-forced:bool false)
+(defvar- message-on:bool false)
+(defvar- message-was-on:bool true)
+; A forced message stays up until it times out.
+(defvar- message-locked:bool false)
+(defvar- message-counter:i32 0)
+(defvar- message-line:TextLine)
+(defvar- title-line:TextLine)
+
+(defn- level-name ():StrView
+  (let (doom-index (+ (* (- game-episode 1) 9) game-map -1))
+    (case (logical-mission)
+      DOOM (if (= game-version EXE-CHEX) (aref CHEX-NAMES doom-index) (aref DOOM-NAMES doom-index))
+      ; Before Final Doom, maps 33 to 35 didn't spill into the next table.
+      DOOM2 (if (and (<= game-version EXE-DOOM-1-9) (>= game-map 33))
+              ""
+              (aref COMMERCIAL-NAMES (- game-map 1)))
+      PACK-PLUT (aref COMMERCIAL-NAMES (+ game-map 31))
+      PACK-TNT (aref COMMERCIAL-NAMES (+ game-map 63))
+      "Unknown level")))
+
+(defn hud-start ():void
+  (set! message-on false)
+  (set! message-forced false)
+  (set! message-locked false)
+  (set! message-was-on true)
+  (clear-line &message-line 0 0)
+  (clear-line &title-line 0 (- 167 (patch-height (aref hu-font 0))))
+  (add-text &title-line (level-name)))
+
+(defn hud-ticker ():void
+  (when (!= message-counter 0)
+    (dec! message-counter)
+    (when (= message-counter 0)
+      (set! message-on false)
+      (set! message-locked false)))
+  (when (or show-messages message-forced)
+    (let (p (player console-player))
+      (when (and (!= (p 'message) null) (or (not message-locked) message-forced))
+        (clear-line &message-line 0 0)
+        (add-text &message-line (strview-from-cstr (p 'message)))
+        (set! (message-line 'needs-update) 4)
+        (set! (p 'message) null)
+        (set! message-on true)
+        (set! message-counter MSG-TIMEOUT)
+        (set! message-locked message-forced)
+        (set! message-forced false)))))
+
+(defn hud-drawer ():!void
+  (when message-on (try (draw-line &message-line)))
+  (when automap-active (try (draw-line &title-line)))
+  (ok))
+
+(defn hud-erase ():void
+  (when (and message-was-on (not message-on))
+    (set! (message-line 'needs-update) 4))
+  (erase-line &message-line)
+  (set! message-was-on message-on)
+  (erase-line &title-line))
+
+(defn hud-responder (ev:&Event):bool
+  (if (and (= (ev 'type) EV-KEYDOWN) (= (ev 'data1) key-message-refresh)
+           (!= (ev 'data1) KEY-RSHIFT) (!= (ev 'data1) KEY-RALT))
+    (do (set! message-on true)
+        (set! message-counter MSG-TIMEOUT)
+        true)
+    false))
+
+;; Level names (d_englsh.h).
+
+(defconst- DOOM-NAMES
+  (array StrView
+    "E1M1: Hangar"
+    "E1M2: Nuclear Plant"
+    "E1M3: Toxin Refinery"
+    "E1M4: Command Control"
+    "E1M5: Phobos Lab"
+    "E1M6: Central Processing"
+    "E1M7: Computer Station"
+    "E1M8: Phobos Anomaly"
+    "E1M9: Military Base"
+    "E2M1: Deimos Anomaly"
+    "E2M2: Containment Area"
+    "E2M3: Refinery"
+    "E2M4: Deimos Lab"
+    "E2M5: Command Center"
+    "E2M6: Halls of the Damned"
+    "E2M7: Spawning Vats"
+    "E2M8: Tower of Babel"
+    "E2M9: Fortress of Mystery"
+    "E3M1: Hell Keep"
+    "E3M2: Slough of Despair"
+    "E3M3: Pandemonium"
+    "E3M4: House of Pain"
+    "E3M5: Unholy Cathedral"
+    "E3M6: Mt. Erebus"
+    "E3M7: Limbo"
+    "E3M8: Dis"
+    "E3M9: Warrens"
+    "E4M1: Hell Beneath"
+    "E4M2: Perfect Hatred"
+    "E4M3: Sever The Wicked"
+    "E4M4: Unruly Evil"
+    "E4M5: They Will Repent"
+    "E4M6: Against Thee Wickedly"
+    "E4M7: And Hell Followed"
+    "E4M8: Unto The Cruel"
+    "E4M9: Fear"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"))
+
+(defconst- CHEX-NAMES
+  (array StrView
+    "E1M1: Hangar"
+    "E1M2: Nuclear Plant"
+    "E1M3: Toxin Refinery"
+    "E1M4: Command Control"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "E1M5: Phobos Lab"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"
+    "NEWLEVEL"))
+
+(defconst- COMMERCIAL-NAMES
+  (array StrView
+    "level 1: entryway"
+    "level 2: underhalls"
+    "level 3: the gantlet"
+    "level 4: the focus"
+    "level 5: the waste tunnels"
+    "level 6: the crusher"
+    "level 7: dead simple"
+    "level 8: tricks and traps"
+    "level 9: the pit"
+    "level 10: refueling base"
+    "level 11: 'o' of destruction!"
+    "level 12: the factory"
+    "level 13: downtown"
+    "level 14: the inmost dens"
+    "level 15: industrial zone"
+    "level 16: suburbs"
+    "level 17: tenements"
+    "level 18: the courtyard"
+    "level 19: the citadel"
+    "level 20: gotcha!"
+    "level 21: nirvana"
+    "level 22: the catacombs"
+    "level 23: barrels o' fun"
+    "level 24: the chasm"
+    "level 25: bloodfalls"
+    "level 26: the abandoned mines"
+    "level 27: monster condo"
+    "level 28: the spirit world"
+    "level 29: the living end"
+    "level 30: icon of sin"
+    "level 31: wolfenstein"
+    "level 32: grosse"
+    "level 1: congo"
+    "level 2: well of souls"
+    "level 3: aztec"
+    "level 4: caged"
+    "level 5: ghost town"
+    "level 6: baron's lair"
+    "level 7: caughtyard"
+    "level 8: realm"
+    "level 9: abattoire"
+    "level 10: onslaught"
+    "level 11: hunted"
+    "level 12: speed"
+    "level 13: the crypt"
+    "level 14: genesis"
+    "level 15: the twilight"
+    "level 16: the omen"
+    "level 17: compound"
+    "level 18: neurosphere"
+    "level 19: nme"
+    "level 20: the death domain"
+    "level 21: slayer"
+    "level 22: impossible mission"
+    "level 23: tombstone"
+    "level 24: the final frontier"
+    "level 25: the temple of darkness"
+    "level 26: bunker"
+    "level 27: anti-christ"
+    "level 28: the sewers"
+    "level 29: odyssey of noises"
+    "level 30: the gateway of hell"
+    "level 31: cyberden"
+    "level 32: go 2 it"
+    "level 1: system control"
+    "level 2: human bbq"
+    "level 3: power control"
+    "level 4: wormhole"
+    "level 5: hanger"
+    "level 6: open season"
+    "level 7: prison"
+    "level 8: metal"
+    "level 9: stronghold"
+    "level 10: redemption"
+    "level 11: storage facility"
+    "level 12: crater"
+    "level 13: nukage processing"
+    "level 14: steel works"
+    "level 15: dead zone"
+    "level 16: deepest reaches"
+    "level 17: processing area"
+    "level 18: mill"
+    "level 19: shipping/respawning"
+    "level 20: central processing"
+    "level 21: administration center"
+    "level 22: habitat"
+    "level 23: lunar mining project"
+    "level 24: quarry"
+    "level 25: baron's den"
+    "level 26: ballistyx"
+    "level 27: mount pain"
+    "level 28: heck"
+    "level 29: river styx"
+    "level 30: last call"
+    "level 31: pharaoh"
+    "level 32: caribbean"
+    ""
+    ""
+    ""))

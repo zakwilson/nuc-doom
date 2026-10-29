@@ -20,9 +20,8 @@
 (defmacro def-count-row (name :rest rows)
   `(defconst ~name ~(node-int (node-len rows))))
 
-; (def-table-rows name T row…): a constant array of T, one element per row,
-; built from the row's remaining elements.
-(defmacro def-table-rows (name type :rest rows)
+; The `(array T …)` literal for a row set.
+(defn table-literal (type:&Node rows:&Node):&Node
   (let (arr:&Node (node-list-new 0) i:i32 0)
     (node-push arr 'array)
     (node-push arr type)
@@ -33,7 +32,17 @@
                          (node-at rest 0)
                          (node-cons type rest 0))))
       (inc! i))
-    `(defconst ~name ~arr)))
+    arr))
+
+; (def-table-rows name T row…): a constant array of T, one element per row,
+; built from the row's remaining elements.
+(defmacro def-table-rows (name type :rest rows)
+  `(defconst ~name ~(table-literal type rows)))
+
+; (def-mutable-table-rows name T row…): the same table as a global the game
+; may change, as fast monsters change state tics and missile speeds.
+(defmacro def-mutable-table-rows (name type :rest rows)
+  `(defvar (~name (array ~type ~(node-int (node-len rows)))) ~(table-literal type rows)))
 
 ; A variadic bit-or: the builtin takes exactly two operands (ISSUE-009), and
 ; thing flags are written five at a time.

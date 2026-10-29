@@ -1,0 +1,110 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; SDL input to Doom events (i_input.c, and i_video.c's I_GetEvent and mouse
+; grab). Keys map by scancode as if on a US keyboard, as vanilla mapping does.
+
+(ns doom.sys.input)
+
+(import-use "SDL2/SDL.h")
+(import-use doom.event)
+
+; Doom key for each SDL scancode below 104 (doomkeys.h's SCANCODE_TO_KEYS_ARRAY).
+(defconst- SCANCODE-KEYS
+  (array i32
+    0 0 0 0 97  98 99 100 101 102  103 104 105 106 107  108 109 110 111 112
+    113 114 115 116 117  118 119 120 121 122  49 50 51 52 53  54 55 56 57 48
+    KEY-ENTER KEY-ESCAPE KEY-BACKSPACE KEY-TAB 32  KEY-MINUS KEY-EQUALS 91 93 92
+    0 59 39 96 44  46 47 KEY-CAPSLOCK KEY-F1 KEY-F2
+    KEY-F3 KEY-F4 KEY-F5 KEY-F6 KEY-F7  KEY-F8 KEY-F9 KEY-F10 KEY-F11 KEY-F12
+    KEY-PRTSCR KEY-SCRLCK KEY-PAUSE KEY-INS KEY-HOME  KEY-PGUP KEY-DEL KEY-END KEY-PGDN KEY-RIGHTARROW
+    KEY-LEFTARROW KEY-DOWNARROW KEY-UPARROW KEY-NUMLOCK 47  42 45 43 KEY-ENTER KEY-END
+    KEY-DOWNARROW KEY-PGDN KEY-LEFTARROW KEYP-5 KEY-RIGHTARROW  KEY-HOME KEY-UPARROW KEY-PGUP KEY-INS 0
+    92 0 0 KEY-EQUALS))
+
+; The DOS shift table, for typed characters: ASCII 32..126 shifted.
+(defconst- SHIFTED
+  " !\"#$%&\"()*+<_>?)!@#$%^&*(::<+>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[!]\"_'ABCDEFGHIJKLMNOPQRSTUVWXYZ{|}~")
+
+(defn- translate-key (scancode:i32):i32
+  (cond (or (= scancode SDL_SCANCODE_LCTRL) (= scancode SDL_SCANCODE_RCTRL)) KEY-RCTRL
+        (or (= scancode SDL_SCANCODE_LSHIFT) (= scancode SDL_SCANCODE_RSHIFT)) KEY-RSHIFT
+        (or (= scancode SDL_SCANCODE_LALT) (= scancode SDL_SCANCODE_RALT)) KEY-RALT
+        (and (>= scancode 0) (< scancode 104)) (aref SCANCODE-KEYS scancode)
+        true 0))
+
+(defn- typed-char (key:i32):i32
+  (if (and (!= (bit-and (as i32 (SDL_GetModState)) (as i32 KMOD_SHIFT)) 0) (>= key 32) (< key 127))
+    (as i32 (aref (SHIFTED 'data) (- key 32)))
+    key))
+
+(defvar- mouse-buttons:i32 0)
+
+(defn- post-mouse-buttons ():void
+  (post-event (Event EV-MOUSE mouse-buttons 0 0 0)))
+
+; Doom's buttons are left 0, right 1, middle 2, wheel 3 and 4, then the rest.
+(defn- mouse-button (sdl-button:i32 on:bool):void
+  (when (and (>= sdl-button SDL_BUTTON_LEFT) (<= sdl-button 8))
+    (let (b (cond (= sdl-button SDL_BUTTON_LEFT) 0
+                  (= sdl-button SDL_BUTTON_RIGHT) 1
+                  (= sdl-button SDL_BUTTON_MIDDLE) 2
+                  true (+ sdl-button 1)))
+      (set! mouse-buttons (if on (bit-or mouse-buttons (bit-shl 1 b))
+                            (bit-and mouse-buttons (bit-not (bit-shl 1 b)))))
+      (post-mouse-buttons))))
+
+; The wheel is a button pressed and released at once.
+(defn- mouse-wheel (y:i32):void
+  (let (b (if (<= y 0) 4 3))
+    (set! mouse-buttons (bit-or mouse-buttons (bit-shl 1 b)))
+    (post-mouse-buttons)
+    (set! mouse-buttons (bit-and mouse-buttons (bit-not (bit-shl 1 b))))
+    (post-mouse-buttons)))
+
+(defconst- MOUSE-THRESHOLD 10)
+
+; Chocolate Doom's default acceleration is exactly 2.
+(defn- accelerate (v:i32):i32
+  (cond (< v 0) (- 0 (accelerate (- 0 v)))
+        (> v MOUSE-THRESHOLD) (+ (* (- v MOUSE-THRESHOLD) 2) MOUSE-THRESHOLD)
+        true v))
+
+; SDL_Event imports opaque (ISSUE-011), so events land in a buffer of its size
+; and are read through the member structs, which do import.
+(defstruct- EventBuf words:(array ui64 8))
+
+(defvar- grabbed:bool false)
+
+(defn- read-mouse ():void
+  (let (x:i32 0 y:i32 0)
+    (SDL_GetRelativeMouseState &x &y)
+    (when (or (!= x 0) (!= y 0))
+      (post-event (Event EV-MOUSE mouse-buttons (accelerate x) (- 0 (accelerate y)) 0)))))
+
+; Pumps SDL's queue into Doom events; `grab` says whether the mouse belongs to
+; the game now (a level being played, no menu, not paused).
+(defn start-tic (grab:bool):void
+  (when (!= grab grabbed)
+    (set! grabbed grab)
+    (SDL_SetRelativeMouseMode (if grab SDL_TRUE SDL_FALSE))
+    (SDL_GetRelativeMouseState null null))
+  (let (buf:&EventBuf (alloca EventBuf)
+        ev (unsafe/cast ptr:SDL_Event buf)) ; ISSUE-011
+    (while (!= (SDL_PollEvent ev) 0)
+      (let (type ((unsafe/cast ptr:SDL_CommonEvent buf) 'type))
+        (cond (or (= type SDL_KEYDOWN) (= type SDL_KEYUP))
+              (let (key (translate-key (as i32 (((unsafe/cast ptr:SDL_KeyboardEvent buf) 'keysym) 'scancode))))
+                (when (!= key 0)
+                  (if (= type SDL_KEYDOWN)
+                    (post-event (Event EV-KEYDOWN key key (typed-char key) 0))
+                    (post-event (Event EV-KEYUP key 0 0 0)))))
+              (= type SDL_MOUSEBUTTONDOWN)
+              (mouse-button (as i32 ((unsafe/cast ptr:SDL_MouseButtonEvent buf) 'button)) true)
+              (= type SDL_MOUSEBUTTONUP)
+              (mouse-button (as i32 ((unsafe/cast ptr:SDL_MouseButtonEvent buf) 'button)) false)
+              (= type SDL_MOUSEWHEEL)
+              (mouse-wheel ((unsafe/cast ptr:SDL_MouseWheelEvent buf) 'y))
+              (= type SDL_QUIT)
+              (post-event (Event EV-QUIT 0 0 0 0))))))
+  (when grabbed (read-mouse)))

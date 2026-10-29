@@ -13,7 +13,10 @@
 (import-use doom.wad)
 (import-use doom.video)
 (import-use doom.sys.video)
+(import-use doom.sys.input)
 (import-use doom.defs)
+(import-use doom.event)
+(import-use doom.world)
 (import-use doom.state)
 (import-use doom.game)
 (import-use doom.render.main)
@@ -21,14 +24,16 @@
 (import-use doom.sys.timer)
 (import-use doom.tichash)
 (import-use doom.wipe)
+(import-use doom.menu)
+(import-use doom.hud)
+(import-use doom.status)
+(import-use doom.automap)
+(import-use doom.intermission)
+(import-use doom.finale)
 (import-use doom.play.spec)
-
 
 ; One tic per frame, as fast as possible: for -framedump and -timedemo.
 (defvar single-tics:bool false)
-(defvar quit-requested:bool false)
-
-(defvar page-name:StrView "TITLEPIC")
 
 (defn- add-wad-files ():!void
   (let (p (check-parm-with-args "-iwad" 1)
@@ -42,23 +47,133 @@
           (inc! i)))))
   (ok))
 
-; SDL_Event imports opaque (ISSUE-011), so events land in a buffer of its size
-; and are read through the member structs, which do import.
-(defstruct EventBuf words:(array ui64 8))
+;; Tics (d_loop.c's TryRunTics, for one local player).
 
-(defn- pump-events ():void
-  (let (buf:&EventBuf (alloca EventBuf)
-        ev (unsafe/cast ptr:SDL_Event buf)) ; ISSUE-011
-    (while (!= (SDL_PollEvent ev) 0)
-      (when (= ((unsafe/cast ptr:SDL_CommonEvent buf) 'type) SDL_QUIT)
-        (set! quit-requested true)))))
+(defvar- local-cmds:(array TicCmd 8))
+(defvar- make-tic:i32 0)
+(defvar- last-time:i32 0)
 
-; One game tic, as d_net.c's RunTic and TryRunTics do it.
+; The mouse belongs to the game only while a level is being played.
+(defn- grab-mouse? ():bool
+  (and (not menu-active) (not paused) (= game-state GS-LEVEL) (not demo-playback)
+       (not advance-demo-pending)))
+
+(defn- process-events ():void
+  (let (go true)
+    (while go
+      (if-some (ev (pop-event))
+        (when (not (menu-responder ev)) (game-responder ev))
+        (set! go false)))))
+
+; Reads input and builds the next tic command, unless it would run too far
+; ahead of the game.
+(defn- build-new-tic ():void
+  (start-tic (grab-mouse?))
+  (process-events)
+  (menu-ticker)
+  (when (<= (- make-tic game-tic) 2)
+    (build-ticcmd &(aref local-cmds (% make-tic 8)))
+    (inc! make-tic)))
+
 (defn- run-tic ():!void
+  (set! @(net-cmd console-player) (aref local-cmds (% game-tic 8)))
+  (when advance-demo-pending (do-advance-demo))
   (try (game-ticker))
   (tichash-write)
   (inc! game-tic)
   (ok))
+
+(defn- try-run-tics ():!void
+  (if single-tics
+    (build-new-tic)
+    (let (now (get-time))
+      (dotimes (i (- now last-time)) (build-new-tic))
+      (set! last-time now)))
+  ; At least one tic a frame: wait for it if the clock hasn't brought one.
+  (while (<= make-tic game-tic)
+    (SDL_Delay 1)
+    (let (now (get-time))
+      (when (> now last-time)
+        (set! last-time now)
+        (build-new-tic))))
+  (while (and (< game-tic make-tic) (not quit-requested))
+    (try (run-tic)))
+  (ok))
+
+;; The frame (D_Display).
+
+(defvar- old-game-state:i32 -1)
+(defvar- view-active-state:bool false)
+(defvar- menu-active-state:bool false)
+(defvar- border-draw-count:i32 0)
+
+; Draws the frame; true when the game state changed and a wipe begins.
+(defn- display ():!bool
+  (when set-size-needed
+    (execute-set-view-size)
+    (set! old-game-state -1)
+    (set! border-draw-count 3))
+  (let (wipe (!= game-state wipe-game-state))
+    (when wipe (wipe-start-screen))
+    (when (and (= game-state GS-LEVEL) (!= game-tic 0)) (hud-erase))
+    (case game-state
+      GS-LEVEL (when (!= game-tic 0)
+                 (when automap-active (try (automap-drawer)))
+                 (try (status-drawer (= view-height SCREEN-HEIGHT))))
+      GS-INTERMISSION (try (wi-drawer))
+      GS-FINALE (try (finale-drawer))
+      GS-DEMOSCREEN (try (draw-patch 0 0 (try (patch-named page-name))))
+      (do))
+    (when (and (= game-state GS-LEVEL) (not automap-active) (!= game-tic 0))
+      (render-player-view (player display-player)))
+    (when (and (= game-state GS-LEVEL) (!= game-tic 0)) (try (hud-drawer)))
+    (when (and (!= game-state old-game-state) (!= game-state GS-LEVEL))
+      (set-palette (try (lump-named "PLAYPAL"))))
+    (when (and (= game-state GS-LEVEL) (!= old-game-state GS-LEVEL))
+      (set! view-active-state false)
+      (try (fill-back-screen "FLOOR7_2")))
+    (when (and (= game-state GS-LEVEL) (not automap-active) (!= scaled-view-width SCREEN-WIDTH))
+      (when (or menu-active menu-active-state (not view-active-state))
+        (set! border-draw-count 3))
+      (when (> border-draw-count 0)
+        (draw-view-border)
+        (set! border-draw-count (- border-draw-count 1))))
+    (set! menu-active-state menu-active)
+    (set! view-active-state view-active)
+    (set! old-game-state game-state)
+    (set! wipe-game-state game-state)
+    (when paused
+      (try (draw-patch (+ view-window-x (/ (- scaled-view-width 68) 2))
+                       (if automap-active 4 (+ view-window-y 4))
+                       (try (patch-named "M_PAUSE")))))
+    (try (menu-drawer))
+    (ok wipe)))
+
+(defvar- wiping:bool false)
+(defvar- wipe-start-time:i32 0)
+
+(defn- run-frame ():!void
+  (if wiping
+    ; The melt runs on the clock, with the game stopped.
+    (let (now (get-time))
+      (while (<= (- now wipe-start-time) 0)
+        (SDL_Delay 1)
+        (set! now (get-time)))
+      (let (tics (- now wipe-start-time))
+        (set! wipe-start-time now)
+        (set! wiping (not (wipe-screen tics)))
+        (try (menu-drawer))
+        (finish-update)))
+    (do (try (try-run-tics))
+        (if (try (display))
+          (do (wipe-end-screen)
+              (set! wiping true)
+              (set! wipe-start-time (- (get-time) 1)))
+          (do (finish-update)
+              (try (framedump-check game-tic))))))
+  (ok))
+
+;; Startup.
 
 (defn- arg-int (i:i32):i32
   (let (s (arg i) n:i32 0)
@@ -66,59 +181,48 @@
       (set! n (+ (* n 10) (- (as i32 (aref (s 'data) k)) 48))))
     n))
 
-(defvar- old-game-state:i32 -1)
-
-(defn- display ():!void
-  (when set-size-needed
-    (execute-set-view-size)
-    (set! old-game-state -1))
-  (if (= game-state GS-LEVEL)
-    (do (render-player-view (player display-player))
-        (when (!= old-game-state GS-LEVEL)
-          (try (fill-back-screen "FLOOR7_2")))
-        (draw-view-border))
-    (try (draw-patch 0 0 (try (patch-named page-name)))))
-  (set! old-game-state game-state)
-  (finish-update)
-  (try (framedump-check game-tic))
-  ; A new game state melts in; the melt's offsets are drawn before the
-  ; next tic.
-  (when (!= game-state wipe-game-state)
-    (wipe-init-melt))
-  (set! wipe-game-state game-state)
-  (ok))
-
 (defn doom-main ():!void
   (try (add-wad-files))
   (detect-game-version)
+  (init-controls)
   (set-palette (try (lump-named "PLAYPAL")))
-  (try (init-renderer 9 0))
+  (menu-init)
+  (try (init-renderer screen-blocks detail-level))
   (init-specials)
+  (try (status-init))
+  (try (hud-init))
+  (try (automap-init))
   (set! (aref player-in-game 0) true)
-  (let (p (check-parm-with-args "-warp" 2))
-    (when (!= p 0)
-      (try (init-new SK-MEDIUM (arg-int (+ p 1)) (arg-int (+ p 2))))))
-  (let (p (check-parm-with-args "-playdemo" 1))
-    (when (!= p 0) (defer-play-demo (arg (+ p 1)))))
-  (let (p (check-parm-with-args "-timedemo" 1))
-    (when (!= p 0)
-      (time-demo (arg (+ p 1)))
-      (set! single-tics true)))
+  (let (start-skill SK-MEDIUM start-episode 1 start-map 1 autostart false)
+    (let (p (check-parm-with-args "-skill" 1))
+      (when (!= p 0)
+        (set! start-skill (- (arg-int (+ p 1)) 1))
+        (set! autostart true)))
+    (let (p (check-parm-with-args "-episode" 1))
+      (when (!= p 0)
+        (set! start-episode (arg-int (+ p 1)))
+        (set! start-map 1)
+        (set! autostart true)))
+    (let (p (check-parm-with-args "-warp" 2))
+      (when (!= p 0)
+        (set! start-episode (arg-int (+ p 1)))
+        (set! start-map (arg-int (+ p 2)))
+        (set! autostart true)))
+    (let (playdemo (check-parm-with-args "-playdemo" 1)
+          timedemo (check-parm-with-args "-timedemo" 1))
+      (cond (!= playdemo 0) (do (set! single-demo true)
+                                (defer-play-demo (arg (+ playdemo 1))))
+            (!= timedemo 0) (do (time-demo (arg (+ timedemo 1)))
+                                (set! single-tics true))
+            autostart (try (init-new start-skill start-episode start-map))
+            true (start-title))))
   (framedump-init)
   (when (parm-exists? "-framedump") (set! single-tics true))
   (try (init-graphics))
+  (set! last-time (get-time))
   ; D_DoomLoop runs one tic before the first frame.
-  (try (run-tic))
-  (let (last (get-time))
-    (while (not quit-requested)
-      (pump-events)
-      (if single-tics
-        (try (run-tic))
-        (let (now (get-time))
-          (while (< last now)
-            (try (run-tic))
-            (inc! last))))
-      (try (display))
-      (when (not single-tics) (SDL_Delay 1))))
+  (try (try-run-tics))
+  (while (not quit-requested)
+    (try (run-frame)))
   (shutdown-graphics)
   (ok))

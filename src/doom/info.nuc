@@ -1236,7 +1236,7 @@
 
 (over-states def-enum-rows StateNum)
 (over-states def-count-row NUM-STATES)
-(over-states def-table-rows states State)
+(over-states def-mutable-table-rows states State)
 
 (defstruct MobjInfo
   doomed-num:i32 spawn-state:i32 spawn-health:i32 see-state:i32 see-sound:i32
@@ -1387,4 +1387,4 @@
 
 (over-mobjs def-enum-rows MobjType)
 (over-mobjs def-count-row NUM-MOBJ-TYPES)
-(over-mobjs def-table-rows mobj-info MobjInfo)
+(over-mobjs def-mutable-table-rows mobj-info MobjInfo)

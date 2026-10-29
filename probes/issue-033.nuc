@@ -1,0 +1,13 @@
+; ISSUE-033: `try` sizes its ok arm from node-type, which leaves a macro call
+; such as `(- 5 1)` untyped. On an overloaded function, whose call node-type
+; can type only from its arguments, `(try (f (- 5 1)))` on a `!void` fails with
+; "match: arm 'ok' binder count does not match its field count".
+; fixed-when: output-contains f 4
+(import-use "stdio.h")
+(defn f (x:i32):!void (printf "f %d\n" x) (ok))
+(defn f (x:f64):!void (ok))
+(defn g ():!void
+  (try (f (- 5 1)))
+  (ok))
+(defn main ():i32
+  (match (g) ((ok) 0) ((err e) 1)))

@@ -1,0 +1,793 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The menus (m_menu.c). The C gives each item and menu a function pointer;
+; here an item names what it does with an `Action`, a menu is an index into
+; one table, and the per-version tweaks M_Init made to those pointers are
+; made to the table's data or decided where the action runs.
+
+(ns doom.menu)
+
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.event)
+(import-use doom.wad)
+(import-use doom.video)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.sound)
+(import-use doom.sounds)
+(import-use doom.hud)
+(import-use doom.game)
+(import-use doom.sys.timer)
+(import-use doom.render.main)
+
+;; Settings the menu changes (the C's config-file defaults).
+
+(defvar screen-blocks:i32 9)
+; 0 is high detail, 1 low.
+(defvar detail-level:i32 0)
+; 0..15, as the volume sliders show them.
+(defvar sfx-level:i32 8)
+(defvar music-level:i32 8)
+; The screen-size slider, screen-blocks - 3.
+(defvar- screen-size:i32 6)
+
+;; The menu table.
+
+(defconst- LINE-HEIGHT 16)
+(defconst- SKULL-X-OFFSET -32)
+(defconst- SAVE-STRING-SIZE 24)
+(defconst- SAVE-SLOTS 6)
+
+; An item's status: no cursor stops on a blank, a disabled item can't be
+; chosen, and left/right move a slider.
+(defconst- ITEM-BLANK -1)
+(defconst- ITEM-DISABLED 0)
+(defconst- ITEM-SELECT 1)
+(defconst- ITEM-SLIDER 2)
+
+(defenum Action
+  DO-NOTHING DO-NEW-GAME DO-OPTIONS DO-LOAD-GAME DO-SAVE-GAME DO-READ-THIS DO-QUIT
+  DO-EPISODE DO-SKILL DO-END-GAME DO-MESSAGES DO-DETAIL DO-SCREEN-SIZE DO-SENSITIVITY
+  DO-SOUND DO-SFX-VOLUME DO-MUSIC-VOLUME DO-READ-THIS2 DO-FINISH-READ DO-LOAD-SLOT DO-SAVE-SLOT)
+
+(defstruct- MenuItem status:i32 name:StrView action:i32 key:Char)
+
+(defenum MenuId
+  MAIN-MENU EPISODE-MENU NEW-GAME-MENU OPTIONS-MENU READ1-MENU READ2-MENU SOUND-MENU
+  LOAD-MENU SAVE-MENU)
+(defconst- NO-MENU -1)
+
+; A menu's items are `count` rows of `items` from `first`.
+(defstruct- Menu count:i32 prev:i32 first:i32 x:i32 y:i32 last-on:i32)
+
+; Item indices the menu code refers to by name.
+(defconst- READ-THIS-ITEM 4)
+(defconst- QUIT-ITEM 5)
+(defconst- SKILL-NIGHTMARE-ITEM 4)
+(defconst- SFX-VOL-ITEM 0)
+(defconst- MUSIC-VOL-ITEM 2)
+(defconst- MESSAGES-ITEM 1)
+(defconst- DETAIL-ITEM 2)
+(defconst- SCREEN-SIZE-ITEM 3)
+(defconst- MOUSE-SENS-ITEM 5)
+
+(defvar- items:(array MenuItem 41)
+  (array MenuItem
+    ; Main, from 0.
+    (MenuItem ITEM-SELECT "M_NGAME" DO-NEW-GAME \n)
+    (MenuItem ITEM-SELECT "M_OPTION" DO-OPTIONS \o)
+    (MenuItem ITEM-SELECT "M_LOADG" DO-LOAD-GAME \l)
+    (MenuItem ITEM-SELECT "M_SAVEG" DO-SAVE-GAME \s)
+    (MenuItem ITEM-SELECT "M_RDTHIS" DO-READ-THIS \r)
+    (MenuItem ITEM-SELECT "M_QUITG" DO-QUIT \q)
+    ; Episodes, from 6.
+    (MenuItem ITEM-SELECT "M_EPI1" DO-EPISODE \k)
+    (MenuItem ITEM-SELECT "M_EPI2" DO-EPISODE \t)
+    (MenuItem ITEM-SELECT "M_EPI3" DO-EPISODE \i)
+    (MenuItem ITEM-SELECT "M_EPI4" DO-EPISODE \t)
+    ; Skills, from 10.
+    (MenuItem ITEM-SELECT "M_JKILL" DO-SKILL \i)
+    (MenuItem ITEM-SELECT "M_ROUGH" DO-SKILL \h)
+    (MenuItem ITEM-SELECT "M_HURT" DO-SKILL \h)
+    (MenuItem ITEM-SELECT "M_ULTRA" DO-SKILL \u)
+    (MenuItem ITEM-SELECT "M_NMARE" DO-SKILL \n)
+    ; Options, from 15.
+    (MenuItem ITEM-SELECT "M_ENDGAM" DO-END-GAME \e)
+    (MenuItem ITEM-SELECT "M_MESSG" DO-MESSAGES \m)
+    (MenuItem ITEM-SELECT "M_DETAIL" DO-DETAIL \g)
+    (MenuItem ITEM-SLIDER "M_SCRNSZ" DO-SCREEN-SIZE \s)
+    (MenuItem ITEM-BLANK "" DO-NOTHING 0)
+    (MenuItem ITEM-SLIDER "M_MSENS" DO-SENSITIVITY \m)
+    (MenuItem ITEM-BLANK "" DO-NOTHING 0)
+    (MenuItem ITEM-SELECT "M_SVOL" DO-SOUND \s)
+    ; Read This 1 and 2, at 23 and 24.
+    (MenuItem ITEM-SELECT "" DO-READ-THIS2 0)
+    (MenuItem ITEM-SELECT "" DO-FINISH-READ 0)
+    ; Sound, from 25.
+    (MenuItem ITEM-SLIDER "M_SFXVOL" DO-SFX-VOLUME \s)
+    (MenuItem ITEM-BLANK "" DO-NOTHING 0)
+    (MenuItem ITEM-SLIDER "M_MUSVOL" DO-MUSIC-VOLUME \m)
+    (MenuItem ITEM-BLANK "" DO-NOTHING 0)
+    ; Load, from 29.
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \1)
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \2)
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \3)
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \4)
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \5)
+    (MenuItem ITEM-SELECT "" DO-LOAD-SLOT \6)
+    ; Save, from 35.
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \1)
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \2)
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \3)
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \4)
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \5)
+    (MenuItem ITEM-SELECT "" DO-SAVE-SLOT \6)))
+
+(defvar- menus:(array Menu 9)
+  (array Menu
+    (Menu 6 NO-MENU 0 97 64 0)
+    (Menu 4 MAIN-MENU 6 48 63 0)
+    (Menu 5 EPISODE-MENU 10 48 63 2)
+    (Menu 8 MAIN-MENU 15 60 37 0)
+    (Menu 1 MAIN-MENU 23 280 185 0)
+    (Menu 1 READ1-MENU 24 330 175 0)
+    (Menu 4 OPTIONS-MENU 25 80 64 0)
+    (Menu 6 MAIN-MENU 29 80 54 0)
+    (Menu 6 MAIN-MENU 35 80 54 0)))
+
+(defvar- current-menu:i32 MAIN-MENU)
+(defvar- item-on:i32 0)
+(defvar- skull-anim-counter:i32 10)
+(defvar- which-skull:i32 0)
+
+(defn- menu (id:i32):&Menu &(aref menus id))
+(defn- current ():&Menu (menu current-menu))
+(defn- item-of (id:i32 i:i32):&MenuItem &(aref items (+ ((menu id) 'first) i)))
+(defn- item (i:i32):&MenuItem (item-of current-menu i))
+
+(defn- setup-next-menu (id:i32):void
+  (set! current-menu id)
+  (set! item-on ((current) 'last-on)))
+
+(defn- clear-menus ():void (set! menu-active false))
+
+(defn start-control-panel ():void
+  ; The intro might call this repeatedly.
+  (when (not menu-active)
+    (set! menu-active true)
+    (setup-next-menu MAIN-MENU)))
+
+;; Text in the HUD font.
+
+(defn- upper (c:i32):i32 (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+; The font index of a character, or -1 for one the font lacks.
+(defn- font-index (c:i32):i32
+  (let (i (- (upper c) FONT-START))
+    (if (or (< i 0) (>= i FONT-SIZE)) -1 i)))
+
+(defn- string-width (s:StrView):i32
+  (let (w 0)
+    (dotimes (i (unsafe/cast i32 (s 'len)))
+      (let (f (font-index (as i32 (aref (s 'data) i))))
+        (set! w (+ w (if (< f 0) 4 (patch-width (aref hu-font f)))))))
+    w))
+
+(defn- string-height (s:StrView):i32
+  (let (line (patch-height (aref hu-font 0)) h line)
+    (dotimes (i (unsafe/cast i32 (s 'len)))
+      (when (= (aref (s 'data) i) 10) (set! h (+ h line))))
+    h))
+
+; A newline returns to `x` 12 pixels down; the text stops at the screen edge.
+(defn- write-text (x:i32 y:i32 s:StrView):!void
+  (let (cx x cy y i 0 n (unsafe/cast i32 (s 'len)))
+    (while (< i n)
+      (let (c (as i32 (aref (s 'data) i)) f (font-index c))
+        (cond (= c 10) (do (set! cx x) (set! cy (+ cy 12)))
+              (< f 0) (set! cx (+ cx 4))
+              true (let (w (patch-width (aref hu-font f)))
+                     (if (> (+ cx w) SCREEN-WIDTH)
+                       (set! i n)
+                       (do (try (draw-patch cx cy (aref hu-font f)))
+                           (set! cx (+ cx w)))))))
+      (inc! i)))
+  (ok))
+
+(defn- draw-named (x:i32 y:i32 name:StrView):!void
+  (try (draw-patch x y (try (patch-named name))))
+  (ok))
+
+(defn- draw-thermo (x:i32 y:i32 width:i32 dot:i32):!void
+  (try (draw-named x y "M_THERML"))
+  (dotimes (i width) (try (draw-named (+ x 8 (* i 8)) y "M_THERMM")))
+  (try (draw-named (+ x 8 (* width 8)) y "M_THERMR"))
+  (try (draw-named (+ x 8 (* dot 8)) y "M_THERMO"))
+  (ok))
+
+;; Messages: a centred text that waits for a key, and maybe a yes or no.
+
+(defenum Response NO-RESPONSE QUICKSAVE-RESPONSE QUICKLOAD-RESPONSE NIGHTMARE-RESPONSE
+  END-GAME-RESPONSE QUIT-RESPONSE)
+
+(defconst- PRESSKEY "press a key.")
+(defconst- PRESSYN "press y or n.")
+
+(defvar- message-to-print:bool false)
+(defvar- message-buf:(array ui8 256))
+(defvar- message-len:i32 0)
+(defvar- message-response:i32 NO-RESPONSE)
+(defvar- message-needs-input:bool false)
+(defvar- message-last-menu-active:bool false)
+
+(defn- message-append (s:StrView):void
+  (dotimes (i (unsafe/cast i32 (s 'len)))
+    (when (< message-len 256)
+      (set! (aref message-buf message-len) (aref (s 'data) i))
+      (inc! message-len))))
+
+(defn- message-text ():StrView (StrView (unsafe/cast &ui8 &message-buf) (as usize message-len)))
+
+; The text, a blank line, and what to press.
+(defn- start-message (text:StrView prompt:StrView response:i32 input:bool):void
+  (set! message-len 0)
+  (message-append text)
+  (message-append "\n\n")
+  (message-append prompt)
+  (set! message-last-menu-active menu-active)
+  (set! message-to-print true)
+  (set! message-response response)
+  (set! message-needs-input input)
+  (set! menu-active true))
+
+(defn- press-key-message (text:StrView):void (start-message text PRESSKEY NO-RESPONSE false))
+
+(defn- yes-no-message (text:StrView response:i32):void (start-message text PRESSYN response true))
+
+; A yes-or-no question about a savegame slot by its description.
+(defn- slot-question (before:StrView slot:i32 response:i32):void
+  (let (q (str before "\n\n'" (save-string slot) "'?"))
+    (yes-no-message (string-as-view &q) response)
+    (drop &q)))
+
+;; Savegame slots. Each description is NUL-terminated in its 24 bytes, as
+;; the savegame file stores it.
+
+(defvar- save-strings:(array ui8 144))
+(defvar- save-old-string:(array ui8 24))
+(defvar- save-string-enter:bool false)
+(defvar- save-slot:i32 0)
+(defvar- save-char-index:i32 0)
+(defvar- quick-save-slot:i32 -1)
+
+(defn- save-string-ptr (slot:i32):ptr:ui8
+  (unsafe/ptr+ (unsafe/cast ptr:ui8 &save-strings) (* slot SAVE-STRING-SIZE)))
+
+(defn- save-string (slot:i32):StrView
+  (strview-from-cstr (unsafe/cast CStr (save-string-ptr slot))))
+
+(defn- set-save-string (slot:i32 s:StrView):void
+  (let (dst (save-string-ptr slot) n (imin (unsafe/cast i32 (s 'len)) (- SAVE-STRING-SIZE 1)))
+    (dotimes (i n) (set! (aref dst i) (aref (s 'data) i)))
+    (set! (aref dst n) 0)))
+
+; Savegames arrive with milestone 7: until then every slot is empty.
+(defn- read-save-strings ():void
+  (dotimes (i SAVE-SLOTS)
+    (set-save-string i "empty slot")
+    (set! ((item-of LOAD-MENU i) 'status) ITEM-DISABLED)))
+
+(defn- do-save (slot:i32):void
+  (save-game slot (save-string slot))
+  (clear-menus)
+  ; A quicksave with no slot yet takes the one just picked.
+  (when (= quick-save-slot -2) (set! quick-save-slot slot)))
+
+(defn- load-select (slot:i32):void
+  (load-game slot)
+  (clear-menus))
+
+(defn- save-select (slot:i32):void
+  (set! save-string-enter true)
+  (set! save-slot slot)
+  (let (old (save-old-string-ptr))
+    (dotimes (i SAVE-STRING-SIZE) (set! (aref old i) (aref (save-string-ptr slot) i))))
+  (when (= (save-string slot) "empty slot") (set-save-string slot ""))
+  (set! save-char-index (unsafe/cast i32 ((save-string slot) 'len))))
+
+(defn- save-old-string-ptr ():ptr:ui8 (unsafe/cast ptr:ui8 &save-old-string))
+
+(defn- restore-save-string ():void
+  (let (old (save-old-string-ptr))
+    (dotimes (i SAVE-STRING-SIZE) (set! (aref (save-string-ptr save-slot) i) (aref old i)))))
+
+(defn- open-load-menu ():void
+  (if netgame
+    (press-key-message "you can't do load while in a net game!")
+    (do (setup-next-menu LOAD-MENU)
+        (read-save-strings))))
+
+(defn- open-save-menu ():void
+  (cond (not user-game) (press-key-message "you can't save if you aren't playing!")
+        (= game-state GS-LEVEL) (do (setup-next-menu SAVE-MENU)
+                                    (read-save-strings))))
+
+(defn- quick-save ():void
+  (cond (not user-game) (start-sound null SFX-OOF)
+        (!= game-state GS-LEVEL) (do)
+        (< quick-save-slot 0) (do (start-control-panel)
+                                  (read-save-strings)
+                                  (setup-next-menu SAVE-MENU)
+                                  ; Picking a slot now makes it the quicksave slot.
+                                  (set! quick-save-slot -2))
+        true (slot-question "quicksave over your game named" quick-save-slot QUICKSAVE-RESPONSE)))
+
+(defn- quick-load ():void
+  (cond netgame (press-key-message "you can't quickload during a netgame!")
+        (< quick-save-slot 0) (press-key-message "you haven't picked a quicksave slot yet!")
+        true (slot-question "do you want to quickload the game named" quick-save-slot QUICKLOAD-RESPONSE)))
+
+;; What the items do.
+
+(defvar- episode:i32 0)
+
+(defconst- DOOM1-END-MESSAGES
+  (array StrView
+    "are you sure you want to\nquit this great game?"
+    "please don't leave, there's more\ndemons to toast!"
+    "let's beat it -- this is turning\ninto a bloodbath!"
+    "i wouldn't leave if i were you.\ndos is much worse."
+    "you're trying to say you like dos\nbetter than me, right?"
+    "don't leave yet -- there's a\ndemon around that corner!"
+    "ya know, next time you come in here\ni'm gonna toast ya."
+    "go ahead and leave. see if i care."))
+
+(defconst- DOOM2-END-MESSAGES
+  (array StrView
+    "are you sure you want to\nquit this great game?"
+    "you want to quit?\nthen, thou hast lost an eighth!"
+    "don't go now, there's a \ndimensional shambler waiting\nat the dos prompt!"
+    "get outta here and go back\nto your boring programs."
+    "if i were your boss, i'd \n deathmatch ya in a minute!"
+    "look, bud. you leave now\nand you forfeit your body count!"
+    "just leave. when you come\nback, i'll be waiting with a bat."
+    "you're lucky i don't smack\nyou for thinking about leaving."))
+
+(defconst- QUIT-SOUNDS
+  (array i32 SFX-PLDETH SFX-DMPAIN SFX-POPAIN SFX-SLOP SFX-TELEPT SFX-POSIT1 SFX-POSIT3 SFX-SGTATK))
+(defconst- QUIT-SOUNDS2
+  (array i32 SFX-VILACT SFX-GETPOW SFX-BOSCUB SFX-SLOP SFX-SKESWG SFX-KNTDTH SFX-BSPACT SFX-SGTATK))
+
+(defn- quit-doom ():void
+  (let (msg (if (= (logical-mission) DOOM)
+              (aref DOOM1-END-MESSAGES (% game-tic 8))
+              (aref DOOM2-END-MESSAGES (% game-tic 8))))
+    (start-message msg "(press y to quit to dos.)" QUIT-RESPONSE true)))
+
+(defn- quit-response ():void
+  (when (not netgame)
+    (start-sound null (if (= game-mode COMMERCIAL)
+                        (aref QUIT-SOUNDS2 (bit-and (bit-shr game-tic 2) 7))
+                        (aref QUIT-SOUNDS (bit-and (bit-shr game-tic 2) 7)))))
+  (set! quit-requested true))
+
+(defn- new-game ():void
+  (cond (and netgame (not demo-playback))
+        (press-key-message "you can't start a new game\nwhile in a network game.")
+        ; Chex Quest disabled the episode select screen, as did Doom II.
+        (or (= game-mode COMMERCIAL) (= game-version EXE-CHEX)) (setup-next-menu NEW-GAME-MENU)
+        true (setup-next-menu EPISODE-MENU)))
+
+(defn- choose-episode (choice:i32):void
+  (if (and (= game-mode SHAREWARE) (!= choice 0))
+    (do (press-key-message "this is the shareware version of doom.\n\nyou need to order the entire trilogy.")
+        (setup-next-menu READ1-MENU))
+    (do (set! episode choice)
+        (setup-next-menu NEW-GAME-MENU))))
+
+(defn- choose-skill (choice:i32):void
+  (if (= choice SK-NIGHTMARE)
+    (yes-no-message "are you sure? this skill level\nisn't even remotely fair." NIGHTMARE-RESPONSE)
+    (do (defer-init-new choice (+ episode 1) 1)
+        (clear-menus))))
+
+(defn- end-game ():void
+  (cond (not user-game) (start-sound null SFX-OOF)
+        netgame (press-key-message "you can't end a netgame!")
+        true (yes-no-message "are you sure you want to end the game?" END-GAME-RESPONSE)))
+
+(defn- console-message (msg:CStr):void (set! ((player console-player) 'message) msg))
+
+(defn- change-messages ():void
+  (set! show-messages (not show-messages))
+  (console-message (if show-messages "Messages ON" "Messages OFF"))
+  (set! message-forced true))
+
+(defn- change-detail ():void
+  (set! detail-level (- 1 detail-level))
+  (set-view-size screen-blocks detail-level)
+  (console-message (if (= detail-level 0) "High detail" "Low detail")))
+
+; 0 is the left arrow, 1 the right.
+(defn- step (v:i32 choice:i32 top:i32):i32
+  (cond (and (= choice 0) (> v 0)) (- v 1)
+        (and (= choice 1) (< v top)) (+ v 1)
+        true v))
+
+(defn- size-display (choice:i32):void
+  (let (s (step screen-size choice 8))
+    (set! screen-blocks (+ screen-blocks (- s screen-size)))
+    (set! screen-size s))
+  (set-view-size screen-blocks detail-level))
+
+(defn- run-action (action:i32 choice:i32):void
+  (case action
+    DO-NEW-GAME (new-game)
+    DO-OPTIONS (setup-next-menu OPTIONS-MENU)
+    DO-LOAD-GAME (open-load-menu)
+    DO-SAVE-GAME (open-save-menu)
+    ; From Ultimate Doom on, Read This shows only the second page.
+    DO-READ-THIS (setup-next-menu (if (>= game-version EXE-ULTIMATE) READ2-MENU READ1-MENU))
+    DO-QUIT (quit-doom)
+    DO-EPISODE (choose-episode choice)
+    DO-SKILL (choose-skill choice)
+    DO-END-GAME (end-game)
+    DO-MESSAGES (change-messages)
+    DO-DETAIL (change-detail)
+    DO-SCREEN-SIZE (size-display choice)
+    DO-SENSITIVITY (set! mouse-sensitivity (step mouse-sensitivity choice 9))
+    DO-SOUND (setup-next-menu SOUND-MENU)
+    DO-SFX-VOLUME (do (set! sfx-level (step sfx-level choice 15))
+                      (set! sfx-volume (* sfx-level 8)))
+    DO-MUSIC-VOLUME (do (set! music-level (step music-level choice 15))
+                        (set! music-volume (* music-level 8)))
+    DO-READ-THIS2 (setup-next-menu (if (= game-mode COMMERCIAL) MAIN-MENU READ2-MENU))
+    DO-FINISH-READ (setup-next-menu MAIN-MENU)
+    DO-LOAD-SLOT (load-select choice)
+    DO-SAVE-SLOT (save-select choice)
+    (do)))
+
+(defn- respond (response:i32 key:i32):void
+  (when (= key key-menu-confirm)
+    (case response
+      QUICKSAVE-RESPONSE (do (do-save quick-save-slot)
+                             (start-sound null SFX-SWTCHX))
+      QUICKLOAD-RESPONSE (do (load-select quick-save-slot)
+                             (start-sound null SFX-SWTCHX))
+      NIGHTMARE-RESPONSE (do (defer-init-new SK-NIGHTMARE (+ episode 1) 1)
+                             (clear-menus))
+      END-GAME-RESPONSE (do (set! ((current) 'last-on) item-on)
+                            (clear-menus)
+                            (start-title))
+      QUIT-RESPONSE (quit-response)
+      (do))))
+
+;; Input.
+
+(defconst- GAMMA-MESSAGES
+  (array CStr "Gamma correction OFF" "Gamma correction level 1" "Gamma correction level 2"
+              "Gamma correction level 3" "Gamma correction level 4"))
+
+; Keys that are a "null" key in vanilla, which jumps oddly through the menus.
+(defn- null-key? (key:i32):bool
+  (or (= key KEY-PAUSE) (= key KEY-CAPSLOCK) (= key KEY-SCRLCK) (= key KEY-NUMLOCK)))
+
+(defvar- mouse-wait:i32 0)
+(defvar- mouse-x:i32 0)
+(defvar- mouse-y:i32 0)
+(defvar- last-x:i32 0)
+(defvar- last-y:i32 0)
+
+; The menu key a mouse event stands for, or -1.
+(defn- mouse-key (ev:&Event):i32
+  (let (key -1)
+    (set! mouse-y (+ mouse-y (ev 'data3)))
+    (cond (< mouse-y (- last-y 30)) (do (set! key key-menu-down)
+                                        (set! mouse-wait (+ (get-time) 5))
+                                        (set! last-y (- last-y 30))
+                                        (set! mouse-y last-y))
+          (> mouse-y (+ last-y 30)) (do (set! key key-menu-up)
+                                        (set! mouse-wait (+ (get-time) 5))
+                                        (set! last-y (+ last-y 30))
+                                        (set! mouse-y last-y)))
+    (set! mouse-x (+ mouse-x (ev 'data2)))
+    (cond (< mouse-x (- last-x 30)) (do (set! key key-menu-left)
+                                        (set! mouse-wait (+ (get-time) 5))
+                                        (set! last-x (- last-x 30))
+                                        (set! mouse-x last-x))
+          (> mouse-x (+ last-x 30)) (do (set! key key-menu-right)
+                                        (set! mouse-wait (+ (get-time) 5))
+                                        (set! last-x (+ last-x 30))
+                                        (set! mouse-x last-x)))
+    (when (!= (bit-and (ev 'data1) 1) 0)
+      (set! key key-menu-forward)
+      (set! mouse-wait (+ (get-time) 15)))
+    (when (!= (bit-and (ev 'data1) 2) 0)
+      (set! key key-menu-back)
+      (set! mouse-wait (+ (get-time) 15)))
+    key))
+
+; Typing a savegame description. Vanilla ignores shift here, so the key
+; itself is the character.
+(defn- save-string-key (ev:&Event key:i32):void
+  (cond (= key KEY-BACKSPACE)
+        (when (> save-char-index 0)
+          (dec! save-char-index)
+          (set! (aref (save-string-ptr save-slot) save-char-index) 0))
+        (= key KEY-ESCAPE)
+        (do (set! save-string-enter false)
+            (restore-save-string))
+        (= key KEY-ENTER)
+        (do (set! save-string-enter false)
+            (when (!= (aref (save-string-ptr save-slot) 0) 0) (do-save save-slot)))
+        (= (ev 'type) EV-KEYDOWN)
+        (let (ch (upper (ev 'data1)))
+          (when (and (or (= ch 32) (>= (font-index ch) 0))
+                     (>= ch 32) (<= ch 127)
+                     (< save-char-index (- SAVE-STRING-SIZE 1))
+                     (< (string-width (save-string save-slot)) (* (- SAVE-STRING-SIZE 2) 8)))
+            (set! (aref (save-string-ptr save-slot) save-char-index) (unsafe/cast ui8 ch))
+            (inc! save-char-index)
+            (set! (aref (save-string-ptr save-slot) save-char-index) 0)))))
+
+; The function keys, which work with the menu closed.
+(defn- function-key (key:i32):bool
+  (cond (= key key-menu-decscreen)
+        (if automap-active false
+          (do (size-display 0) (start-sound null SFX-STNMOV) true))
+        (= key key-menu-incscreen)
+        (if automap-active false
+          (do (size-display 1) (start-sound null SFX-STNMOV) true))
+        (= key key-menu-help)
+        (do (start-control-panel)
+            (set! current-menu (if (>= game-version EXE-ULTIMATE) READ2-MENU READ1-MENU))
+            (set! item-on 0)
+            (start-sound null SFX-SWTCHN)
+            true)
+        (= key key-menu-save)
+        (do (start-control-panel) (start-sound null SFX-SWTCHN) (open-save-menu) true)
+        (= key key-menu-load)
+        (do (start-control-panel) (start-sound null SFX-SWTCHN) (open-load-menu) true)
+        (= key key-menu-volume)
+        (do (start-control-panel)
+            (set! current-menu SOUND-MENU)
+            (set! item-on SFX-VOL-ITEM)
+            (start-sound null SFX-SWTCHN)
+            true)
+        (= key key-menu-detail)
+        (do (change-detail) (start-sound null SFX-SWTCHN) true)
+        (= key key-menu-qsave)
+        (do (start-sound null SFX-SWTCHN) (quick-save) true)
+        (= key key-menu-endgame)
+        (do (start-sound null SFX-SWTCHN) (end-game) true)
+        (= key key-menu-messages)
+        (do (change-messages) (start-sound null SFX-SWTCHN) true)
+        (= key key-menu-qload)
+        (do (start-sound null SFX-SWTCHN) (quick-load) true)
+        (= key key-menu-quit)
+        (do (start-sound null SFX-SWTCHN) (quit-doom) true)
+        (= key key-menu-gamma)
+        (do (set! use-gamma (if (>= use-gamma 4) 0 (+ use-gamma 1)))
+            (console-message (aref GAMMA-MESSAGES use-gamma))
+            (refresh-palette)
+            true)
+        true false))
+
+; As the C, palette 0 at once; the status bar reapplies a tint when it next
+; changes.
+(defn- refresh-palette ():void
+  (match (lump-named "PLAYPAL")
+    ((ok pal) (set-palette pal))
+    ((err e) (do))))
+
+; Moves the cursor by `delta` rows, past blank rows.
+(defn- move-cursor (delta:i32):void
+  (let (n ((current) 'count) go true)
+    (while go
+      (set! item-on (% (+ item-on delta n) n))
+      (start-sound null SFX-PSTOP)
+      (set! go (= ((item item-on) 'status) ITEM-BLANK)))))
+
+; The next item from the cursor, wrapping, whose hotkey is `ch`, or -1.
+(defn- hotkey-item (ch:i32):i32
+  (let (n ((current) 'count) found -1 k 1)
+    (while (and (< found 0) (<= k n))
+      (let (i (% (+ item-on k) n))
+        (when (= (as i32 ((item i) 'key)) ch) (set! found i)))
+      (inc! k))
+    found))
+
+(defn- menu-key (key:i32 ch:i32):bool
+  (let (it (item item-on))
+    (cond (= key key-menu-down) (do (move-cursor 1) true)
+          (= key key-menu-up) (do (move-cursor -1) true)
+          (or (= key key-menu-left) (= key key-menu-right))
+          (do (when (and (!= (it 'action) DO-NOTHING) (= (it 'status) ITEM-SLIDER))
+                (start-sound null SFX-STNMOV)
+                (run-action (it 'action) (if (= key key-menu-left) 0 1)))
+              true)
+          (= key key-menu-forward)
+          (do (when (and (!= (it 'action) DO-NOTHING) (> (it 'status) ITEM-DISABLED))
+                (set! ((current) 'last-on) item-on)
+                (if (= (it 'status) ITEM-SLIDER)
+                  (do (run-action (it 'action) 1)
+                      (start-sound null SFX-STNMOV))
+                  (do (run-action (it 'action) item-on)
+                      (start-sound null SFX-PISTOL))))
+              true)
+          (= key key-menu-activate)
+          (do (set! ((current) 'last-on) item-on)
+              (clear-menus)
+              (start-sound null SFX-SWTCHX)
+              true)
+          (= key key-menu-back)
+          (do (set! ((current) 'last-on) item-on)
+              (when (!= ((current) 'prev) NO-MENU)
+                (setup-next-menu ((current) 'prev))
+                (start-sound null SFX-SWTCHN))
+              true)
+          (or (!= ch 0) (null-key? key))
+          (let (i (hotkey-item ch))
+            (if (< i 0)
+              false
+              (do (set! item-on i)
+                  (start-sound null SFX-PSTOP)
+                  true)))
+          true false)))
+
+(defn menu-responder (ev:&Event):bool
+  (cond
+    ; The window's close button: the first click asks, the second confirms.
+    (= (ev 'type) EV-QUIT)
+    (do (if (and menu-active message-to-print (= message-response QUIT-RESPONSE))
+          (quit-response)
+          (do (start-sound null SFX-SWTCHN)
+              (quit-doom)))
+        true)
+    true
+    (let (key -1 ch 0)
+      (cond (and (= (ev 'type) EV-MOUSE) (< mouse-wait (get-time)) menu-active)
+            (set! key (mouse-key ev))
+            (= (ev 'type) EV-KEYDOWN)
+            (do (set! key (ev 'data1))
+                (set! ch (ev 'data2))))
+      (cond (= key -1) false
+            save-string-enter (do (save-string-key ev key) true)
+            message-to-print
+            (if (and message-needs-input (!= key 32) (!= key KEY-ESCAPE)
+                     (!= key key-menu-confirm) (!= key key-menu-abort))
+              false
+              (do (set! menu-active message-last-menu-active)
+                  (set! message-to-print false)
+                  (respond message-response key)
+                  (set! menu-active false)
+                  (start-sound null SFX-SWTCHX)
+                  true))
+            (and (not menu-active) (function-key key)) true
+            (not menu-active)
+            (if (= key key-menu-activate)
+              (do (start-control-panel)
+                  (start-sound null SFX-SWTCHN)
+                  true)
+              false)
+            true (menu-key key ch)))))
+
+(defn menu-ticker ():void
+  (dec! skull-anim-counter)
+  (when (<= skull-anim-counter 0)
+    (set! which-skull (bit-xor which-skull 1))
+    (set! skull-anim-counter 8)))
+
+;; Drawing.
+
+(defn- draw-save-load-border (x:i32 y:i32):!void
+  (try (draw-named (- x 8) (+ y 7) "M_LSLEFT"))
+  (dotimes (i 24) (try (draw-named (+ x (* i 8)) (+ y 7) "M_LSCNTR")))
+  (try (draw-named (+ x 192) (+ y 7) "M_LSRGHT"))
+  (ok))
+
+; The save menu draws at the load menu's place, as the C does.
+(defn- draw-slots ():!void
+  (let (m (menu LOAD-MENU))
+    (dotimes (i SAVE-SLOTS)
+      (try (draw-save-load-border (m 'x) (+ (m 'y) (* LINE-HEIGHT i))))
+      (try (write-text (m 'x) (+ (m 'y) (* LINE-HEIGHT i)) (save-string i)))))
+  (ok))
+
+(defn- draw-background ():!void
+  (case current-menu
+    MAIN-MENU (try (draw-named 94 2 "M_DOOM"))
+    EPISODE-MENU (try (draw-named 54 38 "M_EPISOD"))
+    NEW-GAME-MENU (do (try (draw-named 96 14 "M_NEWG"))
+                      (try (draw-named 54 38 "M_SKILL")))
+    OPTIONS-MENU
+    (let (m (current))
+      (try (draw-named 108 15 "M_OPTTTL"))
+      (try (draw-named (+ (m 'x) 175) (+ (m 'y) (* LINE-HEIGHT DETAIL-ITEM))
+                       (if (= detail-level 0) "M_GDHIGH" "M_GDLOW")))
+      (try (draw-named (+ (m 'x) 120) (+ (m 'y) (* LINE-HEIGHT MESSAGES-ITEM))
+                       (if show-messages "M_MSGON" "M_MSGOFF")))
+      (try (draw-thermo (m 'x) (+ (m 'y) (* LINE-HEIGHT (+ MOUSE-SENS-ITEM 1))) 10 mouse-sensitivity))
+      (try (draw-thermo (m 'x) (+ (m 'y) (* LINE-HEIGHT (+ SCREEN-SIZE-ITEM 1))) 9 screen-size)))
+    ; Doom II has one help page; Final Doom shows it as the second.
+    READ1-MENU (try (draw-named 0 0 (if (= game-mode COMMERCIAL) "HELP" "HELP2")))
+    READ2-MENU (try (draw-named 0 0 (if (and (>= game-version EXE-FINAL) (<= game-version EXE-FINAL2))
+                                      "HELP" "HELP1")))
+    SOUND-MENU
+    (let (m (current))
+      (try (draw-named 60 38 "M_SVOL"))
+      (try (draw-thermo (m 'x) (+ (m 'y) (* LINE-HEIGHT (+ SFX-VOL-ITEM 1))) 16 sfx-level))
+      (try (draw-thermo (m 'x) (+ (m 'y) (* LINE-HEIGHT (+ MUSIC-VOL-ITEM 1))) 16 music-level)))
+    LOAD-MENU (do (try (draw-named 72 28 "M_LOADG"))
+                  (try (draw-slots)))
+    SAVE-MENU (do (try (draw-named 72 28 "M_SAVEG"))
+                  (try (draw-slots))
+                  (when save-string-enter
+                    (let (m (menu LOAD-MENU))
+                      (try (write-text (+ (m 'x) (string-width (save-string save-slot)))
+                                       (+ (m 'y) (* LINE-HEIGHT save-slot)) "_")))))
+    (do))
+  (ok))
+
+; Each line of the message, centred on the screen.
+(defn- draw-message ():!void
+  (let (s (message-text)
+        y (- (/ SCREEN-HEIGHT 2) (/ (string-height s) 2))
+        start 0
+        n (unsafe/cast i32 (s 'len)))
+    (while (< start n)
+      (let (end start)
+        (while (and (< end n) (!= (aref (s 'data) end) 10)) (inc! end))
+        ; The C copies each line into an 80-byte buffer.
+        (let (line (StrView (unsafe/cast &ui8 (unsafe/ptr+ (s 'data) start)) (imin (- end start) 79)))
+          (try (write-text (- (/ SCREEN-WIDTH 2) (/ (string-width line) 2)) y line)))
+        (set! y (+ y (patch-height (aref hu-font 0))))
+        (set! start (if (< end n) (+ end 1) end)))))
+  (ok))
+
+(defn menu-drawer ():!void
+  (cond message-to-print (try (draw-message))
+        menu-active
+        (let (m (current) x (m 'x) y (m 'y))
+          (try (draw-background))
+          (dotimes (i (m 'count))
+            (let (name ((item i) 'name))
+              (when (and (> (name 'len) 0) (> (check-num-for-name name) 0))
+                (try (draw-named x y name))))
+            (set! y (+ y LINE-HEIGHT)))
+          (try (draw-named (+ x SKULL-X-OFFSET) (+ (m 'y) -5 (* item-on LINE-HEIGHT))
+                           (if (= which-skull 0) "M_SKULL1" "M_SKULL2")))))
+  (ok))
+
+;; Startup.
+
+(defn menu-init ():void
+  (set! current-menu MAIN-MENU)
+  (set! menu-active false)
+  (set! item-on ((current) 'last-on))
+  (set! which-skull 0)
+  (set! skull-anim-counter 10)
+  (set! screen-size (- screen-blocks 3))
+  (set! message-to-print false)
+  (set! message-last-menu-active menu-active)
+  (set! quick-save-slot -1)
+  (when (>= game-version EXE-ULTIMATE)
+    (set! ((menu READ2-MENU) 'prev) NO-MENU))
+  (when (= game-mode COMMERCIAL)
+    ; Doom II's main menu drops Read This for Quit.
+    (set! (aref items READ-THIS-ITEM) (aref items QUIT-ITEM))
+    (let (m (menu MAIN-MENU))
+      (set! (m 'count) (- (m 'count) 1))
+      (set! (m 'y) (+ (m 'y) 8)))
+    (set! ((menu NEW-GAME-MENU) 'prev) MAIN-MENU)
+    (let (m (menu READ1-MENU))
+      (set! (m 'x) 330)
+      (set! (m 'y) 165)))
+  ; Before Ultimate Doom there were three episodes; Chex Quest shows one.
+  (cond (< game-version EXE-ULTIMATE) (set! ((menu EPISODE-MENU) 'count) 3)
+        (= game-version EXE-CHEX) (set! ((menu EPISODE-MENU) 'count) 1)))

@@ -1,0 +1,10 @@
+; ISSUE-029: `try` on a call that returns plain void fails with "match:
+; scrutinee must be a defunion value, a pointer to one, or a defenum integer",
+; which names neither `try` nor the callee's type.
+; fixed-when: output-contains try
+(defn draw ():void (do))
+(defn frame ():!void
+  (try (draw))
+  (ok))
+(defn main ():i32
+  (match (frame) ((ok) 0) ((err e) 1)))

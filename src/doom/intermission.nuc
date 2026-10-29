@@ -1,0 +1,466 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The intermission between levels (wi_stuff.c): the tally, then the episode
+; map with the next level marked. The netgame and deathmatch tallies aren't
+; ported, since netgames aren't. The background animations draw m-random.
+
+(ns doom.intermission)
+
+(import-use "stdio.h")
+(import-use nucleus.fmt)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use doom.defs)
+(import-use doom.random)
+(import-use doom.system)
+(import-use doom.wad)
+(import-use doom.video)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.sound)
+(import-use doom.sounds)
+(import-use doom.game)
+
+(defconst- NUM-MAPS 9)
+(defconst- NUM-CMAPS 32)
+(defconst- TITLE-Y 2)
+(defconst- STATS-X 50)
+(defconst- STATS-Y 50)
+(defconst- TIME-X 16)
+(defconst- TIME-Y (- SCREEN-HEIGHT 32))
+(defconst- SHOW-NEXT-LOC-DELAY 4)
+
+;; The episode maps: where each level sits, and the animations.
+
+(defstruct- Point x:i32 y:i32)
+
+(defconst- LEVEL-NODES
+  (array Point
+    (Point 185 164) (Point 148 143) (Point 69 122) (Point 209 102) (Point 116 89)
+    (Point 166 55) (Point 71 56) (Point 135 29) (Point 71 24)
+    (Point 254 25) (Point 97 50) (Point 188 64) (Point 128 78) (Point 214 92)
+    (Point 133 130) (Point 208 136) (Point 148 140) (Point 235 158)
+    (Point 156 168) (Point 48 154) (Point 174 95) (Point 265 75) (Point 130 48)
+    (Point 279 23) (Point 198 48) (Point 140 25) (Point 281 136)))
+
+(defenum- AnimKind ANIM-ALWAYS ANIM-RANDOM ANIM-LEVEL)
+
+; `data1` is a random animation's period deviation or a level animation's
+; level; `data2` is a random animation's base period.
+(defstruct- Anim kind:i32 period:i32 frames:i32 x:i32 y:i32 data1:i32 data2:i32)
+
+(defconst- ANIMS
+  (array Anim
+    (Anim ANIM-ALWAYS 11 3 224 104 0 0) (Anim ANIM-ALWAYS 11 3 184 160 0 0)
+    (Anim ANIM-ALWAYS 11 3 112 136 0 0) (Anim ANIM-ALWAYS 11 3 72 112 0 0)
+    (Anim ANIM-ALWAYS 11 3 88 96 0 0) (Anim ANIM-ALWAYS 11 3 64 48 0 0)
+    (Anim ANIM-ALWAYS 11 3 192 40 0 0) (Anim ANIM-ALWAYS 11 3 136 16 0 0)
+    (Anim ANIM-ALWAYS 11 3 80 16 0 0) (Anim ANIM-ALWAYS 11 3 64 24 0 0)
+    (Anim ANIM-LEVEL 11 1 128 136 1 0) (Anim ANIM-LEVEL 11 1 128 136 2 0)
+    (Anim ANIM-LEVEL 11 1 128 136 3 0) (Anim ANIM-LEVEL 11 1 128 136 4 0)
+    (Anim ANIM-LEVEL 11 1 128 136 5 0) (Anim ANIM-LEVEL 11 1 128 136 6 0)
+    (Anim ANIM-LEVEL 11 1 128 136 7 0) (Anim ANIM-LEVEL 11 3 192 144 8 0)
+    (Anim ANIM-LEVEL 11 1 128 136 8 0)
+    (Anim ANIM-ALWAYS 11 3 104 168 0 0) (Anim ANIM-ALWAYS 11 3 40 136 0 0)
+    (Anim ANIM-ALWAYS 11 3 160 96 0 0) (Anim ANIM-ALWAYS 11 3 104 80 0 0)
+    (Anim ANIM-ALWAYS 11 3 120 32 0 0) (Anim ANIM-ALWAYS 8 3 40 0 0 0)))
+
+; Each episode's animations are ANIMS[start, end).
+(defconst- ANIM-START (array i32 0 10 19 25))
+
+; Per animation of the current episode: its next tic, frame and patches.
+(defvar- anim-next-tic:(array i32 10))
+(defvar- anim-frame:(array i32 10))
+(defvar- anim-patches:(array Patch 30))
+
+;; Graphics.
+
+(defvar- level-names:(array Patch 32))
+(defvar- you-are-here:(array Patch 2))
+(defvar- splat:(array Patch 1))
+(defvar- percent:Patch)
+(defvar- colon:Patch)
+(defvar- digits:(array Patch 10))
+(defvar- minus:Patch)
+(defvar- has-minus:bool false)
+(defvar- finished:Patch)
+(defvar- entering:Patch)
+(defvar- kills:Patch)
+(defvar- items:Patch)
+(defvar- secret:Patch)
+(defvar- time-patch:Patch)
+(defvar- par:Patch)
+(defvar- sucks:Patch)
+(defvar- background:Patch)
+
+;; State.
+
+(defenum- Stage STAT-COUNT SHOW-NEXT-LOC NO-STATE)
+
+(defvar- wbs:WorldInfo)
+(defvar- stage:i32 STAT-COUNT)
+(defvar- accelerate:bool false)
+; Counts tics for timed stages; `bcnt` times the background animations.
+(defvar- cnt:i32 0)
+(defvar- bcnt:i32 0)
+(defvar- cnt-kills:i32 0)
+(defvar- cnt-items:i32 0)
+(defvar- cnt-secret:i32 0)
+(defvar- cnt-time:i32 0)
+(defvar- cnt-par:i32 0)
+(defvar- cnt-pause:i32 0)
+; The tally's step: odd steps pause, even ones count up, 10 waits for a key.
+(defvar- sp-state:i32 0)
+(defvar- pointer-on:bool false)
+
+(defn- episode-anims? ():bool (and (!= game-mode COMMERCIAL) (<= (wbs 'epsd) 2)))
+
+(defn- anim-count ():i32
+  (- (aref ANIM-START (+ (wbs 'epsd) 1)) (aref ANIM-START (wbs 'epsd))))
+
+(defn- anim (i:i32):Anim (aref ANIMS (+ (aref ANIM-START (wbs 'epsd)) i)))
+
+(defn- init-animated-back ():void
+  (when (episode-anims?)
+    (dotimes (i (anim-count))
+      (let (a (anim i))
+        (set! (aref anim-frame i) -1)
+        (set! (aref anim-next-tic i)
+              (case (a 'kind)
+                ANIM-ALWAYS (+ bcnt 1 (% (m-random) (a 'period)))
+                ANIM-RANDOM (+ bcnt 1 (a 'data2) (% (m-random) (a 'data1)))
+                (+ bcnt 1)))))))
+
+(defn- update-animated-back ():void
+  (when (episode-anims?)
+    (dotimes (i (anim-count))
+      (let (a (anim i) frame (aref anim-frame i))
+        (when (= bcnt (aref anim-next-tic i))
+          (case (a 'kind)
+            ANIM-ALWAYS
+            (do (set! (aref anim-frame i) (if (>= (+ frame 1) (a 'frames)) 0 (+ frame 1)))
+                (set! (aref anim-next-tic i) (+ bcnt (a 'period))))
+            ANIM-RANDOM
+            (if (= (+ frame 1) (a 'frames))
+              (do (set! (aref anim-frame i) -1)
+                  (set! (aref anim-next-tic i) (+ bcnt (a 'data2) (% (m-random) (a 'data1)))))
+              (do (set! (aref anim-frame i) (+ frame 1))
+                  (set! (aref anim-next-tic i) (+ bcnt (a 'period)))))
+            ; The tally holds back the eighth animation on episode 2's map.
+            ANIM-LEVEL
+            (when (and (not (and (= stage STAT-COUNT) (= i 7))) (= (wbs 'next) (a 'data1)))
+              (when (< (+ frame 1) (a 'frames)) (set! (aref anim-frame i) (+ frame 1)))
+              (set! (aref anim-next-tic i) (+ bcnt (a 'period))))))))))
+
+(defn- draw-animated-back ():!void
+  (when (episode-anims?)
+    (dotimes (i (anim-count))
+      (let (a (anim i) frame (aref anim-frame i))
+        (when (>= frame 0)
+          (try (draw-patch (a 'x) (a 'y) (aref anim-patches (+ (* i 3) frame))))))))
+  (ok))
+
+;; Drawing.
+
+(defn- draw-centered (y:i32 p:Patch):!void
+  (draw-patch (/ (- SCREEN-WIDTH (patch-width p)) 2) y p))
+
+; "<Level> Finished!"
+(defn- draw-level-finished ():!void
+  (let (last (wbs 'last))
+    (cond (or (!= game-mode COMMERCIAL) (< last NUM-CMAPS))
+          (let (name (aref level-names last))
+            (try (draw-centered TITLE-Y name))
+            (try (draw-centered (+ TITLE-Y (/ (* 5 (patch-height name)) 4)) finished)))
+          ; MAP33 has no name, only "Finished!".
+          (= last NUM-CMAPS) (try (draw-centered TITLE-Y finished))
+          ; Past MAP33 doom2.exe died with a bad V_DrawPatch.
+          true (fatal "Bad V_DrawPatch")))
+  (ok))
+
+; "Entering <Level>"
+(defn- draw-entering ():!void
+  (let (name (aref level-names (wbs 'next)))
+    (try (draw-centered TITLE-Y entering))
+    (draw-centered (+ TITLE-Y (/ (* 5 (patch-height name)) 4)) name)))
+
+; Draws the first of `n` patches that fits on level `level`'s spot.
+(defn- draw-on-level (level:i32 c:ptr:Patch n:i32):!void
+  (let (node (aref LEVEL-NODES (+ (* (wbs 'epsd) NUM-MAPS) level))
+        i 0)
+    (while (< i n)
+      (let (p (aref c i)
+            left (- (node 'x) (patch-left p))
+            top (- (node 'y) (patch-top p)))
+        (if (and (>= left 0) (< (+ left (patch-width p)) SCREEN-WIDTH)
+                 (>= top 0) (< (+ top (patch-height p)) SCREEN-HEIGHT))
+          (do (try (draw-patch (node 'x) (node 'y) p))
+              (set! i (+ n 1)))
+          (inc! i))))
+    (when (= i n) (printf "Could not place patch on level %d" (+ level 1))))
+  (ok))
+
+; Draws `value` right-aligned at x, in at least `width` digits (or as many as
+; it has, when `width` is negative); returns the x it reached.
+(defn- draw-num (x:i32 y:i32 value:i32 width:i32):!i32
+  (let (n value
+        count width
+        cx x
+        w (patch-width (aref digits 0)))
+    (when (< count 0)
+      (set! count (if (= n 0) 1 0))
+      (let (t n)
+        (while (!= t 0)
+          (set! t (/ t 10))
+          (inc! count))))
+    (let (neg (< n 0))
+      (when neg (set! n (- 0 n)))
+      ; 1994 means "not a number".
+      (when (= n 1994) (return (ok 0)))
+      (dotimes (k count)
+        (set! cx (- cx w))
+        (try (draw-patch cx y (aref digits (% n 10))))
+        (set! n (/ n 10)))
+      (when (and neg has-minus)
+        (set! cx (- cx 8))
+        (try (draw-patch cx y minus))))
+    (ok cx)))
+
+(defn- draw-percent (x:i32 y:i32 p:i32):!void
+  (when (>= p 0)
+    (try (draw-patch x y percent))
+    (try (draw-num x y p -1)))
+  (ok))
+
+; Minutes and seconds (and hours), or "sucks" past 61:59.
+(defn- draw-time (x:i32 y:i32 t:i32):!void
+  (cond (< t 0) (do)
+        (<= t (* 61 59))
+        (let (div 1 cx x more true)
+          (while more
+            (set! cx (- (try (draw-num cx y (% (/ t div) 60) 2)) (patch-width colon)))
+            (set! div (* div 60))
+            (set! more (!= (/ t div) 0))
+            (when (or (= div 60) more) (try (draw-patch cx y colon)))))
+        true (try (draw-patch (- x (patch-width sucks)) y sucks)))
+  (ok))
+
+(defn- draw-stats ():!void
+  (let (lh (/ (* 3 (patch-height (aref digits 0))) 2))
+    (try (draw-patch 0 0 background))
+    (try (draw-animated-back))
+    (try (draw-level-finished))
+    (try (draw-patch STATS-X STATS-Y kills))
+    (try (draw-percent (- SCREEN-WIDTH STATS-X) STATS-Y cnt-kills))
+    (try (draw-patch STATS-X (+ STATS-Y lh) items))
+    (try (draw-percent (- SCREEN-WIDTH STATS-X) (+ STATS-Y lh) cnt-items))
+    (try (draw-patch STATS-X (+ STATS-Y (* 2 lh)) secret))
+    (try (draw-percent (- SCREEN-WIDTH STATS-X) (+ STATS-Y (* 2 lh)) cnt-secret))
+    (try (draw-patch TIME-X TIME-Y time-patch))
+    (try (draw-time (- (/ SCREEN-WIDTH 2) TIME-X) TIME-Y cnt-time))
+    (when (< (wbs 'epsd) 3)
+      (try (draw-patch (+ (/ SCREEN-WIDTH 2) TIME-X) TIME-Y par))
+      (try (draw-time (- SCREEN-WIDTH TIME-X) TIME-Y cnt-par))))
+  (ok))
+
+(defn- draw-show-next-loc ():!void
+  (try (draw-patch 0 0 background))
+  (try (draw-animated-back))
+  (when (!= game-mode COMMERCIAL)
+    (when (> (wbs 'epsd) 2)
+      (return (draw-entering)))
+    ; Splat every level taken, and the secret level if it was.
+    (let (last (if (= (wbs 'last) 8) (- (wbs 'next) 1) (wbs 'last)))
+      (dotimes (i (+ last 1))
+        (try (draw-on-level i (unsafe/cast ptr:Patch &splat) 1))))
+    (when (wbs 'did-secret)
+      (try (draw-on-level 8 (unsafe/cast ptr:Patch &splat) 1)))
+    (when pointer-on
+      (try (draw-on-level (wbs 'next) (unsafe/cast ptr:Patch &you-are-here) 2))))
+  (if (or (!= game-mode COMMERCIAL) (!= (wbs 'next) 30))
+    (draw-entering)
+    (ok)))
+
+(defn wi-drawer ():!void
+  (case stage
+    STAT-COUNT (draw-stats)
+    SHOW-NEXT-LOC (draw-show-next-loc)
+    (do (set! pointer-on true)
+        (draw-show-next-loc))))
+
+;; Ticking.
+
+(defn- init-no-state ():void
+  (set! stage NO-STATE)
+  (set! accelerate false)
+  (set! cnt 10))
+
+(defn- update-no-state ():void
+  (update-animated-back)
+  (dec! cnt)
+  (when (= cnt 0) (world-done)))
+
+(defn- init-show-next-loc ():void
+  (set! stage SHOW-NEXT-LOC)
+  (set! accelerate false)
+  (set! cnt (* SHOW-NEXT-LOC-DELAY TIC-RATE))
+  (init-animated-back))
+
+(defn- update-show-next-loc ():void
+  (update-animated-back)
+  (dec! cnt)
+  (if (or (= cnt 0) accelerate)
+    (init-no-state)
+    (set! pointer-on (< (bit-and cnt 31) 20))))
+
+(defn- init-stats ():void
+  (set! stage STAT-COUNT)
+  (set! accelerate false)
+  (set! sp-state 1)
+  (set! cnt-kills -1)
+  (set! cnt-items -1)
+  (set! cnt-secret -1)
+  (set! cnt-time -1)
+  (set! cnt-par -1)
+  (set! cnt-pause TIC-RATE)
+  (init-animated-back))
+
+(defn- me ():&WorldPlayer &(aref (wbs 'plyr) (wbs 'pnum)))
+
+(defn- kills-pct ():i32 (/ (* ((me) 'skills) 100) (wbs 'maxkills)))
+(defn- items-pct ():i32 (/ (* ((me) 'sitems) 100) (wbs 'maxitems)))
+(defn- secret-pct ():i32 (/ (* ((me) 'ssecret) 100) (wbs 'maxsecret)))
+(defn- level-secs ():i32 (/ ((me) 'stime) TIC-RATE))
+(defn- par-secs ():i32 (/ (wbs 'partime) TIC-RATE))
+
+(defn- boom ():void (start-sound null SFX-BAREXP))
+
+; A pistol shot every fourth tic while a count runs up.
+(defn- tick-sound ():void
+  (when (= (bit-and bcnt 3) 0) (start-sound null SFX-PISTOL)))
+
+; Counts `value` up by 2 towards `target`; true once it's there.
+(defn- count-up (value:&i32 target:i32):bool
+  (set! @value (+ @value 2))
+  (tick-sound)
+  (if (>= @value target)
+    (do (set! @value target) (boom) true)
+    false))
+
+(defn- update-stats ():void
+  (update-animated-back)
+  (when (and accelerate (!= sp-state 10))
+    (set! accelerate false)
+    (set! cnt-kills (kills-pct))
+    (set! cnt-items (items-pct))
+    (set! cnt-secret (secret-pct))
+    (set! cnt-time (level-secs))
+    (set! cnt-par (par-secs))
+    (boom)
+    (set! sp-state 10))
+  (cond (= sp-state 2) (when (count-up &cnt-kills (kills-pct)) (inc! sp-state))
+        (= sp-state 4) (when (count-up &cnt-items (items-pct)) (inc! sp-state))
+        (= sp-state 6) (when (count-up &cnt-secret (secret-pct)) (inc! sp-state))
+        (= sp-state 8)
+        (do (tick-sound)
+            (set! cnt-time (+ cnt-time 3))
+            (when (>= cnt-time (level-secs)) (set! cnt-time (level-secs)))
+            (set! cnt-par (+ cnt-par 3))
+            (when (>= cnt-par (par-secs))
+              (set! cnt-par (par-secs))
+              (when (>= cnt-time (level-secs))
+                (boom)
+                (inc! sp-state))))
+        (= sp-state 10)
+        (when accelerate
+          (start-sound null SFX-SGCOCK)
+          (if (= game-mode COMMERCIAL) (init-no-state) (init-show-next-loc)))
+        (!= (bit-and sp-state 1) 0)
+        (do (dec! cnt-pause)
+            (when (= cnt-pause 0)
+              (inc! sp-state)
+              (set! cnt-pause TIC-RATE)))))
+
+; Fire or use, newly pressed by anyone, skips ahead.
+(defn- check-for-accelerate ():void
+  (dotimes (i MAX-PLAYERS)
+    (when (aref player-in-game i)
+      (let (p (player i) buttons (as i32 ((p 'cmd) 'buttons)))
+        (if (!= (bit-and buttons BT-ATTACK) 0)
+          (do (when (= (p 'attack-down) 0) (set! accelerate true))
+              (set! (p 'attack-down) 1))
+          (set! (p 'attack-down) 0))
+        (if (!= (bit-and buttons BT-USE) 0)
+          (do (when (= (p 'use-down) 0) (set! accelerate true))
+              (set! (p 'use-down) 1))
+          (set! (p 'use-down) 0))))))
+
+(defn wi-ticker ():void
+  (inc! bcnt)
+  (when (= bcnt 1)
+    (change-music (if (= game-mode COMMERCIAL) MUS-DM2INT MUS-INTER) true))
+  (check-for-accelerate)
+  (case stage
+    STAT-COUNT (update-stats)
+    SHOW-NEXT-LOC (update-show-next-loc)
+    (update-no-state)))
+
+;; Starting.
+
+(defn- load-data ():!void
+  (if (= game-mode COMMERCIAL)
+    (dotimes (i NUM-CMAPS)
+      (set! (aref level-names i)
+            (try (patch-named (string-as-view &(str "CWILV" (if (< i 10) "0" "") i))))))
+    (do (dotimes (i NUM-MAPS)
+          (set! (aref level-names i)
+                (try (patch-named (string-as-view &(str "WILV" (wbs 'epsd) i))))))
+        (set! (aref you-are-here 0) (try (patch-named "WIURH0")))
+        (set! (aref you-are-here 1) (try (patch-named "WIURH1")))
+        (set! (aref splat 0) (try (patch-named "WISPLAT")))
+        (when (< (wbs 'epsd) 3)
+          (dotimes (j (anim-count))
+            (dotimes (i ((anim j) 'frames))
+              (set! (aref anim-patches (+ (* j 3) i))
+                    ; Episode 2's last animation reuses the fifth's frames.
+                    (if (and (= (wbs 'epsd) 1) (= j 8))
+                      (aref anim-patches (+ (* 4 3) i))
+                      ; Every animation and frame number is one digit.
+                      (try (patch-named (string-as-view &(str "WIA" (wbs 'epsd) "0" j "0" i)))))))))))
+  (set! has-minus (> (check-num-for-name "WIMINUS") 0))
+  (when has-minus (set! minus (try (patch-named "WIMINUS"))))
+  (dotimes (i 10) (set! (aref digits i) (try (patch-named (string-as-view &(str "WINUM" i))))))
+  (set! percent (try (patch-named "WIPCNT")))
+  (set! finished (try (patch-named "WIF")))
+  (set! entering (try (patch-named "WIENTER")))
+  (set! kills (try (patch-named "WIOSTK")))
+  (set! secret (try (patch-named "WISCRT2")))
+  (set! items (try (patch-named "WIOSTI")))
+  (set! colon (try (patch-named "WICOLON")))
+  (set! time-patch (try (patch-named "WITIME")))
+  (set! sucks (try (patch-named "WISUCKS")))
+  (set! par (try (patch-named "WIPAR")))
+  (set! background
+        (try (patch-named (if (or (= game-mode COMMERCIAL)
+                                  (and (>= game-version EXE-ULTIMATE) (= (wbs 'epsd) 3)))
+                            "INTERPIC"
+                            (string-as-view &(str "WIMAP" (wbs 'epsd)))))))
+  (ok))
+
+(defn wi-start (wi:&WorldInfo):!void
+  (set! wbs @wi)
+  (set! accelerate false)
+  (set! cnt 0)
+  (set! bcnt 0)
+  (when (= (wbs 'maxkills) 0) (set! (wbs 'maxkills) 1))
+  (when (= (wbs 'maxitems) 0) (set! (wbs 'maxitems) 1))
+  (when (= (wbs 'maxsecret) 0) (set! (wbs 'maxsecret) 1))
+  ; Before Ultimate Doom there was no fourth episode map.
+  (when (and (< game-version EXE-ULTIMATE) (> (wbs 'epsd) 2))
+    (set! (wbs 'epsd) (- (wbs 'epsd) 3)))
+  (try (load-data))
+  (init-stats)
+  (ok))
+
+(defn wi-end ():void (do))

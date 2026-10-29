@@ -1,0 +1,9 @@
+(ns issue-032.a)
+(import-use "stdio.h")
+(defn- num (x:i32 y:i32 v:i32 w:i32):!i32 (printf "a.num %d\n" v) (ok x))
+(defn- pct (x:i32 y:i32 v:i32):!void
+  (try (num x y v -1))
+  (ok))
+(defn a-draw ():!void
+  (try (pct 1 2 3))
+  (ok))
