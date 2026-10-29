@@ -11,8 +11,8 @@
 | 4 | Playsim, demos, `-tichash` | done |
 | 5 | Playable | done; playtest requested |
 | 6 | Sound and music (optional) | done; playtest requested |
-| 7 | Savegames and config (optional) | next |
-| 8 | Idiom pass and final report | — |
+| 7 | Savegames and config (optional) | done; playtest requested |
+| 8 | Idiom pass and final report | next |
 
 ## Reference harness
 
@@ -92,7 +92,11 @@
 | `doom.wipe` | `src/doom/wipe.nuc` | f_wipe.c (the melt) |
 | `doom.sys.timer` | `src/doom/sys/timer.nuc` | i_timer.c |
 | `doom.tichash` | `src/doom/tichash.nuc` | `-tichash`, the port's half of the demo-sync harness |
-| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`, `-playdemo`, `-timedemo`) |
+| `doom.files` | `src/doom/files.nuc` | m_misc.c's directory and file helpers (XDG data dir, `-savedir`, write-then-rename) |
+| `doom.savecodec` | `src/doom/savecodec.nuc` | the field encoding `derive-save` writes from each struct's definition (in place of p_saveg.c's struct images) |
+| `doom.savegame` | `src/doom/savegame.nuc` | p_saveg.c, and the file half of G_DoSaveGame/G_DoLoadGame |
+| `doom.config` | `src/doom/config.nuc` | m_config.c, as EDN with key bindings by name |
+| `doom.main` | `src/doom/main.nuc` | d_main.c, d_loop.c (startup, the loop, `-warp`, `-playdemo`, `-timedemo`, `-loadgame`, `-savetest`) |
 | `tests.*` | `src/tests/*.nuc` | unit tests; `scripts/run-tests.sh` |
 
 - The trig tables can't be generated: no closed-form `sin`/`tan`/`atan` (double,
@@ -110,8 +114,17 @@
 - Not ported; each one stops with a message: deathmatch starts, netgame
   respawn and net demos. Netgames, chat and the netgame intermission are out
   of scope (PROMPT §5).
-- Savegames are milestone 7. Until then the load and save menus show empty
-  slots, and saving says so in a message.
+- Savegames are the port's own format, versioned (`SAVE-VERSION`), not
+  vanilla's. `derive-save` writes each struct's codec from its definition, and
+  pointers between level objects are saved as indexes into one object table.
+  Unlike vanilla, a save keeps the thinker order, both RNG indexes,
+  `validcount` and the order of every sector and blockmap thing list, so a
+  game reloaded mid-demo plays on in sync. Removed things that something
+  still targets are saved too. Files are `nucdsav<N>.dsg` in
+  `$XDG_DATA_HOME/nuc-doom` (else `~/.local/share/nuc-doom`), or in `-savedir`.
+- The config is `config.edn` in the same directory, or `-config <file>`. It's
+  read at startup, written on a normal quit, and every entry is optional.
+  Bindings are key names (`"ctrl"`, `"space"`, `"f5"`, `","`).
 - Music plays through SDL_mixer's MIDI support. Chocolate Doom's default OPL
   emulation (`i_oplmusic.c`, `opl/`) is not ported, so the music sounds like
   General MIDI rather than an AdLib. Sound effects play unpitched, as with Chocolate
@@ -122,15 +135,23 @@
 
 ## Gates
 
-- `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info, and
-  `mus2mid` against Chocolate Doom's output for all twelve shareware songs).
+- `scripts/run-tests.sh`: unit tests (fixed point, tables, WAD, info,
+  `mus2mid` against Chocolate Doom's output for all twelve shareware songs,
+  the savegame codec, and the config's round trip and key names).
 - `scripts/check-frames.sh`: `title` and `e1m1` (status bar included) match
   the reference byte for byte.
 - `scripts/check-demos.sh`: demo1, demo2 and demo3 match the reference's
   tic hashes for all 5658, 13980 and 13605 tics.
 - `scripts/check-warp.sh`: E1M1 to E1M9 at skills 1, 3 and 5, each played
   for 700 tics with no input, end in their framedump without a crash.
+- `scripts/check-savegames.sh`: demo1-3 again, with `-savetest 37`. Every 37
+  tics it saves to slot 7 of a temporary `-savedir`, reloads the map, restores
+  the file and saves again. The two saves must match byte for byte, and the
+  tic hashes must stay the reference's. (By hand, every tic and every 3 tics
+  stayed in sync too.)
 - `scripts/check-probes.sh`: issue probes.
+- The gate scripts pass `-config` naming a file that doesn't exist, so a
+  developer's own settings can't change the frames.
 - The menu, automap, intermission and finale were also checked by framedumps
   with key events injected through a temporary hook (since removed). There is
   no reference to compare those frames with, since the reference engine takes
@@ -141,18 +162,20 @@
   silent in the container, which has no MIDI soundfont (`timidity.cfg`), and
   the port says so once on stderr.
 
-## Playtest request (milestones 5 and 6)
+## Playtest request (milestones 5, 6 and 7)
 
-The compiler has fixes on `doom-bugfixes` the host binary lacks, so rebuild it
-first:
+The compiler has fixes on `doom-bugfixes` the host binary lacks. One of them
+(ISSUE-040) changes code generation, so the host build has to converge its
+bootstrap once:
 
 ```
-cd /home/zak/code/nucleus && git checkout doom-bugfixes && make
+cd /home/zak/code/nucleus && git checkout doom-bugfixes
+make && make update-bootstrap && make && make bootstrap
 cd /home/zak/code/nuc-doom && . scripts/env.sh && nucleus build
 build/nuc-doom -iwad /home/zak/code/chocolate-doom/src/DOOM1.WAD
 ```
 
-There are no savegames yet (milestone 7). Music needs a MIDI synth that
+Music needs a MIDI synth that
 SDL_mixer can use (Timidity with a `timidity.cfg`, or FluidSynth with a
 soundfont). Without one the game prints "music: SDL_mixer cannot load MIDI"
 and plays without music. Please try:
@@ -175,9 +198,20 @@ and plays without music. Please try:
   ending music, and effects panning left and right as you turn. Check that
   distant monsters fade, that the volume sliders work, that pause silences the
   music, and that a quit plays its sound before the window closes.
+- Savegames (new): save from the menu (F2 or Esc → Save Game) into a slot
+  with a name of your own, play on, then load it (F3) and check that
+  everything is where it was: monsters, their health and targets, doors and
+  lifts mid-move, flickering lights, pickups, your weapons and ammo. Try
+  quicksave (F6) and quickload (F9), a load after dying, a save on E1M8
+  near the end, and `-loadgame N` on the command line. The files are in
+  `~/.local/share/nuc-doom/` (or `$XDG_DATA_HOME/nuc-doom/`).
+- Config (new): change the screen size, detail, volumes, messages and gamma,
+  quit from the menu, and check that `~/.local/share/nuc-doom/config.edn`
+  holds them and that the next start uses them. Rebind a key by editing the
+  file (e.g. `:fire "f"`) and check that it works. A bad entry should print a
+  warning and keep the default.
 
 ## Next steps
 
-- Milestone 7: savegames and a config file.
 - Milestone 8: the idiom pass, the final ISSUES.md ranking, the line-count
   table and the executive summary.

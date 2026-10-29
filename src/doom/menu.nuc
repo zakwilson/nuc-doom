@@ -22,6 +22,7 @@
 (import-use doom.sounds)
 (import-use doom.hud)
 (import-use doom.game)
+(import-use doom.savegame)
 (import-use doom.sys.timer)
 (import-use doom.render.main)
 
@@ -40,7 +41,6 @@
 
 (defconst- LINE-HEIGHT 16)
 (defconst- SKULL-X-OFFSET -32)
-(defconst- SAVE-STRING-SIZE 24)
 (defconst- SAVE-SLOTS 6)
 
 ; An item's status: no cursor stops on a blank, a disabled item can't be
@@ -276,11 +276,18 @@
     (dotimes (i n) (set! (aref dst i) (aref (s 'data) i)))
     (set! (aref dst n) 0)))
 
-; Savegames arrive with milestone 7: until then every slot is empty.
+; An empty or unreadable slot can be saved into but not loaded.
 (defn- read-save-strings ():void
   (dotimes (i SAVE-SLOTS)
-    (set-save-string i "empty slot")
-    (set! ((item-of LOAD-MENU i) 'status) ITEM-DISABLED)))
+    (match (slot-header i)
+      ((some h)
+        (let (d (save-string-ptr i))
+          (dotimes (k SAVE-STRING-SIZE) (set! (aref d k) (aref (h 'description) k)))
+          (set! (aref d (- SAVE-STRING-SIZE 1)) 0))
+        (set! ((item-of LOAD-MENU i) 'status) ITEM-SELECT))
+      (none
+        (set-save-string i "empty slot")
+        (set! ((item-of LOAD-MENU i) 'status) ITEM-DISABLED)))))
 
 (defn- do-save (slot:i32):void
   (save-game slot (save-string slot))

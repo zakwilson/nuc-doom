@@ -1,0 +1,7 @@
+; ISSUE-044: an extra ')' in an imported file. `nucleusc --list-imports`,
+; which `nucleus build` runs before compiling, reports it at this file's
+; path and the other file's line: "issue-044.nuc:3: error: unexpected )".
+; fixed-when: output-contains issue-044/lib.nuc:3
+; flags: --list-imports -I $ROOT/probes
+(import-use issue-044.lib)
+(defn main ():i32 (f))

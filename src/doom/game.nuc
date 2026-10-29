@@ -34,6 +34,7 @@
 (import-use doom.play.setup)
 (import-use doom.play.tick)
 (import-use doom.play.spec)
+(import-use doom.savegame)
 
 (defconst- MAX-AMMO (array i32 200 50 300 50))
 
@@ -118,6 +119,8 @@
         (do (fast-monsters (fn (t:i32):i32 (bit-shl t 1)))
             (set-missile-speeds 15 10 10)))
   (dotimes (i MAX-PLAYERS) (set! ((player i) 'player-state) PST-REBORN))
+  ; A demo sets it back once this returns.
+  (set! user-game true)
   (set! demo-playback false)
   (set! automap-active false)
   (set! view-active true)
@@ -210,6 +213,7 @@
       (when (aref player-in-game 1) (fatal "G_DoPlayDemo: net demos are not ported yet"))
       (try (init-new skill episode map))))
   (set! start-time (get-time))
+  (set! user-game false)
   (set! demo-playback true)
   (ok))
 
@@ -572,12 +576,51 @@
   (set! d-map map)
   (set! game-action GA-NEW-GAME))
 
-; Savegames arrive with milestone 7; until then the menu says so.
+;; Savegames. The menu asks; the next tic does it, between two tics' worth of
+;; thinking, as G_Ticker did.
+
+(defvar- save-slot:i32 0)
+(defvar- save-description:(array ui8 24))
+(defvar- save-description-len:i32 0)
+
 (defn save-game (slot:i32 description:StrView):void
-  (set! ((player console-player) 'message) "savegames are not supported yet"))
+  (set! save-slot slot)
+  (set! save-description-len (imin (unsafe/cast i32 (description 'len)) SAVE-STRING-SIZE))
+  (dotimes (i save-description-len)
+    (set! (aref save-description i) (aref (description 'data) i)))
+  (set! game-action GA-SAVE-GAME))
 
 (defn load-game (slot:i32):void
-  (set! ((player console-player) 'message) "savegames are not supported yet"))
+  (set! save-slot slot)
+  (set! game-action GA-LOAD-GAME))
+
+(defn- do-save-game ():void
+  (set! game-action GA-NOTHING)
+  (let (d (strview (unsafe/cast &ui8 &save-description) (as usize save-description-len)))
+    (match (save-to-slot save-slot d)
+      ((ok) (set! ((player console-player) 'message) "game saved."))
+      ((err e) (set! ((player console-player) 'message) "couldn't save the game")))))
+
+; G_DoLoadGame: a new game on the saved map, then the saved level over it.
+(defn- do-load-game ():!void
+  (set! game-action GA-NOTHING)
+  (match (read-slot save-slot)
+    ((err e) (return (ok)))
+    ((ok s)
+      (with (data s)
+        (let (b (string-bytes &data))
+          (match (read-header b)
+            ((err e) (set! ((player console-player) 'message) "that savegame can't be loaded"))
+            ((ok h)
+              (dotimes (i MAX-PLAYERS) (set! (aref player-in-game i) (aref (h 'in-game) i)))
+              (try (init-new (h 'skill) (h 'episode) (h 'map)))
+              ; A save that fails halfway has changed the level: start it afresh.
+              (match (restore-save b)
+                ((ok) (do))
+                ((err e)
+                  (try (init-new (h 'skill) (h 'episode) (h 'map)))
+                  (set! ((player console-player) 'message) "that savegame is damaged")))))))))
+  (ok))
 
 (defn- do-new-game ():!void
   (set! demo-playback false)
@@ -614,7 +657,9 @@
       GA-COMPLETED (try (do-completed))
       GA-VICTORY (finale-start)
       GA-WORLD-DONE (try (do-world-done))
-      (fatal "G_Ticker: loading and saving games are not ported yet")))
+      GA-LOAD-GAME (try (do-load-game))
+      GA-SAVE-GAME (do-save-game)
+      (fatal "G_Ticker: unknown game action")))
   (dotimes (i MAX-PLAYERS)
     (when (aref player-in-game i)
       (let (cmd &((player i) 'cmd))

@@ -652,10 +652,11 @@
 
 ;; The brain (Doom 2's final boss).
 
-(defvar- brain-targets:(array ?&Mobj 32))
-(defvar- num-brain-targets:i32 0)
-(defvar- brain-target-on:i32 0)
-(defvar- brain-easy:i32 0)
+; Public for doom.savegame, like the item queue.
+(defvar brain-targets:(array ?&Mobj 32))
+(defvar num-brain-targets:i32 0)
+(defvar brain-target-on:i32 0)
+(defvar brain-easy:i32 0)
 
 (defn- brain-awake (mo:&Mobj):void
   (set! num-brain-targets 0)

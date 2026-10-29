@@ -26,7 +26,7 @@ for f in "${frames[@]}"; do
     mkdir -p "$TMP/$f"
     # shellcheck disable=SC2086
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout -k 5 60 "$ROOT/build/nuc-doom" \
-        -iwad "$IWAD" -nosound ${ARGS[$f]} -framedump "${TIC[$f]}" "$TMP/$f" > "$TMP/$f.log" 2>&1
+        -iwad "$IWAD" -nosound -config "$TMP/none.edn" ${ARGS[$f]} -framedump "${TIC[$f]}" "$TMP/$f" > "$TMP/$f.log" 2>&1
     got="$TMP/$f/tic$tic.ppm"
     if [ ! -f "$got" ]; then
         echo "$f: FAIL (no frame written; last output: $(tail -1 "$TMP/$f.log"))"

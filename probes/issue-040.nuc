@@ -1,0 +1,12 @@
+; ISSUE-040: an array field of a by-value struct binding decays to a pointer
+; into a copy, so a store through it is silently lost.
+; fixed-when: output-contains 1 9
+(import-use "stdio.h")
+(defstruct Thing hp:i32 flags:(array i32 3))
+(defn main ():i32
+  (let (t:Thing (Thing))
+    (set! (aref (t 'flags) 0) 1)
+    (let (p &(aref (t 'flags) 2))
+      (set! @p 9))
+    (printf "%d %d\n" (aref (t 'flags) 0) (aref (t 'flags) 2)))
+  0)

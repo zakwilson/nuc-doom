@@ -1,0 +1,195 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The config file (m_config.c), as EDN: settings by name, and key bindings by
+; key name rather than scan code, e.g.
+;   {:screen-blocks 9 ... :keys {:fire "ctrl" :use "space" :weapon1 "1" ...}}
+; Every entry is optional and falls back to its default, so a file from an
+; older build still loads, which derive-edn can't do. ISSUE-045
+
+(ns doom.config)
+
+(import-use nucleus.error)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.node)
+(import-use nucleus.char)
+(import-use nucleus.edn)
+(import-use doom.args)
+(import-use doom.files)
+(import-use doom.system)
+(import-use doom.event)
+(import-use doom.video)
+(import-use doom.hud)
+(import-use doom.menu)
+
+;; Key names.
+
+(defstruct- KeyName code:i32 name:StrView)
+
+(defconst- KEY-NAMES
+  (array KeyName
+    (KeyName 0 "none") (KeyName 32 "space")
+    (KeyName KEY-RIGHTARROW "right") (KeyName KEY-LEFTARROW "left")
+    (KeyName KEY-UPARROW "up") (KeyName KEY-DOWNARROW "down")
+    (KeyName KEY-ESCAPE "escape") (KeyName KEY-ENTER "enter") (KeyName KEY-TAB "tab")
+    (KeyName KEY-BACKSPACE "backspace") (KeyName KEY-PAUSE "pause")
+    (KeyName KEY-RSHIFT "shift") (KeyName KEY-RCTRL "ctrl") (KeyName KEY-RALT "alt")
+    (KeyName KEY-CAPSLOCK "capslock") (KeyName KEY-NUMLOCK "numlock")
+    (KeyName KEY-SCRLCK "scrolllock") (KeyName KEY-PRTSCR "printscreen")
+    (KeyName KEY-HOME "home") (KeyName KEY-END "end")
+    (KeyName KEY-PGUP "pageup") (KeyName KEY-PGDN "pagedown")
+    (KeyName KEY-INS "insert") (KeyName KEY-DEL "delete") (KeyName KEYP-5 "keypad5")
+    (KeyName KEY-F1 "f1") (KeyName KEY-F2 "f2") (KeyName KEY-F3 "f3") (KeyName KEY-F4 "f4")
+    (KeyName KEY-F5 "f5") (KeyName KEY-F6 "f6") (KeyName KEY-F7 "f7") (KeyName KEY-F8 "f8")
+    (KeyName KEY-F9 "f9") (KeyName KEY-F10 "f10") (KeyName KEY-F11 "f11")
+    (KeyName KEY-F12 "f12")))
+
+(defconst- NUM-KEY-NAMES 38)
+
+; Printable keys are named by their character.
+(defn- printable? (code:i32):bool (and (> code 32) (< code 127)))
+
+(defn key-name (code:i32):String
+  (dotimes (i NUM-KEY-NAMES)
+    (let (k (aref KEY-NAMES i))
+      (when (= (k 'code) code) (return (str (k 'name))))))
+  (when (printable? code)
+    (match (char-from-u32 (as ui32 code))
+      ((ok c) (let (s (str "")) (string-push-char &s c) (return s)))
+      ((err e) (do))))
+  (str "#" code))
+
+(defn key-code (name:StrView):?i32
+  (dotimes (i NUM-KEY-NAMES)
+    (when (= ((aref KEY-NAMES i) 'name) name) (return (some ((aref KEY-NAMES i) 'code)))))
+  (if (and (= (name 'len) 1) (printable? (as i32 (aref (name 'data) 0))))
+    (some (as i32 (aref (name 'data) 0)))
+    (none)))
+
+;; What the file holds.
+
+; (each-setting f a…): `(f a… "name" &var lo hi)` for each integer setting.
+(defmacro- each-setting (f :rest a)
+  `(do (~f ~@a "screen-blocks" &screen-blocks 3 11)
+       (~f ~@a "detail-level" &detail-level 0 1)
+       (~f ~@a "sfx-volume" &sfx-level 0 15)
+       (~f ~@a "music-volume" &music-level 0 15)
+       (~f ~@a "gamma" &use-gamma 0 4)
+       (~f ~@a "mouse-sensitivity" &mouse-sensitivity 0 9)
+       (~f ~@a "mouse-fire" &mouseb-fire -1 2)
+       (~f ~@a "mouse-strafe" &mouseb-strafe -1 2)
+       (~f ~@a "mouse-forward" &mouseb-forward -1 2)))
+
+; (each-key f a…): `(f a… "name" &var)` for each key binding.
+(defmacro- each-key (f :rest a)
+  `(do (~f ~@a "right" &key-right) (~f ~@a "left" &key-left) (~f ~@a "up" &key-up) (~f ~@a "down" &key-down)
+       (~f ~@a "strafe-left" &key-strafeleft) (~f ~@a "strafe-right" &key-straferight)
+       (~f ~@a "fire" &key-fire) (~f ~@a "use" &key-use) (~f ~@a "strafe" &key-strafe)
+       (~f ~@a "run" &key-speed) (~f ~@a "pause" &key-pause) (~f ~@a "spy" &key-spy)
+       (~f ~@a "message-refresh" &key-message-refresh)
+       (~f ~@a "prev-weapon" &key-prevweapon) (~f ~@a "next-weapon" &key-nextweapon)
+       (~f ~@a "weapon1" &(aref key-weapons 0)) (~f ~@a "weapon2" &(aref key-weapons 1))
+       (~f ~@a "weapon3" &(aref key-weapons 2)) (~f ~@a "weapon4" &(aref key-weapons 3))
+       (~f ~@a "weapon5" &(aref key-weapons 4)) (~f ~@a "weapon6" &(aref key-weapons 5))
+       (~f ~@a "weapon7" &(aref key-weapons 6)) (~f ~@a "weapon8" &(aref key-weapons 7))
+       (~f ~@a "map-north" &key-map-north) (~f ~@a "map-south" &key-map-south)
+       (~f ~@a "map-east" &key-map-east) (~f ~@a "map-west" &key-map-west)
+       (~f ~@a "map-zoom-in" &key-map-zoomin) (~f ~@a "map-zoom-out" &key-map-zoomout)
+       (~f ~@a "map-toggle" &key-map-toggle) (~f ~@a "map-max-zoom" &key-map-maxzoom)
+       (~f ~@a "map-follow" &key-map-follow) (~f ~@a "map-grid" &key-map-grid)
+       (~f ~@a "map-mark" &key-map-mark) (~f ~@a "map-clear-marks" &key-map-clearmark)
+       (~f ~@a "menu-activate" &key-menu-activate) (~f ~@a "menu-up" &key-menu-up)
+       (~f ~@a "menu-down" &key-menu-down) (~f ~@a "menu-left" &key-menu-left)
+       (~f ~@a "menu-right" &key-menu-right) (~f ~@a "menu-back" &key-menu-back)
+       (~f ~@a "menu-forward" &key-menu-forward) (~f ~@a "menu-confirm" &key-menu-confirm)
+       (~f ~@a "menu-abort" &key-menu-abort) (~f ~@a "menu-help" &key-menu-help)
+       (~f ~@a "menu-save" &key-menu-save) (~f ~@a "menu-load" &key-menu-load)
+       (~f ~@a "menu-volume" &key-menu-volume) (~f ~@a "menu-detail" &key-menu-detail)
+       (~f ~@a "menu-quicksave" &key-menu-qsave) (~f ~@a "menu-end-game" &key-menu-endgame)
+       (~f ~@a "menu-messages" &key-menu-messages) (~f ~@a "menu-quickload" &key-menu-qload)
+       (~f ~@a "menu-quit" &key-menu-quit) (~f ~@a "menu-gamma" &key-menu-gamma)
+       (~f ~@a "menu-bigger" &key-menu-incscreen) (~f ~@a "menu-smaller" &key-menu-decscreen)))
+
+(defn config-path ():String
+  (let (p (check-parm-with-args "-config" 1))
+    (if (!= p 0)
+      (str (arg (+ p 1)))
+      (with (d (data-dir)) (str (string-as-view &d) "/config.edn")))))
+
+;; Reading.
+
+(defn- bad (name:StrView why:StrView):void
+  (let (m (str "config: " name " " why "; using the default"))
+    (warn (string-as-view &m))
+    (drop &m)))
+
+(defn- read-setting (m:?&Node name:StrView p:&i32 lo:i32 hi:i32):void
+  (let (v (edn-get m name))
+    (when (!= v null)
+      (match (edn-int v)
+        ((ok i) (if (and (>= i lo) (<= i hi)) (set! @p (unsafe/cast i32 i)) (bad name "is out of range")))
+        ((err e) (bad name "isn't an integer"))))))
+
+(defn- read-key (m:?&Node name:StrView p:&i32):void
+  (let (v (edn-get m name))
+    (when (!= v null)
+      (match (edn-str v)
+        ((ok s) (match (key-code s) ((some c) (set! @p c)) (none (bad name "names no key"))))
+        ((err e) (bad name "isn't a key name"))))))
+
+;; Applies `text`, a config file's contents; `what` names it in warnings.
+(defn apply-config (text:StrView what:StrView):void
+  (match (edn-parse text)
+    ((err e) (bad what "isn't EDN"))
+    ((ok m)
+      (if (!= (edn-kind m) EDN-MAP)
+        (bad what "isn't a map")
+        (do (each-setting read-setting m)
+            (let (sm (edn-get m "show-messages"))
+              (when (!= sm null)
+                (match (edn-bool sm)
+                  ((ok b) (set! show-messages b))
+                  ((err e) (bad "show-messages" "isn't true or false")))))
+            (let (keys (edn-get m "keys"))
+              (when (!= keys null) (each-key read-key keys))))))))
+
+; A missing file is the defaults.
+(defn load-config ():void
+  (with (path (config-path))
+    (match (read-file (string-as-view &path))
+      ((err e) (do))
+      ((ok text) (with (t text) (apply-config (string-as-view &t) (string-as-view &path)))))))
+
+;; Writing.
+
+(defn- write-setting (out:&String name:StrView p:&i32 lo:i32 hi:i32):void
+  (str-into out " :" name " " @p "\n"))
+
+(defn- write-key (out:&String name:StrView p:&i32):void
+  (with (k (key-name @p))
+    (str-into out "  :" name " ")
+    (edn-write out (string-as-view &k))
+    (str-into out "\n")))
+
+; The current settings, as a config file.
+(defn config-text ():String
+  (let (out (str "{\n"))
+    (each-setting write-setting &out)
+    (str-into &out " :show-messages " (if show-messages "true" "false") "\n")
+    (str-into &out " :keys\n {\n")
+    (each-key write-key &out)
+    (str-into &out " }}\n")
+    out))
+
+; Written on a normal quit, as M_SaveDefaults was.
+(defn save-config ():!void
+  (with (out (config-text))
+    (with (path (config-path))
+      (let (pv (string-as-view &path))
+        (match (strview-rfind-byte &pv 47)
+          ((some slash) (try (make-dirs (strview-take-bytes pv slash))))
+          (none (do)))
+        (let (v (string-as-view &out))
+          (write-file pv (v 'data) (v 'len)))))))

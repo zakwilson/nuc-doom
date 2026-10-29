@@ -1,0 +1,8 @@
+; ISSUE-043: `(ok)` as a statement (not the tail) of a `!void` function
+; reports "unknown: ok — not defined anywhere in this compilation unit",
+; though nucleus.error is imported. A clear refusal naming the missing
+; result type would also close this; the probe tracks the friendlier outcome.
+; fixed-when: compiles
+(import-use nucleus.error)
+(defn f ():!void (ok) (ok))
+(defn main ():i32 (f) 0)

@@ -1,0 +1,56 @@
+; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Where the port keeps its files: savegames and the config (m_misc.c's
+; M_GetSaveGameDir and friends, by the XDG convention rather than beside the
+; executable).
+
+(ns doom.files)
+
+(import-use "stdlib.h")
+(import-use nucleus.error)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.file)
+(import-use doom.args)
+
+(defn- env (name:CStr):?StrView
+  (let (v (getenv name))
+    (if (= (unsafe/cast ptr v) null) (none) (some (strview-from-cstr (unsafe/cast CStr v))))))
+
+; `$XDG_DATA_HOME/nuc-doom`, else `~/.local/share/nuc-doom`, else the
+; current directory.
+(defn data-dir ():String
+  (match (env "XDG_DATA_HOME")
+    ((some d) (str d "/nuc-doom"))
+    (none (match (env "HOME")
+            ((some h) (str h "/.local/share/nuc-doom"))
+            (none (str "."))))))
+
+; -savedir overrides where savegames go.
+(defn save-dir ():String
+  (let (p (check-parm-with-args "-savedir" 1))
+    (if (!= p 0) (str (arg (+ p 1))) (data-dir))))
+
+; Creates `path` and every missing directory above it.
+(defn make-dirs (path:StrView):!void
+  (dotimes (i (unsafe/cast i32 (path 'len)))
+    (when (and (> i 0) (= (aref (path 'data) i) 47))
+      (try (make-dir (strview-take-bytes path (as usize i))))))
+  (make-dir path))
+
+(defn read-file (path:StrView):!String
+  (with (f (try (file-open-read &path)))
+    (file-read-to-string f)))
+
+; Writes beside the target and renames over it, so a crash mid-write leaves
+; the old file.
+(defn write-file (path:StrView data:&ui8 n:usize):!void
+  (let (tmp (str path ".tmp") tv (string-as-view &tmp))
+    (with (f (try (file-create &tv)))
+      (try (file-write-bytes f data n))
+      (try (file-close f)))
+    (try (rename-file tv path))
+    (drop &tmp))
+  (ok))

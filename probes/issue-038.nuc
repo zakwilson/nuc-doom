@@ -1,0 +1,14 @@
+; ISSUE-038: a template method first stamped inside a `defn-`, in a file with no
+; `ns`, is defined under its bare name while the call uses the mangled one.
+; fixed-when: output-contains count 1
+(import-use "stdio.h")
+(import-use nucleus.vector)
+(import-use nucleus.create)
+
+(defn- size (v:&(Vector ui8)):i32 (unsafe/cast i32 (count v)))
+
+(defn main ():i32
+  (let (v (make (Vector ui8)))
+    (conj &v 1)
+    (printf "count %d\n" (size &v)))
+  0)

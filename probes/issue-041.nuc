@@ -1,0 +1,9 @@
+; ISSUE-041: two `import-use`d namespaces both define `nodes`, and a bare
+; `nodes` silently means the first import's. The same clash between two
+; functions is reported; for a value it should be too, naming both spellings.
+; fixed-when: compile-fails
+; flags: -I $ROOT/probes
+(import-use "stdio.h")
+(import-use issue-041.a)
+(import-use issue-041.b)
+(defn main ():i32 (printf "%d\n" nodes) 0)

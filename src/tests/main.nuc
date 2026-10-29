@@ -9,6 +9,8 @@
 (import-use tests.wad)
 (import-use tests.info)
 (import-use tests.music)
+(import-use tests.savegame)
+(import-use tests.config)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))

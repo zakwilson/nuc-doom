@@ -1,0 +1,247 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; The savegame's field encoding (in place of p_saveg.c's raw struct images).
+; `derive-save` writes each struct's codec from its definition, so a field
+; added to Mobj is saved without anyone remembering to. Pointers between level
+; objects are saved as indexes. A leaf module, because doom.game, which loads
+; and saves, sits in an import cycle with the playsim, and a macro can't be
+; used across one.
+
+(ns doom.savecodec)
+
+(import-use nucleus.error)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(import-ct nucleus.node)
+(import-ct nucleus.strview)
+(import-ct nucleus.intern)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.bytes)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.table)
+
+(deferror save-truncated "savegame is truncated")
+(deferror save-corrupt "savegame refers to something that isn't there")
+
+;; The byte stream: little-endian, four bytes an integer whatever its width.
+;; Globals here are `save-*` because doom.world has a `nodes`. ISSUE-041
+
+(defvar save-out:(Vector ui8) (make (Vector ui8)))
+(defvar save-in:Bytes (Bytes null 0))
+(defvar save-pos:i32 0)
+
+(defn put-byte (b:i32):void (conj &save-out (unsafe/cast ui8 (bit-and b 255))))
+
+(defn put-i32 (v:i32):void
+  (dotimes (i 4) (put-byte (bit-shr v (* 8 i)))))
+
+(defn take-byte ():!i32
+  (when (>= save-pos (save-in (quote len))) (return (err save-truncated)))
+  (let (b (u8 save-in save-pos))
+    (inc! save-pos)
+    (ok b)))
+
+(defn take-i32 ():!i32
+  (when (> (+ save-pos 4) (save-in (quote len))) (return (err save-truncated)))
+  (let (v (le-i32 save-in save-pos))
+    (set! save-pos (+ save-pos 4))
+    (ok v)))
+
+;; Level objects by index. Every thinker embeds its ThinkerNode, so one table
+;; covers mobjs and sector effects: 1 is the first, 0 is null.
+
+(defvar save-objects:(Vector &ThinkerNode) (make (Vector &ThinkerNode)))
+(defvar- node-index:(HashMap i64 i32) (make (HashMap i64 i32)))
+
+(defn reset-nodes ():void
+  (set! (save-objects (quote len)) 0) ; ISSUE-036
+  (drop &node-index) ; ISSUE-036
+  (set! node-index (make (HashMap i64 i32))))
+
+; A node's index, registering it on first sight: a removed thing that is still
+; somebody's target is saved too, after the thinker list.
+(defn index-of-node (n:&ThinkerNode):i32
+  (match (get &node-index (unsafe/cast i64 n))
+    ((some i) i)
+    (none (do (conj &save-objects n)
+              (let (i (unsafe/cast i32 (count &save-objects)))
+                (assoc &node-index (unsafe/cast i64 n) i)
+                i)))))
+
+(defn node-at (i:i32):!&ThinkerNode
+  (when (or (< i 1) (> i (unsafe/cast i32 (count &save-objects)))) (return (err save-corrupt)))
+  (ok (&save-objects (as usize (- i 1)))))
+
+;; Scalars.
+
+(defn put-field (x:&i32):void (put-i32 @x))
+(defn put-field (x:&i16):void (put-i32 (as i32 @x)))
+(defn put-field (x:&i8):void (put-i32 (as i32 @x)))
+(defn put-field (x:&ui8):void (put-i32 (as i32 @x)))
+(defn put-field (x:&bool):void (put-i32 (if @x 1 0)))
+(defn put-field (x:&Angle):void (put-i32 (unsafe/cast i32 @x)))
+(defn put-field (x:&Fixed):void (put-i32 (x 'v)))
+
+(defn take-field (x:&i32):!void (set! @x (try (take-i32))) (ok))
+(defn take-field (x:&i16):!void (set! @x (unsafe/cast i16 (try (take-i32)))) (ok))
+(defn take-field (x:&i8):!void (set! @x (unsafe/cast i8 (try (take-i32)))) (ok))
+(defn take-field (x:&ui8):!void (set! @x (unsafe/cast ui8 (try (take-i32)))) (ok))
+(defn take-field (x:&bool):!void (set! @x (!= (try (take-i32)) 0)) (ok))
+(defn take-field (x:&Angle):!void (set! @x (unsafe/cast Angle (try (take-i32)))) (ok))
+(defn take-field (x:&Fixed):!void (set! (x 'v) (try (take-i32))) (ok))
+
+;; Pointers.
+
+(defn put-field (x:(ref ?&Mobj)):void
+  (match @x ((some m) (put-i32 (index-of-node &(m 'th)))) (none (put-i32 0))))
+
+(defn take-field (x:(ref ?&Mobj)):!void
+  (let (i (try (take-i32)))
+    (if (= i 0)
+      (set! @x null)
+      (match ((try (node-at i)) 'self)
+        ((mobj m) (set! @x m))
+        (_ (return (err save-corrupt))))))
+  (ok))
+
+(defn put-field (x:(ref ?&ThinkerNode)):void
+  (match @x ((some n) (put-i32 (index-of-node n))) (none (put-i32 0))))
+
+(defn take-field (x:(ref ?&ThinkerNode)):!void
+  (let (i (try (take-i32)))
+    (set! @x (if (= i 0) null (try (node-at i)))))
+  (ok))
+
+(defn put-field (x:(ref ?&Plat)):void
+  (match @x ((some p) (put-i32 (index-of-node &(p 'th)))) (none (put-i32 0))))
+
+(defn take-field (x:(ref ?&Plat)):!void
+  (let (i (try (take-i32)))
+    (if (= i 0)
+      (set! @x null)
+      (match ((try (node-at i)) 'self)
+        ((plat p) (set! @x p))
+        (_ (return (err save-corrupt))))))
+  (ok))
+
+(defn put-field (x:(ref ?&Ceiling)):void
+  (match @x ((some c) (put-i32 (index-of-node &(c 'th)))) (none (put-i32 0))))
+
+(defn take-field (x:(ref ?&Ceiling)):!void
+  (let (i (try (take-i32)))
+    (if (= i 0)
+      (set! @x null)
+      (match ((try (node-at i)) 'self)
+        ((ceiling c) (set! @x c))
+        (_ (return (err save-corrupt))))))
+  (ok))
+
+(defn put-field (x:(ref ?&Player)):void
+  (let (n 0)
+    (when-some (p @x)
+      (dotimes (i MAX-PLAYERS)
+        (when (= (unsafe/cast ptr p) (unsafe/cast ptr (player i))) (set! n (+ i 1)))))
+    (put-i32 n)))
+
+(defn take-field (x:(ref ?&Player)):!void
+  (let (i (try (take-i32)))
+    (cond (= i 0) (set! @x null)
+          (and (>= i 1) (<= i MAX-PLAYERS)) (set! @x (player (- i 1)))
+          true (return (err save-corrupt))))
+  (ok))
+
+; A map structure is its index in its table, plus one so that 0 is null.
+; Overloading ignores nullability, so this one codec serves `&T` fields too.
+(defmacro- table-codec (type table)
+  `(do (defn ~'put-field ((x (ref (?ref ~type)))):void
+         (match @x ((some s) (put-i32 (+ (index-of ~table s) 1))) (none (put-i32 0))))
+       (defn ~'take-field ((x (ref (?ref ~type)))):!void
+         (let (i (try (take-i32)))
+           (cond (= i 0) (set! @x null)
+                 (<= i (table-len ~table)) (set! @x (~table (- i 1)))
+                 true (return (err save-corrupt))))
+         (ok))))
+
+(table-codec Sector sectors)
+(table-codec Line lines)
+(table-codec Subsector subsectors)
+
+; A sector's sound origin, by its sector.
+(defn put-field (x:(ref ?&SoundOrg)):void
+  (let (n 0)
+    (when-some (o @x)
+      (dotimes (i (table-len sectors))
+        (when (= (unsafe/cast ptr o) (unsafe/cast ptr &((sectors i) 'sound-org))) (set! n (+ i 1)))))
+    (put-i32 n)))
+
+(defn take-field (x:(ref ?&SoundOrg)):!void
+  (let (i (try (take-i32)))
+    (cond (= i 0) (set! @x null)
+          (<= i (table-len sectors)) (set! @x &((sectors (- i 1)) 'sound-org))
+          true (return (err save-corrupt))))
+  (ok))
+
+;; Structs.
+
+(defn- array-type? (t:ptr:nucleus.core/Node):bool
+  (and (= (t 'kind) NODE-LIST) (= (symbol-as-view ((ast-at t 0) 's)) "array")))
+
+(defn- listed? (names:&nucleus.core/Node name:ptr:nucleus.core/Node):bool
+  (doseq (s names NodeIter)
+    (when (= (s 's) (name 's)) (return true)))
+  false)
+
+; `put-field` and `take-field` for struct `t`, over its fields in declaration
+; order: all of them but `skip`, or only those in `only`.
+; `struct-fields` works only in a macro body, so the shared part is a macro.
+(defmacro save-codec (t only :rest names)
+  (let (only?:bool (= (symbol-as-view (only 's)) "true")
+        fields:&nucleus.core/Node (struct-fields t)
+        puts:&nucleus.core/Node (node-list-new (t (quote line)))
+        takes:&nucleus.core/Node (node-list-new (t (quote line))))
+    (dotimes (i (ast-len fields))
+      (let (f:ptr:nucleus.core/Node (ast-at fields i)
+            fname:ptr:nucleus.core/Node (ast-at f 0)
+            ftype:ptr:nucleus.core/Node (ast-at f 1))
+        (when (= (listed? names fname) only?)
+          (if (array-type? ftype)
+            (let (n:ptr:nucleus.core/Node (ast-at ftype 2))
+              (node-push puts `(dotimes (i ~n) (put-field &(aref (v '~fname) i))))
+              (node-push takes `(dotimes (i ~n) (try (take-field &(aref (v '~fname) i))))))
+            (do (node-push puts `(put-field (ref v '~fname)))
+                (node-push takes `(try (take-field (ref v '~fname)))))))))
+    `(do (defn ~'put-field (v:(ref ~t)):void ~@puts)
+         (defn ~'take-field (v:(ref ~t)):!void ~@takes (ok)))))
+
+; (derive-save T field…): every field except those named.
+(defmacro derive-save (t :rest skip)
+  `(save-codec ~t false ~@skip))
+
+; (derive-save-only T field…): just the fields named.
+(defmacro derive-save-only (t :rest only)
+  `(save-codec ~t true ~@only))
+
+(derive-save TicCmd)
+(derive-save PspDef)
+(derive-save MapThing)
+; Links and the subsector's lists are rebuilt from the saved list order.
+(derive-save Mobj th snext sprev bnext bprev)
+; A message points at a string literal; a loaded game starts with none.
+(derive-save Player message)
+; The rest of a sector, line or side comes from the map.
+(derive-save-only Sector floor-height ceiling-height floor-pic ceiling-pic light-level
+                  special tag sound-traversed sound-target special-data)
+(derive-save-only Line flags special tag)
+(derive-save Side sector)
+(derive-save Door th)
+(derive-save FloorMove th)
+(derive-save Ceiling th)
+(derive-save Plat th)
+(derive-save FireFlicker th)
+(derive-save LightFlash th)
+(derive-save Strobe th)
+(derive-save Glow th)

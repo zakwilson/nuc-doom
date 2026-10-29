@@ -272,8 +272,8 @@
 
 ;; Items picked up in deathmatch 2 come back; this queue remembers them.
 
-(defvar- item-respawn-que:(array MapThing 128))
-(defvar- item-respawn-time:(array i32 128))
+(defvar item-respawn-que:(array MapThing 128))
+(defvar item-respawn-time:(array i32 128))
 (defvar item-que-head:i32 0)
 (defvar item-que-tail:i32 0)
 

@@ -49,6 +49,18 @@ scripts:
     with `build/nuctests --run NAME` from `.toolchain/nucleus`.
   - On the host, compiler fixes take effect only after `make` in
     `/home/zak/code/nucleus`. Say so in every playtest request.
+  - **A fix that changes the compiler's own codegen moves the bootstrap.** The
+    bootstrap diff then fails by construction (nucleus `context/build.md`,
+    "After a codegen change"). To converge in the container:
+    1. Check the fixed point: `build/nucleusc-stage2 --emit-llvm
+       src/nucleusc.nuc` must equal `build/stage2.ll`.
+    2. Run `scripts/build-compiler.sh update-bootstrap`.
+    3. Copy `.toolchain/nucleus/boot/*.ll` into the real tree's (gitignored)
+       `boot/`, because the next sync restores `boot/` from there.
+    4. Rerun the gates.
+
+    The host's own `bin/nucleusc` still needs `make && make update-bootstrap
+    && make && make bootstrap`. Say so in the playtest request.
 
 Other environment facts:
 - **No display.** Run everything with
@@ -74,6 +86,17 @@ Other environment facts:
   instead.
 - **Probes** state their own pass condition on a `; fixed-when:` header line
   (see `scripts/check-probes.sh`).
+- **The port writes into `$XDG_DATA_HOME/nuc-doom`** (else
+  `~/.local/share/nuc-doom`): savegames, and `config.edn` on a menu quit.
+  Pass `-savedir DIR` and `-config FILE` in scratch runs. The gates already
+  pass a `-config` that doesn't exist, so the defaults apply. `-savetest N`
+  writes slot 7 of the save dir. A `-framedump` or `-timedemo` run exits
+  without saving the config, so the config's write path is reachable only
+  from the menu, which a headless run can't drive.
+- **`nucleus build` scans imports first** (`nucleusc --list-imports`). Before
+  nucleus 6518d10, that scan blamed a syntax error in an imported file on the
+  importer's path (ISSUE-044). If a host error names a balanced line, compile
+  the entry with `nucleusc -I src` to find the right file.
 - **Commits** need an identity the container lacks: pass
   `-c user.name="Zak Wilson" -c user.email="zak.wilson@gmail.com"` (the
   repos' existing author) on each `git commit`, in both repos.
@@ -94,6 +117,7 @@ scripts/check-demos.sh      # demo-sync gate against reference/data/
 scripts/run-tests.sh        # unit tests (test/build.edn → test/build/tests)
 scripts/check-probes.sh     # which ISSUES.md probes still reproduce
 scripts/check-frames.sh     # framedump gate against reference/data/frames/
+scripts/check-savegames.sh  # demos again with -savetest: save/reload/restore every 37 tics
 scripts/build-compiler.sh && scripts/build-compiler.sh -k test bootstrap   # after a Nucleus fix
 ```
 

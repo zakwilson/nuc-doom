@@ -1,0 +1,10 @@
+; ISSUE-042: `issue-042.m` passes its own `pick` as a function value. Because
+; another namespace in the unit (one `m` doesn't import) also defines `pick`,
+; the reference fails: "undefined: pick — defined in namespace
+; 'issue-042.lib', which this file does not import".
+; fixed-when: output-contains run 1
+; flags: -I $ROOT/probes
+(import-use "stdio.h")
+(import-use issue-042.lib)
+(import-use issue-042.m)
+(defn main ():i32 (printf "run %d\n" (run)) 0)

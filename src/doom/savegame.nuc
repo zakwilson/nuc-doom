@@ -1,0 +1,329 @@
+; Copyright(C) 1993-1996 Id Software, Inc.; Copyright(C) 2005-2014 Simon Howard.
+; GPLv2 or later; see COPYING.
+;
+; Savegames (p_saveg.c, and the file half of G_DoSaveGame/G_DoLoadGame), in a
+; format of the port's own. Unlike vanilla's, it keeps the thinker order, both
+; RNG indexes and the order of every sector and blockmap list, so a game
+; reloaded mid-demo plays on in sync (scripts/check-savegames.sh).
+;
+; Layout: a header, a directory of every saved thinker's kind and state, then
+; the fields. The directory comes first so that loading can allocate every
+; object before reading the pointers between them.
+
+(ns doom.savegame)
+
+(import-use nucleus.error)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.files)
+(import-use doom.math)
+(import-use doom.defs)
+(import-use doom.bytes)
+(import-use doom.world)
+(import-use doom.state)
+(import-use doom.random)
+(import-use doom.table)
+(import-use doom.savecodec)
+(import-use doom.play.thinkers)
+(import-use doom.play.movers)
+(import-use doom.play.spec)
+(import-use doom.play.enemy)
+(import-use doom.play.mobj)
+
+(deferror save-not-ours "not a nuc-doom savegame")
+(deferror save-version "savegame is from another version of nuc-doom")
+
+(defconst SAVE-STRING-SIZE 24)
+; "NUCDSAVE", as two little-endian words; bump the version on any change to
+; what is saved, since old files can't be read field by field.
+(defconst- MAGIC-LO 0x4443554e)
+(defconst- MAGIC-HI 0x45564153)
+(defconst SAVE-VERSION 1)
+
+(defstruct SaveHeader
+  description:(array ui8 24)
+  skill:i32 episode:i32 map:i32
+  in-game:(array bool 4))
+
+(defenum- Kind K-MOBJ K-DOOR K-FLOOR K-CEILING K-PLAT K-FIRE-FLICKER K-LIGHT-FLASH
+  K-STROBE K-GLOW)
+
+(defn- kind-of (n:&ThinkerNode):i32
+  (match (n 'self)
+    (cap -1)
+    ((mobj m) K-MOBJ) ((door d) K-DOOR) ((floor f) K-FLOOR) ((ceiling c) K-CEILING)
+    ((plat p) K-PLAT) ((fire-flicker f) K-FIRE-FLICKER) ((light-flash l) K-LIGHT-FLASH)
+    ((strobe s) K-STROBE) ((glow g) K-GLOW)))
+
+(defn- put-object (n:&ThinkerNode):void
+  (match (n 'self)
+    (cap (do))
+    ((mobj m) (put-field m)) ((door d) (put-field d)) ((floor f) (put-field f))
+    ((ceiling c) (put-field c)) ((plat p) (put-field p)) ((fire-flicker f) (put-field f))
+    ((light-flash l) (put-field l)) ((strobe s) (put-field s)) ((glow g) (put-field g))))
+
+(defn- take-object (n:&ThinkerNode):!void
+  (match (n 'self)
+    (cap (do))
+    ((mobj m) (try (take-field m))) ((door d) (try (take-field d)))
+    ((floor f) (try (take-field f))) ((ceiling c) (try (take-field c)))
+    ((plat p) (try (take-field p))) ((fire-flicker f) (try (take-field f)))
+    ((light-flash l) (try (take-field l))) ((strobe s) (try (take-field s)))
+    ((glow g) (try (take-field g))))
+  (ok))
+
+; A fresh object of `kind`, its node pointing back at it.
+(defn- new-object (kind:i32):!&ThinkerNode
+  (case kind
+    K-MOBJ (let (x (new Mobj level-arena)) (set! (&(x 'th) 'self) (Thinker-mobj x)) (ok &(x 'th)))
+    K-DOOR (let (x (new Door level-arena)) (set! (&(x 'th) 'self) (Thinker-door x)) (ok &(x 'th)))
+    K-FLOOR (let (x (new FloorMove level-arena)) (set! (&(x 'th) 'self) (Thinker-floor x)) (ok &(x 'th)))
+    K-CEILING (let (x (new Ceiling level-arena)) (set! (&(x 'th) 'self) (Thinker-ceiling x)) (ok &(x 'th)))
+    K-PLAT (let (x (new Plat level-arena)) (set! (&(x 'th) 'self) (Thinker-plat x)) (ok &(x 'th)))
+    K-FIRE-FLICKER (let (x (new FireFlicker level-arena))
+                     (set! (&(x 'th) 'self) (Thinker-fire-flicker x)) (ok &(x 'th)))
+    K-LIGHT-FLASH (let (x (new LightFlash level-arena))
+                    (set! (&(x 'th) 'self) (Thinker-light-flash x)) (ok &(x 'th)))
+    K-STROBE (let (x (new Strobe level-arena)) (set! (&(x 'th) 'self) (Thinker-strobe x)) (ok &(x 'th)))
+    K-GLOW (let (x (new Glow level-arena)) (set! (&(x 'th) 'self) (Thinker-glow x)) (ok &(x 'th)))
+    (err save-corrupt)))
+
+(defn- mobj-of (n:&ThinkerNode):!&Mobj
+  (match (n 'self) ((mobj m) (ok m)) (_ (err save-corrupt))))
+
+;; The parts after the directory, in the order both directions use.
+
+(defn- put-button (b:&Button):void
+  (put-field (ref b 'line))
+  (put-field (ref b 'where))
+  (put-field (ref b 'btexture))
+  (put-field (ref b 'btimer))
+  (put-field (ref b 'soundorg)))
+
+(defn- take-button (b:&Button):!void
+  (try (take-field (ref b 'line)))
+  (try (take-field (ref b 'where)))
+  (try (take-field (ref b 'btexture)))
+  (try (take-field (ref b 'btimer)))
+  (try (take-field (ref b 'soundorg)))
+  (ok))
+
+; (each-global f): `(f &g)` for each scalar global.
+(defmacro- each-global (f)
+  `(do (~f &level-time) (~f &prnd-index) (~f &rnd-index) (~f &validcount)
+       (~f &total-kills) (~f &total-items) (~f &total-secret)
+       (~f &item-que-head) (~f &item-que-tail)
+       (~f &num-brain-targets) (~f &brain-target-on) (~f &brain-easy)))
+
+(defmacro- try-take (x) `(try (take-field ~x)))
+
+(defn- put-globals ():void
+  (each-global put-field)
+  (dotimes (i 128)
+    (put-field &(aref item-respawn-que i))
+    (put-field &(aref item-respawn-time i)))
+  (dotimes (i 32) (put-field &(aref brain-targets i)))
+  (dotimes (i 30) (put-field &(aref active-plats i)))
+  (dotimes (i 30) (put-field &(aref active-ceilings i)))
+  (dotimes (i 16) (put-button &(aref buttons i))))
+
+(defn- take-globals ():!void
+  (each-global try-take)
+  (dotimes (i 128)
+    (try (take-field &(aref item-respawn-que i)))
+    (try (take-field &(aref item-respawn-time i))))
+  (dotimes (i 32) (try (take-field &(aref brain-targets i))))
+  (dotimes (i 30) (try (take-field &(aref active-plats i))))
+  (dotimes (i 30) (try (take-field &(aref active-ceilings i))))
+  (dotimes (i 16) (try (take-button &(aref buttons i))))
+  (ok))
+
+(defn- put-world ():void
+  (dotimes (i (table-len sectors)) (put-field (sectors i)))
+  (dotimes (i (table-len lines)) (put-field (lines i)))
+  (dotimes (i (table-len sides)) (put-field (sides i)))
+  (dotimes (i MAX-PLAYERS) (put-field (player i))))
+
+(defn- take-world ():!void
+  (dotimes (i (table-len sectors)) (try (take-field (sectors i))))
+  (dotimes (i (table-len lines)) (try (take-field (lines i))))
+  (dotimes (i (table-len sides)) (try (take-field (sides i))))
+  (dotimes (i MAX-PLAYERS) (try (take-field (player i))))
+  (ok))
+
+; Each sector's and blockmap cell's things, head first: the iterators visit
+; them in this order, and it depends on history set-thing-position can't redo.
+(defn- put-links ():void
+  (dotimes (i (table-len sectors))
+    (let (cur ((sectors i) 'thing-list) n 0)
+      (while (not (null? cur)) ; ISSUE-026
+        (when-some (m cur) (inc! n) (set! cur (m 'snext))))
+      (put-i32 n)
+      (set! cur ((sectors i) 'thing-list))
+      (while (not (null? cur))
+        (when-some (m cur) (put-i32 (index-of-node &(m 'th))) (set! cur (m 'snext))))))
+  (dotimes (i (table-len blocklinks))
+    (let (cur ((blocklinks i) 'head) n 0)
+      (while (not (null? cur))
+        (when-some (m cur) (inc! n) (set! cur (m 'bnext))))
+      (put-i32 n)
+      (set! cur ((blocklinks i) 'head))
+      (while (not (null? cur))
+        (when-some (m cur) (put-i32 (index-of-node &(m 'th))) (set! cur (m 'bnext)))))))
+
+(defn- take-links ():!void
+  (dotimes (i (table-len sectors))
+    (let (n (try (take-i32)) prev:?&Mobj null)
+      (set! ((sectors i) 'thing-list) null)
+      (dotimes (k n)
+        (let (m (try (mobj-of (try (node-at (try (take-i32)))))))
+          (set! (m 'sprev) prev)
+          (set! (m 'snext) null)
+          (match prev
+            ((some p) (set! (p 'snext) m))
+            (none (set! ((sectors i) 'thing-list) m)))
+          (set! prev m)))))
+  (dotimes (i (table-len blocklinks))
+    (let (n (try (take-i32)) prev:?&Mobj null)
+      (set! ((blocklinks i) 'head) null)
+      (dotimes (k n)
+        (let (m (try (mobj-of (try (node-at (try (take-i32)))))))
+          (set! (m 'bprev) prev)
+          (set! (m 'bnext) null)
+          (match prev
+            ((some p) (set! (p 'bnext) m))
+            (none (set! ((blocklinks i) 'head) m)))
+          (set! prev m)))))
+  (ok))
+
+;; Writing.
+
+(defn- put-header (h:&SaveHeader):void
+  (put-i32 MAGIC-LO)
+  (put-i32 MAGIC-HI)
+  (put-i32 SAVE-VERSION)
+  (dotimes (i SAVE-STRING-SIZE) (put-byte (as i32 (aref (h 'description) i))))
+  (put-i32 (h 'skill))
+  (put-i32 (h 'episode))
+  (put-i32 (h 'map))
+  (dotimes (i MAX-PLAYERS) (put-byte (if (aref (h 'in-game) i) 1 0))))
+
+; The current level as a savegame, in `out`'s place: the caller copies it out
+; before the next save.
+(defn write-save (description:StrView):&(Vector ui8)
+  (reset-nodes)
+  (set! (save-out (quote len)) 0) ; ISSUE-036
+  (let (h:SaveHeader (SaveHeader)) ; ISSUE-025
+    (dotimes (i (imin SAVE-STRING-SIZE (unsafe/cast i32 (description 'len))))
+      (set! (aref (h 'description) i) (aref (description 'data) i)))
+    (set! (h 'skill) game-skill)
+    (set! (h 'episode) game-episode)
+    (set! (h 'map) game-map)
+    (dotimes (i MAX-PLAYERS) (set! (aref (h 'in-game) i) (aref player-in-game i)))
+    (put-header &h))
+  ; The body goes first, into its own buffer, because writing it can find
+  ; more objects (an orphan target) for the directory.
+  (let (head:(Vector ui8) save-out)
+    (set! save-out (make (Vector ui8)))
+    (let (cur (first-thinker))
+      (while (not (null? cur))
+        (when-some (n cur) (index-of-node n) (set! cur (next-thinker n)))))
+    (let (in-list (unsafe/cast i32 (count &save-objects)))
+      (put-globals)
+      (put-world)
+      (put-links)
+      (let (i 0)
+        (while (< i (unsafe/cast i32 (count &save-objects)))
+          (put-object (&save-objects (as usize i)))
+          (inc! i)))
+      (let (body:(Vector ui8) save-out)
+        (set! save-out head)
+        (put-i32 in-list)
+        (put-i32 (unsafe/cast i32 (count &save-objects)))
+        (dotimes (i (unsafe/cast i32 (count &save-objects)))
+          (let (n (&save-objects (as usize i)))
+            (put-i32 (kind-of n))
+            (put-i32 (n 'state))))
+        (dotimes (i (unsafe/cast i32 (count &body))) (conj &save-out (&body (as usize i))))
+        (drop &body))))
+  &save-out)
+
+; The current level as a savegame the caller owns.
+(defn save-bytes (description:StrView):(Vector ui8)
+  (write-save description)
+  (let (v:(Vector ui8) save-out)
+    (set! save-out (make (Vector ui8)))
+    v))
+
+(defn vector-bytes (v:&(Vector ui8)):Bytes
+  (Bytes (unsafe/cast ptr:ui8 (v 'data)) (unsafe/cast i32 (count v))))
+
+(defn string-bytes (s:&String):Bytes
+  (let (v (string-as-view s))
+    (Bytes (unsafe/cast ptr:ui8 (v 'data)) (unsafe/cast i32 (v 'len)))))
+
+;; Slots: one file each in the save directory.
+
+(defn- slot-path (slot:i32):String
+  (with (d (save-dir))
+    (str (string-as-view &d) "/nucdsav" slot ".dsg")))
+
+(defn save-to-slot (slot:i32 description:StrView):!void
+  (with (d (save-dir)) (try (make-dirs (string-as-view &d))))
+  (with (v (save-bytes description))
+    (with (p (slot-path slot))
+      (write-file (string-as-view &p) (unsafe/cast &ui8 (v 'data)) (count &v)))))
+
+(defn read-slot (slot:i32):!String
+  (with (p (slot-path slot)) (read-file (string-as-view &p))))
+
+; The header of the game in `slot`, if it holds one this version can load.
+(defn slot-header (slot:i32):?SaveHeader
+  (match (read-slot slot)
+    ((ok s) (with (data s)
+              (match (read-header (string-bytes &data))
+                ((ok h) (some h))
+                ((err e) (none)))))
+    ((err e) (none))))
+
+;; Reading.
+
+(defn read-header (b:Bytes):!SaveHeader
+  (set! save-in b)
+  (set! save-pos 0)
+  (when (or (!= (try (take-i32)) MAGIC-LO) (!= (try (take-i32)) MAGIC-HI))
+    (return (err save-not-ours)))
+  (when (!= (try (take-i32)) SAVE-VERSION) (return (err save-version)))
+  (let (h:SaveHeader (SaveHeader))
+    (dotimes (i SAVE-STRING-SIZE)
+      (set! (aref (h 'description) i) (unsafe/cast ui8 (try (take-byte)))))
+    (set! (h 'skill) (try (take-i32)))
+    (set! (h 'episode) (try (take-i32)))
+    (set! (h 'map) (try (take-i32)))
+    (dotimes (i MAX-PLAYERS) (set! (aref (h 'in-game) i) (!= (try (take-byte)) 0)))
+    (ok h)))
+
+; Replaces the level that setup-level has just loaded for the header's map
+; with the saved one.
+(defn restore-save (b:Bytes):!void
+  (try (read-header b))
+  (reset-nodes)
+  (init-thinkers)
+  (let (in-list (try (take-i32)) total (try (take-i32)))
+    (when (or (< in-list 0) (< total in-list)) (return (err save-corrupt)))
+    (dotimes (i total)
+      (let (n (try (new-object (try (take-i32))))
+            state (try (take-i32)))
+        (when (< i in-list) (add-thinker n (n 'self)))
+        (set! (n 'state) state)
+        (conj &save-objects n))))
+  (try (take-globals))
+  (try (take-world))
+  (try (take-links))
+  (dotimes (i (unsafe/cast i32 (count &save-objects)))
+    (try (take-object (&save-objects (as usize i)))))
+  (when (!= save-pos (save-in (quote len))) (return (err save-corrupt)))
+  (ok))

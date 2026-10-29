@@ -71,7 +71,7 @@
 (defconst KEY-DEL 0xd3)
 (defconst KEYP-5 0xcc)
 
-;; Bindings (m_controls.c's defaults; there's no config file yet).
+;; Bindings (m_controls.c's defaults; doom.config reads and writes them).
 
 (defvar key-right:i32 KEY-RIGHTARROW)
 (defvar key-left:i32 KEY-LEFTARROW)

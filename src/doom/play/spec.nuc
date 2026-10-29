@@ -161,7 +161,8 @@
 ; Pairs of off/on textures: an index's partner is index xor 1.
 (defvar- switch-list:(array i32 100))
 (defvar- num-switches:i32 0)
-(defvar- buttons:(array Button 16))
+; Public for doom.savegame.
+(defvar buttons:(array Button 16))
 
 (defn- add-switch (episode:i32 max-episode:i32 name1:StrView name2:StrView):void
   (when (<= episode max-episode)

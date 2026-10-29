@@ -1,0 +1,10 @@
+; ISSUE-039: with nucleus.error loaded only by `import-ct`, an `err` site calls
+; `err-find-handler`, which the program never defines.
+; fixed-when: output-contains ok 1
+(import-use "stdio.h")
+(import-ct nucleus.error)
+(deferror nope "nope")
+(defn f (x:i32):!i32 (if (> x 0) (ok x) (err nope)))
+(defn main ():i32
+  (match (f 1) ((ok v) (printf "ok %d\n" v)) ((err e) (printf "err\n")))
+  0)

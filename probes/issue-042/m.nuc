@@ -1,0 +1,4 @@
+(ns issue-042.m)
+(defn- pick (x:i32):bool (> x 2))
+(defn- apply (f:(fn bool)(i32)):bool (f 5))
+(defn run ():i32 (if (apply pick) 1 0))

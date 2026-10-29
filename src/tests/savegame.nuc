@@ -1,0 +1,62 @@
+(ns tests.savegame)
+(import-use "string.h")
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.vector)
+(import-use nucleus.test)
+(import-use doom.math)
+(import-use doom.bytes)
+(import-use doom.world)
+(import-use doom.savecodec)
+(import-use doom.savegame)
+
+; The bytes written so far, as the reader's input.
+(defn- rewind ():void
+  (set! save-in (vector-bytes &save-out))
+  (set! save-pos 0))
+
+; Every derived field, arrays and nested structs included, comes back. The
+; pointers are null, so the struct images compare byte for byte.
+(deftest player-codec-round-trips
+  (set! (save-out 'len) 0) ; ISSUE-036
+  (let (a:Player (Player) b:Player (Player)) ; ISSUE-025
+    ; A literal leaves the padding undefined, and memcmp reads it.
+    (memset (unsafe/cast ptr &a) 0 (unsafe/cast usize (sizeof Player)))
+    (memset (unsafe/cast ptr &b) 0 (unsafe/cast usize (sizeof Player)))
+    (set! (a 'player-state) 2)
+    (set! ((ref a 'cmd) 'forward-move) -50)
+    (set! ((ref a 'cmd) 'angle-turn) -1280)
+    (set! ((ref a 'cmd) 'buttons) 130)
+    (set! (a 'viewz) (fx-raw -2621440))
+    (set! (a 'health) 85)
+    (set! (aref (a 'powers) 5) 4)
+    (set! (aref (a 'cards) 2) true)
+    (set! (aref (a 'weapon-owned) 8) 1)
+    (set! (aref (a 'max-ammo) 3) 600)
+    (set! (a 'did-secret) true)
+    (let (ps &(aref (a 'psprites) 1)) ; ISSUE-021
+      (set! (ps 'state) 77)
+      (set! (ps 'sy) (fx 32)))
+    (put-field &a)
+    (rewind)
+    (try (take-field &b))
+    (try (check-eq-int (as i64 save-pos) (as i64 (save-in 'len)) "all of it read"))
+    (try (check (= (memcmp (unsafe/cast ptr &a) (unsafe/cast ptr &b) (unsafe/cast usize (sizeof Player))) 0)
+                "players equal"))))
+
+(deftest short-input-is-truncated
+  (set! (save-out 'len) 0)
+  (put-byte 1)
+  (rewind)
+  (match (take-i32)
+    ((ok v) (fail! "read an i32 from one byte"))
+    ; Not (ok): deftest supplies it, and a non-tail one is "unknown". ISSUE-043
+    ((err e) (do))))
+
+(deftest foreign-file-is-refused
+  (set! (save-out 'len) 0)
+  (put-i32 0x44415749)
+  (put-i32 0)
+  (match (read-header (vector-bytes &save-out))
+    ((ok h) (fail! "took an IWAD header for a savegame"))
+    ((err e) (do))))

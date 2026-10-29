@@ -1,3 +1,5 @@
 {:name "tests"
  :entry "../src/tests/main.nuc"
- :source-root "../src"}
+ :source-root "../src"
+ ; The tests reach the menu, and through it SDL_mixer (ISSUE-001).
+ :pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}}

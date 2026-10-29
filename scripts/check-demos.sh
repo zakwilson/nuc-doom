@@ -2,6 +2,7 @@
 # Demo-sync gate: plays demo1-3 under -timedemo with -tichash and diffs each
 # against reference/data/. Reports the first divergent tic and which fields differ.
 # Usage: scripts/check-demos.sh [demo1 demo2 demo3]
+# DEMO_ARGS adds port arguments to every run (check-savegames.sh uses it).
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,7 +21,7 @@ for d in "${demos[@]}"; do
     want="$ROOT/reference/data/$d.tichash"
     got="$TMP/$d.tichash"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout -k 5 600 "$ROOT/build/nuc-doom" \
-        -iwad "$IWAD" -nosound -timedemo "$d" -tichash "$got" > "$TMP/$d.log" 2>&1
+        -iwad "$IWAD" -nosound -config "$TMP/none.edn" ${DEMO_ARGS:-} -timedemo "$d" -tichash "$got" > "$TMP/$d.log" 2>&1
     if [ ! -f "$got" ]; then
         echo "$d: FAIL (no tichash written; last output: $(tail -1 "$TMP/$d.log"))"
         fail=1

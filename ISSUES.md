@@ -41,8 +41,16 @@ Format and rules: `PROMPT.md` §7.
 | — | ISSUE-033 | major | bug | 0 |
 | — | ISSUE-034 | minor | bug | 0 |
 | — | ISSUE-035 | papercut | stdlib gap | 4 |
-| — | ISSUE-036 | papercut | stdlib gap | 1 |
+| — | ISSUE-036 | papercut | stdlib gap | 5 |
 | — | ISSUE-037 | papercut | design gap | 1 |
+| — | ISSUE-038 | major | bug | 0 |
+| — | ISSUE-039 | major | bug | 0 |
+| — | ISSUE-040 | critical | bug | 0 |
+| — | ISSUE-041 | major | bug | 1 |
+| — | ISSUE-042 | major | bug | 0 |
+| — | ISSUE-043 | papercut | diagnostics | 1 |
+| — | ISSUE-044 | minor | bug | 0 |
+| — | ISSUE-045 | minor | known-limitation | 1 |
 
 ---
 
@@ -638,16 +646,20 @@ already hand-written `iabs` in milestone 1 for the same reason.
 
 ---
 
-## ISSUE-036: `Vector` has no `clear`, though `String` has `string-clear`
+## ISSUE-036: `Vector` and `HashMap` have no `clear`, though `String` has `string-clear`
 
 - **Severity:** papercut
 - **Kind:** stdlib gap
 - **Status:** worked-around
 - **Probe:** none; nothing is broken.
-- **Port sites:** `src/doom/sys/music.nuc` (`play-song` reuses one MIDI buffer)
-- **Workaround:** `(set! (v 'len) 0)`, writing the struct's length field directly.
-- **Suggestion:** `(clear v)` (and probably `truncate`) on `(Vector T)`, dropping
-  the elements and keeping the capacity. `string-clear` is already
+- **Port sites:** `src/doom/sys/music.nuc` (`play-song` reuses one MIDI
+  buffer); `src/doom/savegame.nuc` and `src/doom/savecodec.nuc` (the save
+  stream and object table, reset per save); `src/tests/savegame.nuc`
+- **Workaround:** `(set! (v 'len) 0)`, writing the struct's length field
+  directly. For a `HashMap`, `(drop &m)` then `(set! m (make (HashMap K V)))`,
+  which frees and reallocates the table on every save.
+- **Suggestion:** `(clear v)` (and probably `truncate`) on `(Vector T)`, and
+  `clear` on `HashMap`, dropping the elements and keeping the capacity. `string-clear` is already
   `(set! ((ref self 'bytes) 'len) 0)`, so the Vector version is the same line
   plus a drop loop for elements that own memory.
 
@@ -680,6 +692,214 @@ left for a safe conversion is the one the language reserves for unsafe ones,
 and an `unsafe/` search over the port now finds four harmless casts. The
 playsim never uses floats, so the rule costs nothing there. It shows up as
 soon as code touches audio or other host-side arithmetic.
+
+---
+
+## ISSUE-038: A template method first stamped inside a `defn-`, in a file with no `ns`, gets no definition
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus 1862c27
+- **Probe:** `probes/issue-038.nuc`. Expected `count 1`. Actual: "nucleusc:
+  failed to parse generated IR …: use of undefined value
+  '@nuc_count.pnuc_Vector.u8'".
+- **Port sites:** none. Every port file has an `ns`. It was found while
+  prototyping the savegame macro in a scratch file.
+- **Workaround:** make the function public, or give the file an `ns`.
+- **Suggestion:** done. The stamp is registered with `g-defining-private`
+  cleared, as ISSUE-032's fix does for union instances. The remaining
+  question is whether anything else registers under the private key while a
+  `defn-` body is being compiled. Both bugs came from that one global, which
+  stays set for everything the body causes to be compiled.
+
+Context: `(defn- size (v:&(Vector ui8)):i32 (unsafe/cast i32 (count v)))` was
+the first use of `count` on `(Vector ui8)`. The call was emitted against the
+mangled `@nuc_count.pnuc_Vector.u8` and the definition as `@nuc_count`. The
+error points at generated IR, so a user learns nothing from it about which
+form caused it. Making the same function a `defn` hides it.
+
+---
+
+## ISSUE-039: With `nucleus.error` loaded only by `import-ct`, every `err` calls an undefined function
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus 95b70b9
+- **Probe:** `probes/issue-039.nuc`. Expected `ok 1`. Actual: "nucleusc:
+  failed to parse generated IR …: use of undefined value
+  '@nuc_err-find-handler'".
+- **Port sites:** none yet. It is hit by the savegame macro, whose
+  `import-ct nucleus.node` brings in `nucleus.error` at compile time.
+- **Workaround:** `(import-use nucleus.error)` as well.
+- **Suggestion:** done. The `err` emitter asked whether the error library's
+  names were registered, and `import-ct` registers names it never defines.
+  It now also asks whether they are compile-time only. The compiler had
+  already added that check for the node runtime, so the rule ("a `ct-only`
+  binding is absent from the program") belongs wherever the emitter probes
+  for a library by name.
+
+Context: a macro file needs `(import-ct nucleus.node)` to build forms, and
+`nucleus.node` imports `nucleus.error`. Any `!T` function that returns
+`(err …)` in the same program then fails at the IR stage. The error names
+neither the import nor the `err`.
+
+---
+
+## ISSUE-040: An array field of a struct binding decays into a copy, so stores through it vanish
+
+- **Severity:** critical (silent wrong code)
+- **Kind:** bug
+- **Status:** fixed in nucleus 712308d
+- **Probe:** `probes/issue-040.nuc`. Expected `1 9`. Actual: `0 0`.
+- **Port sites:** none found. The port's array fields are written through
+  `&T` receivers (`(p 'powers)` on a `&Player`), which were always right. It
+  was found when the savegame prototype round-tripped a local struct.
+- **Workaround:** write through a pointer: `(set! (aref (&t 'flags) 0) 1)`.
+- **Suggestion:** done. Field reads now use the binding's own slot, and only
+  a true temporary is copied. The deeper problem is that the copy was
+  invisible. `docs/types.md` says reading an array field is "the address of
+  element 0 … nothing is loaded and nothing is copied", and the copy broke
+  that promise without a diagnostic. A test that the decayed pointer of a
+  local's field equals the field's address would have caught it.
+
+Context: `(let (t:Thing (Thing)) (set! (aref (t 'flags) 0) 1) …)` stored into
+a `%tc3.mat` temporary that SV-1 had made so a by-value struct could be a
+field-access receiver. Every later read made a fresh copy of the unchanged
+binding. The fix moved the compiler's own bootstrap (93,924 IR lines, all of
+them a copy fewer per field read), so it needed the converge cycle.
+
+---
+
+## ISSUE-041: A `defvar` defined by two `import-use`d namespaces silently resolves to the first import's
+
+- **Severity:** major (silent wrong binding)
+- **Kind:** bug
+- **Status:** open
+- **Probe:** `probes/issue-041.nuc` (with `probes/issue-041/a.nuc` and `b.nuc`).
+  Expected: an error naming `issue-041.a/nodes` and `issue-041.b/nodes`.
+  Actual: it compiles and prints `1`. Swap the two imports and it prints `2`.
+- **Port sites:** `src/doom/savecodec.nuc` (the stream and object-table globals
+  are `save-*`, not the shorter `nodes`/`in`/`out`, since `doom.world` already
+  has a `nodes`).
+- **Workaround:** give every public global a name no other flattened
+  namespace uses, or spell it qualified.
+- **Suggestion:** do what `design/stage15-stress-test/name-resolution.md` §8.2
+  recommends. Its table already lists `defvar`/`defconst`/enum members as kinds
+  where "the same name from two flattened namespaces" is a collision, reported
+  lazily at the first bare use. Functions get that diagnostic ("defined in
+  namespaces 'a' and 'b' … write 'a/f' or 'b/f' here"), but only for an
+  unresolved call. A value lookup returns the first candidate key it finds, so
+  import order picks the binding. `docs/toplevel.md` says import order doesn't
+  affect resolution, and here it does.
+
+Context: `doom.savecodec` first named its node table `nodes`. `doom.savegame`
+imports both `doom.world` (whose `nodes` is the BSP node table) and
+`doom.savecodec`, and its bare `nodes` meant the BSP table. That surfaced as a
+type error only because the two element types differed. Two `i32` counters with
+the same name would have compiled and read the wrong variable.
+
+---
+
+## ISSUE-042: A function name used as a value is "undefined" once another namespace defines the same name
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus cab687d
+- **Probe:** `probes/issue-042.nuc` (with `probes/issue-042/lib.nuc` and `m.nuc`).
+  Expected `run 1`. Actual: "undefined: pick — defined in namespace
+  'issue-042.lib', which this file does not import", reported at `m.nuc`'s
+  own use of its own `pick`.
+- **Port sites:** none now. It blocked the unit-test program, whose
+  `nucleus.test` import puts a public `check-line` in the unit beside
+  `doom.play.map`'s private one, which `check-position` passes to
+  `block-lines-iterator`.
+- **Workaround:** wrap the function in a lambda, `(fn (ld:&Line):bool (check-line ld))`.
+- **Suggestion:** done. A value reference that finds no binding now asks the
+  generic, through the same visibility filter a bare call uses. If exactly one
+  method is reachable, that method is the value; if several are, the error
+  says the name is overloaded rather than undefined. The root cause is that
+  the "solitary" `g-globals` binding a value reference needs is decided per
+  unit, while overloading is decided per namespace. Any library that added a
+  public function could break unrelated code taking a same-named function as
+  a value.
+
+Context: the game built and the test program didn't. The two differ only in
+which libraries are in the unit, so it first looked like an import-order
+problem, and the first message blamed an import cycle (`play.map` ↔
+`play.spec`).
+
+---
+
+## ISSUE-043: `(ok)` as a statement is "unknown: ok — not defined anywhere"
+
+- **Severity:** papercut
+- **Kind:** diagnostics
+- **Status:** open
+- **Probe:** `probes/issue-043.nuc`. `(defn f ():!void (ok) (ok))` reports
+  "unknown: ok — not defined anywhere in this compilation unit", with
+  `nucleus.error` imported.
+- **Port sites:** `src/tests/savegame.nuc` (match arms that succeed are
+  `(do)`, because `deftest` appends its own `(return (ok))`).
+- **Workaround:** write `(ok)` only in tail or `return` position. In a
+  `deftest` body, don't write it at all.
+- **Suggestion:** a non-tail `(ok)` has no expected type to construct. Either
+  take it from the enclosing function's result type (the value is discarded,
+  so accepting it costs nothing), or say that `ok` needs a result type there.
+  The current message sends the reader looking for a missing import.
+  `docs/testing.md` could also say that `deftest` supplies the `(ok)`.
+
+Context: hit twice in one test file. The first time, an `(ok)` closed a
+`deftest` body, the way a `defn` test helper ends. The second time it was a
+match arm that was out of tail position for the same reason.
+
+---
+
+## ISSUE-044: `nucleus build` reports a syntax error in an imported file at the importer's path
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed in nucleus 6518d10
+- **Probe:** `probes/issue-044.nuc` (run with `--list-imports`). Expected
+  `issue-044/lib.nuc:3: error: unexpected )`. Actual: `issue-044.nuc:3`, the
+  importer's path with the imported file's line.
+- **Port sites:** none.
+- **Workaround:** compile the entry with `nucleusc` directly, which names
+  the right file.
+- **Suggestion:** done. `--list-imports` set the current file after reading
+  it rather than before. The general hazard is that `g-source-path` is
+  ambient state that every reader error consults. A reader that took the path
+  as an argument couldn't get it wrong.
+
+Context: an extra `)` in `doom/config.nuc` came back as `main.nuc:161:
+error: unexpected )`. Line 161 of `main.nuc` was a balanced `(when …)`, and
+the note ("the form opened at line 143 is already closed") described forms
+that don't exist there.
+
+---
+
+## ISSUE-045: `derive-edn` reads a struct only if every field is present
+
+- **Severity:** minor
+- **Kind:** known-limitation
+- **Status:** worked-around
+- **Probe:** none; `docs/edn.md` "Not yet" lists "default values", and
+  missing keys are `edn-missing-key` by design.
+- **Port sites:** `src/doom/config.nuc` (every setting and binding is read by
+  hand with `edn-get`)
+- **Workaround:** one `edn-get` per key, falling back to the variable's
+  current value, driven by two `each-setting`/`each-key` macros that list
+  each name and variable once, for reading and writing both.
+- **Suggestion:** a field default in `derive-edn`, say `:edn-default` per field
+  or a whole-struct "absent keys keep the destination's value" mode. A config
+  file is the textbook EDN use, and it always meets an older file that lacks
+  a newer key. A strict codec makes the first new setting a breaking change
+  for every saved config.
+
+Context: PROMPT asks for an EDN config through `nucleus.edn`. A `Config`
+struct with `derive-edn` would have been about five lines. It wasn't usable,
+because a file written before a setting existed would fail to load at all.
+The by-hand reader and writer are about 75 lines, and they also give key bindings by name
+(`"ctrl"`, `"f5"`, `"space"`), which a struct of `i32`s wouldn't.
 
 ---
 

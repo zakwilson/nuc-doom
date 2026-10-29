@@ -1,0 +1,2 @@
+(ns issue-041.b)
+(defvar nodes:i32 2)

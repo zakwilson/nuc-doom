@@ -33,6 +33,14 @@
 (import-use doom.play.spec)
 (import-use doom.sound)
 (import-use doom.sys.sound)
+(import-use doom.play.setup)
+(import-use doom.savegame)
+(import-use nucleus.vector)
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+(import-use doom.system)
+(import-use doom.bytes)
+(import-use doom.config)
 
 ; One tic per frame, as fast as possible: for -framedump and -timedemo.
 (defvar single-tics:bool false)
@@ -77,9 +85,33 @@
     (build-ticcmd &(aref local-cmds (% make-tic 8)))
     (inc! make-tic)))
 
+;; -savetest N: every N tics of a level, save to slot 7 (past the menu's six),
+;; reload the map and restore the file. A second save must match the first,
+;; and the tic hashes mustn't move.
+
+(defvar- save-test-every:i32 0)
+
+(defn- save-round-trip ():!void
+  (try (save-to-slot 7 "savetest"))
+  (with (a (try (read-slot 7)))
+    (try (setup-level game-episode game-map game-skill))
+    (try (restore-save (string-bytes &a)))
+    (with (b (save-bytes "savetest"))
+      (let (x (string-bytes &a) y (vector-bytes &b) same (= (x 'len) (y 'len)))
+        (when same
+          (dotimes (i (x 'len))
+            (when (!= (u8 x i) (u8 y i)) (set! same false))))
+        (when (not same)
+          (let (msg (str "-savetest: the save at tic " game-tic " doesn't round-trip"))
+            (fatal (string-as-view &msg)))))))
+  (ok))
+
 (defn- run-tic ():!void
   (set! @(net-cmd console-player) (aref local-cmds (% game-tic 8)))
   (when advance-demo-pending (do-advance-demo))
+  (when (and (> save-test-every 0) (> game-tic 0) (= (% game-tic save-test-every) 0)
+             (= game-state GS-LEVEL) (= game-action GA-NOTHING))
+    (try (save-round-trip)))
   (try (game-ticker))
   (tichash-write)
   (inc! game-tic)
@@ -188,6 +220,7 @@
   (try (add-wad-files))
   (detect-game-version)
   (init-controls)
+  (load-config)
   (set-palette (try (lump-named "PLAYPAL")))
   (menu-init)
   (try (init-renderer screen-blocks detail-level))
@@ -196,7 +229,8 @@
   (try (hud-init))
   (try (automap-init))
   (let (nosound (parm-exists? "-nosound"))
-    (sound-init (or nosound (parm-exists? "-nosfx")) (or nosound (parm-exists? "-nomusic"))))
+    (sound-init (or nosound (parm-exists? "-nosfx")) (or nosound (parm-exists? "-nomusic"))
+                (* sfx-level 8) (* music-level 8)))
   (set! (aref player-in-game 0) true)
   (let (start-skill SK-MEDIUM start-episode 1 start-map 1 autostart false)
     (let (p (check-parm-with-args "-skill" 1))
@@ -214,8 +248,10 @@
         (set! start-map (arg-int (+ p 2)))
         (set! autostart true)))
     (let (playdemo (check-parm-with-args "-playdemo" 1)
-          timedemo (check-parm-with-args "-timedemo" 1))
-      (cond (!= playdemo 0) (do (set! single-demo true)
+          timedemo (check-parm-with-args "-timedemo" 1)
+          loadgame (check-parm-with-args "-loadgame" 1))
+      (cond (!= loadgame 0) (load-game (arg-int (+ loadgame 1)))
+            (!= playdemo 0) (do (set! single-demo true)
                                 (defer-play-demo (arg (+ playdemo 1))))
             (!= timedemo 0) (do (time-demo (arg (+ timedemo 1)))
                                 (set! single-tics true))
@@ -223,12 +259,17 @@
             true (start-title))))
   (framedump-init)
   (when (parm-exists? "-framedump") (set! single-tics true))
+  (let (p (check-parm-with-args "-savetest" 1))
+    (when (!= p 0) (set! save-test-every (arg-int (+ p 1)))))
   (try (init-graphics))
   (set! last-time (get-time))
   ; D_DoomLoop runs one tic before the first frame.
   (try (try-run-tics))
   (while (not quit-requested)
     (try (run-frame)))
+  (match (save-config)
+    ((ok) (do))
+    ((err e) (warn "couldn't write the config file")))
   (stop-music)
   (close-mixer)
   (shutdown-graphics)

@@ -251,8 +251,9 @@
                 true))
 
 ; Opens the mixer unless -nosound, -nosfx or -nomusic says otherwise.
-(defn sound-init (nosfx:bool nomusic:bool):void
+; The volumes are 0-127, as S_Init took them.
+(defn sound-init (nosfx:bool nomusic:bool sfx:i32 music:i32):void
   (when (and (not nosfx) (not (init-sound))) (warn "sound effects: cannot open the mixer"))
   (when (and (not nomusic) (not (init-music))) (warn "music: cannot open the mixer"))
-  (set-sfx-volume sfx-volume)
-  (set-music-volume music-volume))
+  (set-sfx-volume sfx)
+  (set-music-volume music))

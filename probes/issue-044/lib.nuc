@@ -1,0 +1,3 @@
+(ns issue-044.lib)
+
+(defn f ():i32 1))

@@ -19,7 +19,7 @@ for skill in 1 3 5; do
         out="$TMP/e1m$map-$skill"
         mkdir -p "$out"
         SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout -k 5 120 "$ROOT/build/nuc-doom" \
-            -iwad "$IWAD" -nosound -warp 1 "$map" -skill "$skill" -framedump "$TICS" "$out" \
+            -iwad "$IWAD" -nosound -config "$TMP/none.edn" -warp 1 "$map" -skill "$skill" -framedump "$TICS" "$out" \
             > "$out.log" 2>&1
         rc=$?
         if [ $rc -eq 0 ] && [ -f "$out/tic$(printf '%05d' "$TICS").ppm" ]; then
